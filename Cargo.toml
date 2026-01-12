@@ -1,6 +1,6 @@
 [package]
 name = "otlp2records"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Transform OTLP telemetry to Arrow RecordBatches"
@@ -28,6 +28,7 @@ thiserror = "2"
 const-hex = "1"
 once_cell = "1"
 chrono-tz = "0.10"
+indexmap = "2"
 
 [dependencies.parquet]
 version = "54"

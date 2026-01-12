@@ -22,6 +22,8 @@ pub enum DecodeError {
     Json(serde_json::Error),
     /// Protobuf decoding failed
     Protobuf(prost::DecodeError),
+    /// General parse error (e.g., UTF-8, JSONL line errors)
+    Parse(String),
     /// Unsupported or invalid payload
     Unsupported(String),
 }
@@ -31,6 +33,7 @@ impl std::fmt::Display for DecodeError {
         match self {
             DecodeError::Json(e) => write!(f, "JSON decode error: {}", e),
             DecodeError::Protobuf(e) => write!(f, "protobuf decode error: {}", e),
+            DecodeError::Parse(msg) => write!(f, "parse error: {}", msg),
             DecodeError::Unsupported(msg) => write!(f, "unsupported payload: {}", msg),
         }
     }
@@ -41,6 +44,7 @@ impl std::error::Error for DecodeError {
         match self {
             DecodeError::Json(e) => Some(e),
             DecodeError::Protobuf(e) => Some(e),
+            DecodeError::Parse(_) => None,
             DecodeError::Unsupported(_) => None,
         }
     }

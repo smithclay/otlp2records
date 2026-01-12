@@ -64,9 +64,15 @@ pub mod wasm;
 use ::arrow::record_batch::RecordBatch;
 use vrl::value::{KeyString, Value};
 
-pub use arrow::{gauge_schema, logs_schema, sum_schema, traces_schema, values_to_arrow};
+pub use arrow::{
+    extract_min_timestamp_micros, extract_service_name, gauge_schema, group_batch_by_service,
+    logs_schema, sum_schema, traces_schema, values_to_arrow, PartitionedBatch, PartitionedMetrics,
+    ServiceGroupedBatches,
+};
 pub use decode::{
-    decode_logs, decode_metrics, decode_traces, DecodeMetricsResult, InputFormat, SkippedMetrics,
+    count_skipped_metric_data_points, decode_logs, decode_metrics, decode_traces,
+    normalise_json_value, normalize_json_bytes, DecodeMetricsResult, InputFormat, MetricSkipCounts,
+    SkippedMetrics,
 };
 pub use error::{Error, Result};
 #[cfg(feature = "parquet")]
@@ -277,6 +283,132 @@ pub fn transform_metrics_json(bytes: &[u8], format: InputFormat) -> Result<JsonM
         gauge: values_to_json(metric_values.gauge, "gauge metric")?,
         sum: values_to_json(metric_values.sum, "sum metric")?,
         skipped: decode_result.skipped,
+    })
+}
+
+// ============================================================================
+// Partitioned API functions
+// ============================================================================
+
+/// Transform OTLP logs with service-based partitioning.
+///
+/// This function combines decoding, transformation, and service-based grouping
+/// into a single call. Returns batches grouped by service name, ready for
+/// partitioned storage.
+///
+/// # Arguments
+///
+/// * `bytes` - Raw OTLP log data bytes
+/// * `format` - The input format (Protobuf or JSON)
+///
+/// # Returns
+///
+/// A `ServiceGroupedBatches` containing RecordBatches grouped by service name,
+/// with pre-extracted metadata (service_name, min_timestamp_micros) for each batch.
+///
+/// # Example
+///
+/// ```ignore
+/// use otlp2records::{transform_logs_partitioned, InputFormat};
+///
+/// let grouped = transform_logs_partitioned(otlp_bytes, InputFormat::Protobuf)?;
+/// for batch in grouped.into_iter() {
+///     // batch.service_name, batch.min_timestamp_micros, batch.batch are available
+///     println!("Service: {}, records: {}", batch.service_name, batch.record_count);
+/// }
+/// ```
+pub fn transform_logs_partitioned(
+    bytes: &[u8],
+    format: InputFormat,
+) -> Result<ServiceGroupedBatches> {
+    let batch = transform_logs(bytes, format)?;
+    Ok(group_batch_by_service(batch))
+}
+
+/// Transform OTLP traces with service-based partitioning.
+///
+/// This function combines decoding, transformation, and service-based grouping
+/// into a single call. Returns batches grouped by service name, ready for
+/// partitioned storage.
+///
+/// # Arguments
+///
+/// * `bytes` - Raw OTLP trace data bytes
+/// * `format` - The input format (Protobuf or JSON)
+///
+/// # Returns
+///
+/// A `ServiceGroupedBatches` containing RecordBatches grouped by service name,
+/// with pre-extracted metadata for each batch.
+///
+/// # Example
+///
+/// ```ignore
+/// use otlp2records::{transform_traces_partitioned, InputFormat};
+///
+/// let grouped = transform_traces_partitioned(otlp_bytes, InputFormat::Protobuf)?;
+/// for batch in grouped.into_iter() {
+///     println!("Service: {}, spans: {}", batch.service_name, batch.record_count);
+/// }
+/// ```
+pub fn transform_traces_partitioned(
+    bytes: &[u8],
+    format: InputFormat,
+) -> Result<ServiceGroupedBatches> {
+    let batch = transform_traces(bytes, format)?;
+    Ok(group_batch_by_service(batch))
+}
+
+/// Transform OTLP metrics with service-based partitioning.
+///
+/// This function combines decoding, transformation, and service-based grouping
+/// into a single call. Returns metrics separated by type (gauge, sum) and
+/// grouped by service name.
+///
+/// # Arguments
+///
+/// * `bytes` - Raw OTLP metric data bytes
+/// * `format` - The input format (Protobuf or JSON)
+///
+/// # Returns
+///
+/// A `PartitionedMetrics` containing gauge and sum metrics, each grouped by
+/// service name with pre-extracted metadata.
+///
+/// # Example
+///
+/// ```ignore
+/// use otlp2records::{transform_metrics_partitioned, InputFormat};
+///
+/// let metrics = transform_metrics_partitioned(otlp_bytes, InputFormat::Protobuf)?;
+///
+/// for batch in metrics.gauge.into_iter() {
+///     println!("Gauge service: {}, points: {}", batch.service_name, batch.record_count);
+/// }
+/// for batch in metrics.sum.into_iter() {
+///     println!("Sum service: {}, points: {}", batch.service_name, batch.record_count);
+/// }
+/// ```
+pub fn transform_metrics_partitioned(
+    bytes: &[u8],
+    format: InputFormat,
+) -> Result<PartitionedMetrics> {
+    let batches = transform_metrics(bytes, format)?;
+
+    let gauge = match batches.gauge {
+        Some(batch) => group_batch_by_service(batch),
+        None => ServiceGroupedBatches::default(),
+    };
+
+    let sum = match batches.sum {
+        Some(batch) => group_batch_by_service(batch),
+        None => ServiceGroupedBatches::default(),
+    };
+
+    Ok(PartitionedMetrics {
+        gauge,
+        sum,
+        skipped: batches.skipped,
     })
 }
 

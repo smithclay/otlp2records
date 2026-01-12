@@ -19,10 +19,14 @@
 mod common;
 mod logs;
 mod metrics;
+mod normalize;
 mod traces;
 
 pub use common::{looks_like_json, DecodeError};
 pub use metrics::{DecodeMetricsResult, SkippedMetrics};
+pub use normalize::{
+    count_skipped_metric_data_points, normalise_json_value, normalize_json_bytes, MetricSkipCounts,
+};
 use vrl::value::Value;
 
 /// Input format for OTLP decoding
@@ -32,6 +36,8 @@ pub enum InputFormat {
     Protobuf,
     /// JSON format
     Json,
+    /// Newline-delimited JSON (JSONL/NDJSON) format
+    Jsonl,
     /// Auto-detect JSON vs protobuf, with fallback decoding
     Auto,
 }
@@ -42,11 +48,22 @@ impl InputFormat {
         let content_type = content_type.map(|v| v.trim().to_ascii_lowercase());
 
         match content_type.as_deref() {
+            Some("application/x-ndjson") | Some("application/jsonl") => InputFormat::Jsonl,
             Some("application/json") | Some("application/otlp+json") => InputFormat::Json,
             Some("application/x-protobuf")
             | Some("application/protobuf")
             | Some("application/otlp") => InputFormat::Protobuf,
             _ => InputFormat::Auto,
+        }
+    }
+
+    /// Returns the canonical Content-Type string for this format.
+    pub fn content_type(&self) -> &'static str {
+        match self {
+            InputFormat::Protobuf => "application/x-protobuf",
+            InputFormat::Json => "application/json",
+            InputFormat::Jsonl => "application/x-ndjson",
+            InputFormat::Auto => "application/x-protobuf", // Default to protobuf
         }
     }
 }
@@ -68,6 +85,7 @@ pub fn decode_logs(bytes: &[u8], format: InputFormat) -> Result<Vec<Value>, Deco
     match format {
         InputFormat::Protobuf => logs::decode_protobuf(bytes),
         InputFormat::Json => logs::decode_json(bytes),
+        InputFormat::Jsonl => decode_jsonl(bytes, logs::decode_json),
         InputFormat::Auto => {
             if looks_like_json(bytes) {
                 match logs::decode_json(bytes) {
@@ -119,6 +137,7 @@ pub fn decode_traces(bytes: &[u8], format: InputFormat) -> Result<Vec<Value>, De
     match format {
         InputFormat::Protobuf => traces::decode_protobuf(bytes),
         InputFormat::Json => traces::decode_json(bytes),
+        InputFormat::Jsonl => decode_jsonl(bytes, traces::decode_json),
         InputFormat::Auto => {
             if looks_like_json(bytes) {
                 match traces::decode_json(bytes) {
@@ -180,6 +199,7 @@ pub fn decode_metrics(
     match format {
         InputFormat::Protobuf => metrics::decode_protobuf(bytes),
         InputFormat::Json => metrics::decode_json(bytes),
+        InputFormat::Jsonl => decode_metrics_jsonl(bytes),
         InputFormat::Auto => {
             if looks_like_json(bytes) {
                 match metrics::decode_json(bytes) {
@@ -206,6 +226,81 @@ pub fn decode_metrics(
     }
 }
 
+// ============================================================================
+// JSONL decoding helpers
+// ============================================================================
+
+/// Generic JSONL decoder for logs and traces.
+/// Processes each non-empty line as a separate JSON payload and combines results.
+fn decode_jsonl<F>(bytes: &[u8], decode_json_fn: F) -> Result<Vec<Value>, DecodeError>
+where
+    F: Fn(&[u8]) -> Result<Vec<Value>, DecodeError>,
+{
+    let text = std::str::from_utf8(bytes).map_err(|e| DecodeError::Parse(e.to_string()))?;
+    let mut all_values = Vec::new();
+    let mut saw_line = false;
+
+    for (line_num, line) in text.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        saw_line = true;
+
+        let values = decode_json_fn(trimmed.as_bytes())
+            .map_err(|e| DecodeError::Parse(format!("line {}: {}", line_num + 1, e)))?;
+        all_values.extend(values);
+    }
+
+    if !saw_line {
+        return Err(DecodeError::Parse(
+            "jsonl payload contained no records".to_string(),
+        ));
+    }
+
+    Ok(all_values)
+}
+
+/// JSONL decoder for metrics - handles the special DecodeMetricsResult return type.
+fn decode_metrics_jsonl(bytes: &[u8]) -> Result<DecodeMetricsResult, DecodeError> {
+    let text = std::str::from_utf8(bytes).map_err(|e| DecodeError::Parse(e.to_string()))?;
+    let mut all_values = Vec::new();
+    let mut combined_skipped = SkippedMetrics::default();
+    let mut saw_line = false;
+
+    for (line_num, line) in text.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        saw_line = true;
+
+        let result = metrics::decode_json(trimmed.as_bytes())
+            .map_err(|e| DecodeError::Parse(format!("line {}: {}", line_num + 1, e)))?;
+
+        all_values.extend(result.values);
+
+        // Merge skipped counts
+        combined_skipped.histograms += result.skipped.histograms;
+        combined_skipped.exponential_histograms += result.skipped.exponential_histograms;
+        combined_skipped.summaries += result.skipped.summaries;
+        combined_skipped.nan_values += result.skipped.nan_values;
+        combined_skipped.infinity_values += result.skipped.infinity_values;
+        combined_skipped.missing_values += result.skipped.missing_values;
+    }
+
+    if !saw_line {
+        return Err(DecodeError::Parse(
+            "jsonl payload contained no records".to_string(),
+        ));
+    }
+
+    Ok(DecodeMetricsResult {
+        values: all_values,
+        skipped: combined_skipped,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -214,6 +309,7 @@ mod tests {
     fn input_format_debug() {
         assert_eq!(format!("{:?}", InputFormat::Protobuf), "Protobuf");
         assert_eq!(format!("{:?}", InputFormat::Json), "Json");
+        assert_eq!(format!("{:?}", InputFormat::Jsonl), "Jsonl");
         assert_eq!(format!("{:?}", InputFormat::Auto), "Auto");
     }
 
@@ -221,6 +317,84 @@ mod tests {
     fn input_format_equality() {
         assert_eq!(InputFormat::Protobuf, InputFormat::Protobuf);
         assert_ne!(InputFormat::Protobuf, InputFormat::Json);
-        assert_ne!(InputFormat::Json, InputFormat::Auto);
+        assert_ne!(InputFormat::Json, InputFormat::Jsonl);
+        assert_ne!(InputFormat::Jsonl, InputFormat::Auto);
+    }
+
+    #[test]
+    fn input_format_from_content_type_jsonl() {
+        assert_eq!(
+            InputFormat::from_content_type(Some("application/x-ndjson")),
+            InputFormat::Jsonl
+        );
+        assert_eq!(
+            InputFormat::from_content_type(Some("application/jsonl")),
+            InputFormat::Jsonl
+        );
+    }
+
+    #[test]
+    fn input_format_content_type() {
+        assert_eq!(
+            InputFormat::Protobuf.content_type(),
+            "application/x-protobuf"
+        );
+        assert_eq!(InputFormat::Json.content_type(), "application/json");
+        assert_eq!(InputFormat::Jsonl.content_type(), "application/x-ndjson");
+        assert_eq!(InputFormat::Auto.content_type(), "application/x-protobuf");
+    }
+
+    #[test]
+    fn decode_logs_jsonl() {
+        let line1 = r#"{"resourceLogs":[{"resource":{},"scopeLogs":[{"scope":{},"logRecords":[{"timeUnixNano":"123","severityNumber":9}]}]}]}"#;
+        let line2 = r#"{"resourceLogs":[{"resource":{},"scopeLogs":[{"scope":{},"logRecords":[{"timeUnixNano":"456","severityNumber":13}]}]}]}"#;
+        let jsonl = format!("{}\n{}", line1, line2);
+
+        let result = decode_logs(jsonl.as_bytes(), InputFormat::Jsonl);
+        assert!(result.is_ok());
+        let values = result.unwrap();
+        assert_eq!(values.len(), 2);
+    }
+
+    #[test]
+    fn decode_logs_jsonl_empty_lines() {
+        let line1 = r#"{"resourceLogs":[{"resource":{},"scopeLogs":[{"scope":{},"logRecords":[{"timeUnixNano":"123"}]}]}]}"#;
+        let jsonl = format!("\n{}\n\n", line1);
+
+        let result = decode_logs(jsonl.as_bytes(), InputFormat::Jsonl);
+        assert!(result.is_ok());
+        let values = result.unwrap();
+        assert_eq!(values.len(), 1);
+    }
+
+    #[test]
+    fn decode_logs_jsonl_empty_payload() {
+        let result = decode_logs(b"", InputFormat::Jsonl);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("no records"));
+    }
+
+    #[test]
+    fn decode_traces_jsonl() {
+        let line1 = r#"{"resourceSpans":[{"resource":{},"scopeSpans":[{"scope":{},"spans":[{"traceId":"00000000000000000000000000000001","spanId":"0000000000000001","name":"span1","startTimeUnixNano":"100","endTimeUnixNano":"200"}]}]}]}"#;
+        let jsonl = format!("{}\n", line1);
+
+        let result = decode_traces(jsonl.as_bytes(), InputFormat::Jsonl);
+        assert!(result.is_ok());
+        let values = result.unwrap();
+        assert_eq!(values.len(), 1);
+    }
+
+    #[test]
+    fn decode_metrics_jsonl() {
+        let line1 = r#"{"resourceMetrics":[{"resource":{},"scopeMetrics":[{"scope":{},"metrics":[{"name":"test","gauge":{"dataPoints":[{"timeUnixNano":"100","asDouble":1.0}]}}]}]}]}"#;
+        let line2 = r#"{"resourceMetrics":[{"resource":{},"scopeMetrics":[{"scope":{},"metrics":[{"name":"test2","gauge":{"dataPoints":[{"timeUnixNano":"200","asDouble":2.0}]}}]}]}]}"#;
+        let jsonl = format!("{}\n{}", line1, line2);
+
+        let result = decode_metrics(jsonl.as_bytes(), InputFormat::Jsonl);
+        assert!(result.is_ok());
+        let decode_result = result.unwrap();
+        assert_eq!(decode_result.values.len(), 2);
     }
 }

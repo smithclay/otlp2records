@@ -87,7 +87,9 @@ fn export_logs_to_vrl_proto(
 // ============================================================================
 
 pub fn decode_json(body: &[u8]) -> Result<Vec<VrlValue>, DecodeError> {
-    let request: JsonExportLogsServiceRequest = serde_json::from_slice(body)?;
+    // Normalize JSON to convert enum strings to numbers before parsing
+    let normalized = super::normalize::normalize_json_bytes(body)?;
+    let request: JsonExportLogsServiceRequest = serde_json::from_slice(&normalized)?;
     export_logs_json_to_vrl(request)
 }
 

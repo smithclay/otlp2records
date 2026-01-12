@@ -309,7 +309,9 @@ fn build_exemplars(
 // ============================================================================
 
 pub fn decode_json(body: &[u8]) -> Result<DecodeMetricsResult, DecodeError> {
-    let request: JsonExportMetricsServiceRequest = serde_json::from_slice(body)?;
+    // Normalize JSON to convert enum strings to numbers before parsing
+    let normalized = super::normalize::normalize_json_bytes(body)?;
+    let request: JsonExportMetricsServiceRequest = serde_json::from_slice(&normalized)?;
     export_metrics_to_vrl_json(request)
 }
 
@@ -379,8 +381,16 @@ fn export_metrics_to_vrl_json(
                     }
                 }
 
-                // JSON doesn't have histogram/summary in the current struct definitions
-                // If they were present, we'd track them here
+                // Track skipped histogram/exponential_histogram/summary metrics
+                if let Some(h) = metric.histogram {
+                    skipped.histograms += h.data_points.len();
+                }
+                if let Some(eh) = metric.exponential_histogram {
+                    skipped.exponential_histograms += eh.data_points.len();
+                }
+                if let Some(s) = metric.summary {
+                    skipped.summaries += s.data_points.len();
+                }
             }
 
             Ok::<(), DecodeError>(())
@@ -561,6 +571,12 @@ struct JsonMetric {
     gauge: Option<JsonGauge>,
     #[serde(default)]
     sum: Option<JsonSum>,
+    #[serde(default)]
+    histogram: Option<JsonHistogram>,
+    #[serde(default)]
+    exponential_histogram: Option<JsonExponentialHistogram>,
+    #[serde(default)]
+    summary: Option<JsonSummary>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -579,6 +595,30 @@ struct JsonSum {
     aggregation_temporality: i64,
     #[serde(default)]
     is_monotonic: bool,
+}
+
+/// Minimal struct for histogram metrics (skipped, only count data_points)
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct JsonHistogram {
+    #[serde(default)]
+    data_points: Vec<serde_json::Value>,
+}
+
+/// Minimal struct for exponential histogram metrics (skipped, only count data_points)
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct JsonExponentialHistogram {
+    #[serde(default)]
+    data_points: Vec<serde_json::Value>,
+}
+
+/// Minimal struct for summary metrics (skipped, only count data_points)
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct JsonSummary {
+    #[serde(default)]
+    data_points: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Default, Deserialize)]
