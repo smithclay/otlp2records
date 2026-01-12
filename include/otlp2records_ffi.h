@@ -55,6 +55,14 @@ typedef enum OtlpSignalType {
    Sum/counter metrics (C: OTLP_SIGNAL_METRICS_SUM)
    */
   MetricsSum = 3,
+  /*
+   Histogram metrics (C: OTLP_SIGNAL_METRICS_HISTOGRAM)
+   */
+  MetricsHistogram = 4,
+  /*
+   Exponential histogram metrics (C: OTLP_SIGNAL_METRICS_EXP_HISTOGRAM)
+   */
+  MetricsExpHistogram = 5,
 } OtlpSignalType;
 
 /*

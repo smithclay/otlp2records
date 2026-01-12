@@ -43,6 +43,20 @@ pub static OTLP_SUM_PROGRAM: Lazy<Program> = Lazy::new(|| {
         .program
 });
 
+pub static OTLP_HISTOGRAM_PROGRAM: Lazy<Program> = Lazy::new(|| {
+    let fns = functions::all();
+    compile(OTLP_HISTOGRAM_SOURCE, &fns)
+        .expect("OTLP_HISTOGRAM VRL should compile")
+        .program
+});
+
+pub static OTLP_EXP_HISTOGRAM_PROGRAM: Lazy<Program> = Lazy::new(|| {
+    let fns = functions::all();
+    compile(OTLP_EXP_HISTOGRAM_SOURCE, &fns)
+        .expect("OTLP_EXP_HISTOGRAM VRL should compile")
+        .program
+});
+
 /// VRL transformation error
 #[derive(Debug)]
 pub struct VrlError(pub String);
@@ -142,6 +156,8 @@ pub fn init_programs() {
     let _ = &*OTLP_TRACES_PROGRAM;
     let _ = &*OTLP_GAUGE_PROGRAM;
     let _ = &*OTLP_SUM_PROGRAM;
+    let _ = &*OTLP_HISTOGRAM_PROGRAM;
+    let _ = &*OTLP_EXP_HISTOGRAM_PROGRAM;
 }
 
 impl Default for VrlTransformer {

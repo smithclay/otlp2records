@@ -201,7 +201,7 @@ pub fn decode_traces(bytes: &[u8], format: InputFormat) -> Result<Vec<Value>, De
 /// # Skipped Metrics
 ///
 /// The following are skipped and tracked in the returned [`DecodeMetricsResult::skipped`]:
-/// - Histogram, ExponentialHistogram, and Summary metric types (not supported)
+/// - Summary metric types (deprecated in OTLP spec)
 /// - Data points with non-finite values (NaN, Infinity)
 /// - Data points with missing values
 ///
@@ -303,8 +303,6 @@ fn decode_metrics_jsonl(bytes: &[u8]) -> Result<DecodeMetricsResult, DecodeError
         all_values.extend(result.values);
 
         // Merge skipped counts
-        combined_skipped.histograms += result.skipped.histograms;
-        combined_skipped.exponential_histograms += result.skipped.exponential_histograms;
         combined_skipped.summaries += result.skipped.summaries;
         combined_skipped.nan_values += result.skipped.nan_values;
         combined_skipped.infinity_values += result.skipped.infinity_values;

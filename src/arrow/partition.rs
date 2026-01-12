@@ -72,6 +72,10 @@ pub struct PartitionedMetrics {
     pub gauge: ServiceGroupedBatches,
     /// Sum metrics grouped by service
     pub sum: ServiceGroupedBatches,
+    /// Histogram metrics grouped by service
+    pub histogram: ServiceGroupedBatches,
+    /// Exponential histogram metrics grouped by service
+    pub exp_histogram: ServiceGroupedBatches,
     /// Metrics that were skipped during processing
     pub skipped: SkippedMetrics,
 }

@@ -1,7 +1,7 @@
 //! OTLP metrics decoding - protobuf and JSON
 //!
-//! Supports Gauge and Sum metric types. Histogram, ExponentialHistogram, and Summary
-//! types are skipped (use [`SkippedMetrics`] to track what was skipped).
+//! Supports Gauge, Sum, Histogram, and ExponentialHistogram metric types.
+//! Summary metrics are skipped (deprecated in OTLP spec).
 //! Data points with non-finite values (NaN, Infinity) are skipped.
 
 /// Tracks metrics that were skipped during decoding.
@@ -10,11 +10,7 @@
 /// into what data was not processed (unsupported types or invalid values).
 #[derive(Debug, Default, Clone)]
 pub struct SkippedMetrics {
-    /// Count of histogram metrics skipped (not supported)
-    pub histograms: usize,
-    /// Count of exponential histogram metrics skipped (not supported)
-    pub exponential_histograms: usize,
-    /// Count of summary metrics skipped (not supported)
+    /// Count of summary metrics skipped (deprecated in OTLP spec)
     pub summaries: usize,
     /// Count of data points skipped due to NaN values
     pub nan_values: usize,
@@ -27,9 +23,7 @@ pub struct SkippedMetrics {
 impl SkippedMetrics {
     /// Returns true if any metrics were skipped
     pub fn has_skipped(&self) -> bool {
-        self.histograms > 0
-            || self.exponential_histograms > 0
-            || self.summaries > 0
+        self.summaries > 0
             || self.nan_values > 0
             || self.infinity_values > 0
             || self.missing_values > 0
@@ -37,12 +31,7 @@ impl SkippedMetrics {
 
     /// Returns total count of skipped items
     pub fn total(&self) -> usize {
-        self.histograms
-            + self.exponential_histograms
-            + self.summaries
-            + self.nan_values
-            + self.infinity_values
-            + self.missing_values
+        self.summaries + self.nan_values + self.infinity_values + self.missing_values
     }
 }
 
@@ -150,10 +139,23 @@ fn export_metrics_to_vrl_proto(
                         }
                     }
                     Some(Data::Histogram(h)) => {
-                        skipped.histograms += h.data_points.len();
+                        let aggregation_temporality = h.aggregation_temporality as i64;
+                        for point in h.data_points {
+                            let record =
+                                build_histogram_from_point(&point, &ctx, aggregation_temporality)?;
+                            values.push(record);
+                        }
                     }
                     Some(Data::ExponentialHistogram(eh)) => {
-                        skipped.exponential_histograms += eh.data_points.len();
+                        let aggregation_temporality = eh.aggregation_temporality as i64;
+                        for point in eh.data_points {
+                            let record = build_exp_histogram_from_point(
+                                &point,
+                                &ctx,
+                                aggregation_temporality,
+                            )?;
+                            values.push(record);
+                        }
                     }
                     Some(Data::Summary(s)) => {
                         skipped.summaries += s.data_points.len();
@@ -185,6 +187,8 @@ fn count_data_points(metric: &opentelemetry_proto::tonic::metrics::v1::Metric) -
     match &metric.data {
         Some(Data::Gauge(g)) => g.data_points.len(),
         Some(Data::Sum(s)) => s.data_points.len(),
+        Some(Data::Histogram(h)) => h.data_points.len(),
+        Some(Data::ExponentialHistogram(eh)) => eh.data_points.len(),
         _ => 0,
     }
 }
@@ -271,6 +275,109 @@ fn build_sum_from_point(
     };
 
     Ok(Some(build_sum_record(parts)))
+}
+
+fn build_histogram_from_point(
+    point: &opentelemetry_proto::tonic::metrics::v1::HistogramDataPoint,
+    ctx: &MetricContext,
+    aggregation_temporality: i64,
+) -> Result<VrlValue, DecodeError> {
+    let time_unix_nano =
+        safe_timestamp_conversion(point.time_unix_nano, "histogram.time_unix_nano")?;
+    let start_time_unix_nano =
+        safe_timestamp_conversion(point.start_time_unix_nano, "histogram.start_time_unix_nano")?;
+
+    let exemplars = build_exemplars(&point.exemplars)?;
+
+    // Convert bucket_counts and explicit_bounds to JSON strings
+    let bucket_counts_json =
+        serde_json::to_string(&point.bucket_counts).unwrap_or_else(|_| "[]".to_string());
+    let explicit_bounds_json =
+        serde_json::to_string(&point.explicit_bounds).unwrap_or_else(|_| "[]".to_string());
+
+    let parts = HistogramRecordParts {
+        time_unix_nano,
+        start_time_unix_nano,
+        metric_name: ctx.metric_name.clone(),
+        metric_description: ctx.metric_description.clone(),
+        metric_unit: ctx.metric_unit.clone(),
+        count: point.count as i64,
+        sum: point.sum,
+        min: point.min,
+        max: point.max,
+        bucket_counts: Bytes::from(bucket_counts_json),
+        explicit_bounds: Bytes::from(explicit_bounds_json),
+        attributes: otlp_attributes_to_value(&point.attributes),
+        resource: Arc::clone(&ctx.resource),
+        scope: Arc::clone(&ctx.scope),
+        flags: point.flags as i64,
+        exemplars,
+        aggregation_temporality,
+    };
+
+    Ok(build_histogram_record(parts))
+}
+
+fn build_exp_histogram_from_point(
+    point: &opentelemetry_proto::tonic::metrics::v1::ExponentialHistogramDataPoint,
+    ctx: &MetricContext,
+    aggregation_temporality: i64,
+) -> Result<VrlValue, DecodeError> {
+    let time_unix_nano =
+        safe_timestamp_conversion(point.time_unix_nano, "exp_histogram.time_unix_nano")?;
+    let start_time_unix_nano = safe_timestamp_conversion(
+        point.start_time_unix_nano,
+        "exp_histogram.start_time_unix_nano",
+    )?;
+
+    let exemplars = build_exemplars(&point.exemplars)?;
+
+    // Extract positive bucket data
+    let (positive_offset, positive_bucket_counts_json) = match &point.positive {
+        Some(buckets) => {
+            let counts_json =
+                serde_json::to_string(&buckets.bucket_counts).unwrap_or_else(|_| "[]".to_string());
+            (buckets.offset as i64, Bytes::from(counts_json))
+        }
+        None => (0, Bytes::from("[]")),
+    };
+
+    // Extract negative bucket data
+    let (negative_offset, negative_bucket_counts_json) = match &point.negative {
+        Some(buckets) => {
+            let counts_json =
+                serde_json::to_string(&buckets.bucket_counts).unwrap_or_else(|_| "[]".to_string());
+            (buckets.offset as i64, Bytes::from(counts_json))
+        }
+        None => (0, Bytes::from("[]")),
+    };
+
+    let parts = ExpHistogramRecordParts {
+        time_unix_nano,
+        start_time_unix_nano,
+        metric_name: ctx.metric_name.clone(),
+        metric_description: ctx.metric_description.clone(),
+        metric_unit: ctx.metric_unit.clone(),
+        count: point.count as i64,
+        sum: point.sum,
+        min: point.min,
+        max: point.max,
+        scale: point.scale as i64,
+        zero_count: point.zero_count as i64,
+        zero_threshold: point.zero_threshold,
+        positive_offset,
+        positive_bucket_counts: positive_bucket_counts_json,
+        negative_offset,
+        negative_bucket_counts: negative_bucket_counts_json,
+        attributes: otlp_attributes_to_value(&point.attributes),
+        resource: Arc::clone(&ctx.resource),
+        scope: Arc::clone(&ctx.scope),
+        flags: point.flags as i64,
+        exemplars,
+        aggregation_temporality,
+    };
+
+    Ok(build_exp_histogram_record(parts))
 }
 
 fn build_exemplars(
@@ -381,13 +488,29 @@ fn export_metrics_to_vrl_json(
                     }
                 }
 
-                // Track skipped histogram/exponential_histogram/summary metrics
-                if let Some(h) = metric.histogram {
-                    skipped.histograms += h.data_points.len();
+                if let Some(histogram) = metric.histogram {
+                    for point in histogram.data_points {
+                        let record = build_histogram_from_json_point(
+                            point,
+                            &ctx,
+                            histogram.aggregation_temporality,
+                        )?;
+                        values.push(record);
+                    }
                 }
-                if let Some(eh) = metric.exponential_histogram {
-                    skipped.exponential_histograms += eh.data_points.len();
+
+                if let Some(exp_histogram) = metric.exponential_histogram {
+                    for point in exp_histogram.data_points {
+                        let record = build_exp_histogram_from_json_point(
+                            point,
+                            &ctx,
+                            exp_histogram.aggregation_temporality,
+                        )?;
+                        values.push(record);
+                    }
                 }
+
+                // Track skipped summary metrics (deprecated in OTLP spec)
                 if let Some(s) = metric.summary {
                     skipped.summaries += s.data_points.len();
                 }
@@ -480,6 +603,121 @@ fn build_sum_from_json_point(
     };
 
     Ok(Some(build_sum_record(parts)))
+}
+
+fn build_histogram_from_json_point(
+    point: JsonHistogramDataPoint,
+    ctx: &MetricContext,
+    aggregation_temporality: i64,
+) -> Result<VrlValue, DecodeError> {
+    let exemplars = build_json_exemplars(point.exemplars)?;
+
+    // Convert bucket_counts to JSON string
+    let bucket_counts: Vec<u64> = point
+        .bucket_counts
+        .iter()
+        .filter_map(|n| n.as_i64().map(|v| v as u64))
+        .collect();
+    let bucket_counts_json =
+        serde_json::to_string(&bucket_counts).unwrap_or_else(|_| "[]".to_string());
+
+    // Convert explicit_bounds to JSON string
+    let explicit_bounds_json =
+        serde_json::to_string(&point.explicit_bounds).unwrap_or_else(|_| "[]".to_string());
+
+    let parts = HistogramRecordParts {
+        time_unix_nano: json_timestamp_to_i64(&point.time_unix_nano, "histogram.time_unix_nano")?,
+        start_time_unix_nano: json_timestamp_to_i64(
+            &point.start_time_unix_nano,
+            "histogram.start_time_unix_nano",
+        )?,
+        metric_name: ctx.metric_name.clone(),
+        metric_description: ctx.metric_description.clone(),
+        metric_unit: ctx.metric_unit.clone(),
+        count: point.count.as_i64().unwrap_or(0),
+        sum: point.sum,
+        min: point.min,
+        max: point.max,
+        bucket_counts: Bytes::from(bucket_counts_json),
+        explicit_bounds: Bytes::from(explicit_bounds_json),
+        attributes: json_attrs_to_value(point.attributes),
+        resource: Arc::clone(&ctx.resource),
+        scope: Arc::clone(&ctx.scope),
+        flags: point.flags as i64,
+        exemplars,
+        aggregation_temporality,
+    };
+
+    Ok(build_histogram_record(parts))
+}
+
+fn build_exp_histogram_from_json_point(
+    point: JsonExpHistogramDataPoint,
+    ctx: &MetricContext,
+    aggregation_temporality: i64,
+) -> Result<VrlValue, DecodeError> {
+    let exemplars = build_json_exemplars(point.exemplars)?;
+
+    // Extract positive bucket data
+    let (positive_offset, positive_bucket_counts_json) = match &point.positive {
+        Some(buckets) => {
+            let counts: Vec<u64> = buckets
+                .bucket_counts
+                .iter()
+                .filter_map(|n| n.as_i64().map(|v| v as u64))
+                .collect();
+            let counts_json = serde_json::to_string(&counts).unwrap_or_else(|_| "[]".to_string());
+            (buckets.offset as i64, Bytes::from(counts_json))
+        }
+        None => (0, Bytes::from("[]")),
+    };
+
+    // Extract negative bucket data
+    let (negative_offset, negative_bucket_counts_json) = match &point.negative {
+        Some(buckets) => {
+            let counts: Vec<u64> = buckets
+                .bucket_counts
+                .iter()
+                .filter_map(|n| n.as_i64().map(|v| v as u64))
+                .collect();
+            let counts_json = serde_json::to_string(&counts).unwrap_or_else(|_| "[]".to_string());
+            (buckets.offset as i64, Bytes::from(counts_json))
+        }
+        None => (0, Bytes::from("[]")),
+    };
+
+    let parts = ExpHistogramRecordParts {
+        time_unix_nano: json_timestamp_to_i64(
+            &point.time_unix_nano,
+            "exp_histogram.time_unix_nano",
+        )?,
+        start_time_unix_nano: json_timestamp_to_i64(
+            &point.start_time_unix_nano,
+            "exp_histogram.start_time_unix_nano",
+        )?,
+        metric_name: ctx.metric_name.clone(),
+        metric_description: ctx.metric_description.clone(),
+        metric_unit: ctx.metric_unit.clone(),
+        count: point.count.as_i64().unwrap_or(0),
+        sum: point.sum,
+        min: point.min,
+        max: point.max,
+        scale: point.scale as i64,
+        zero_count: point.zero_count.as_i64().unwrap_or(0),
+        zero_threshold: point.zero_threshold,
+        positive_offset,
+        positive_bucket_counts: positive_bucket_counts_json,
+        negative_offset,
+        negative_bucket_counts: negative_bucket_counts_json,
+        attributes: json_attrs_to_value(point.attributes),
+        resource: Arc::clone(&ctx.resource),
+        scope: Arc::clone(&ctx.scope),
+        flags: point.flags as i64,
+        exemplars,
+        aggregation_temporality,
+    };
+
+    Ok(build_exp_histogram_record(parts))
 }
 
 /// Extract numeric value, always producing Float for schema compatibility
@@ -597,20 +835,93 @@ struct JsonSum {
     is_monotonic: bool,
 }
 
-/// Minimal struct for histogram metrics (skipped, only count data_points)
+/// Struct for histogram metrics
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct JsonHistogram {
     #[serde(default)]
-    data_points: Vec<serde_json::Value>,
+    data_points: Vec<JsonHistogramDataPoint>,
+    #[serde(default)]
+    aggregation_temporality: i64,
 }
 
-/// Minimal struct for exponential histogram metrics (skipped, only count data_points)
+/// Struct for exponential histogram metrics
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct JsonExponentialHistogram {
     #[serde(default)]
-    data_points: Vec<serde_json::Value>,
+    data_points: Vec<JsonExpHistogramDataPoint>,
+    #[serde(default)]
+    aggregation_temporality: i64,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct JsonHistogramDataPoint {
+    #[serde(default)]
+    time_unix_nano: JsonNumberOrString,
+    #[serde(default)]
+    start_time_unix_nano: JsonNumberOrString,
+    #[serde(default)]
+    count: JsonNumberOrString,
+    #[serde(default)]
+    sum: Option<f64>,
+    #[serde(default)]
+    min: Option<f64>,
+    #[serde(default)]
+    max: Option<f64>,
+    #[serde(default)]
+    bucket_counts: Vec<JsonNumberOrString>,
+    #[serde(default)]
+    explicit_bounds: Vec<f64>,
+    #[serde(default)]
+    attributes: Vec<JsonKeyValue>,
+    #[serde(default)]
+    flags: u32,
+    #[serde(default)]
+    exemplars: Vec<JsonExemplar>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct JsonExpHistogramDataPoint {
+    #[serde(default)]
+    time_unix_nano: JsonNumberOrString,
+    #[serde(default)]
+    start_time_unix_nano: JsonNumberOrString,
+    #[serde(default)]
+    count: JsonNumberOrString,
+    #[serde(default)]
+    sum: Option<f64>,
+    #[serde(default)]
+    min: Option<f64>,
+    #[serde(default)]
+    max: Option<f64>,
+    #[serde(default)]
+    scale: i32,
+    #[serde(default)]
+    zero_count: JsonNumberOrString,
+    #[serde(default)]
+    zero_threshold: f64,
+    #[serde(default)]
+    positive: Option<JsonExpHistogramBuckets>,
+    #[serde(default)]
+    negative: Option<JsonExpHistogramBuckets>,
+    #[serde(default)]
+    attributes: Vec<JsonKeyValue>,
+    #[serde(default)]
+    flags: u32,
+    #[serde(default)]
+    exemplars: Vec<JsonExemplar>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct JsonExpHistogramBuckets {
+    #[serde(default)]
+    offset: i32,
+    #[serde(default)]
+    bucket_counts: Vec<JsonNumberOrString>,
 }
 
 /// Minimal struct for summary metrics (skipped, only count data_points)
@@ -701,6 +1012,53 @@ struct SumRecordParts {
     is_monotonic: bool,
 }
 
+/// Precomputed fields for building a histogram metric record into VRL values
+struct HistogramRecordParts {
+    time_unix_nano: i64,
+    start_time_unix_nano: i64,
+    metric_name: Bytes,
+    metric_description: Bytes,
+    metric_unit: Bytes,
+    count: i64,
+    sum: Option<f64>,
+    min: Option<f64>,
+    max: Option<f64>,
+    bucket_counts: Bytes,
+    explicit_bounds: Bytes,
+    attributes: VrlValue,
+    resource: Arc<VrlValue>,
+    scope: Arc<VrlValue>,
+    flags: i64,
+    exemplars: Vec<ExemplarParts>,
+    aggregation_temporality: i64,
+}
+
+/// Precomputed fields for building an exponential histogram metric record into VRL values
+struct ExpHistogramRecordParts {
+    time_unix_nano: i64,
+    start_time_unix_nano: i64,
+    metric_name: Bytes,
+    metric_description: Bytes,
+    metric_unit: Bytes,
+    count: i64,
+    sum: Option<f64>,
+    min: Option<f64>,
+    max: Option<f64>,
+    scale: i64,
+    zero_count: i64,
+    zero_threshold: f64,
+    positive_offset: i64,
+    positive_bucket_counts: Bytes,
+    negative_offset: i64,
+    negative_bucket_counts: Bytes,
+    attributes: VrlValue,
+    resource: Arc<VrlValue>,
+    scope: Arc<VrlValue>,
+    flags: i64,
+    exemplars: Vec<ExemplarParts>,
+    aggregation_temporality: i64,
+}
+
 /// Pre-allocate values Vec for metrics
 fn preallocate_metric_values<R, F>(resource_metrics: &[R], count_points: F) -> Vec<VrlValue>
 where
@@ -781,6 +1139,123 @@ fn build_sum_record(parts: SumRecordParts) -> VrlValue {
     );
     map.insert("is_monotonic".into(), VrlValue::Boolean(parts.is_monotonic));
     map.insert("_metric_type".into(), VrlValue::Bytes(Bytes::from("sum")));
+    VrlValue::Object(map)
+}
+
+fn build_histogram_record(parts: HistogramRecordParts) -> VrlValue {
+    let mut map = ObjectMap::new();
+    map.insert(
+        "time_unix_nano".into(),
+        VrlValue::Integer(parts.time_unix_nano),
+    );
+    map.insert(
+        "start_time_unix_nano".into(),
+        VrlValue::Integer(parts.start_time_unix_nano),
+    );
+    map.insert("metric_name".into(), VrlValue::Bytes(parts.metric_name));
+    map.insert(
+        "metric_description".into(),
+        VrlValue::Bytes(parts.metric_description),
+    );
+    map.insert("metric_unit".into(), VrlValue::Bytes(parts.metric_unit));
+    map.insert("count".into(), VrlValue::Integer(parts.count));
+    map.insert(
+        "sum".into(),
+        parts.sum.map(finite_float_to_vrl).unwrap_or(VrlValue::Null),
+    );
+    map.insert(
+        "min".into(),
+        parts.min.map(finite_float_to_vrl).unwrap_or(VrlValue::Null),
+    );
+    map.insert(
+        "max".into(),
+        parts.max.map(finite_float_to_vrl).unwrap_or(VrlValue::Null),
+    );
+    map.insert("bucket_counts".into(), VrlValue::Bytes(parts.bucket_counts));
+    map.insert(
+        "explicit_bounds".into(),
+        VrlValue::Bytes(parts.explicit_bounds),
+    );
+    map.insert("attributes".into(), parts.attributes);
+    map.insert("resource".into(), (*parts.resource).clone());
+    map.insert("scope".into(), (*parts.scope).clone());
+    map.insert("flags".into(), VrlValue::Integer(parts.flags));
+    map.insert("exemplars".into(), build_exemplars_array(parts.exemplars));
+    map.insert(
+        "aggregation_temporality".into(),
+        VrlValue::Integer(parts.aggregation_temporality),
+    );
+    map.insert(
+        "_metric_type".into(),
+        VrlValue::Bytes(Bytes::from("histogram")),
+    );
+    VrlValue::Object(map)
+}
+
+fn build_exp_histogram_record(parts: ExpHistogramRecordParts) -> VrlValue {
+    let mut map = ObjectMap::new();
+    map.insert(
+        "time_unix_nano".into(),
+        VrlValue::Integer(parts.time_unix_nano),
+    );
+    map.insert(
+        "start_time_unix_nano".into(),
+        VrlValue::Integer(parts.start_time_unix_nano),
+    );
+    map.insert("metric_name".into(), VrlValue::Bytes(parts.metric_name));
+    map.insert(
+        "metric_description".into(),
+        VrlValue::Bytes(parts.metric_description),
+    );
+    map.insert("metric_unit".into(), VrlValue::Bytes(parts.metric_unit));
+    map.insert("count".into(), VrlValue::Integer(parts.count));
+    map.insert(
+        "sum".into(),
+        parts.sum.map(finite_float_to_vrl).unwrap_or(VrlValue::Null),
+    );
+    map.insert(
+        "min".into(),
+        parts.min.map(finite_float_to_vrl).unwrap_or(VrlValue::Null),
+    );
+    map.insert(
+        "max".into(),
+        parts.max.map(finite_float_to_vrl).unwrap_or(VrlValue::Null),
+    );
+    map.insert("scale".into(), VrlValue::Integer(parts.scale));
+    map.insert("zero_count".into(), VrlValue::Integer(parts.zero_count));
+    map.insert(
+        "zero_threshold".into(),
+        finite_float_to_vrl(parts.zero_threshold),
+    );
+    map.insert(
+        "positive_offset".into(),
+        VrlValue::Integer(parts.positive_offset),
+    );
+    map.insert(
+        "positive_bucket_counts".into(),
+        VrlValue::Bytes(parts.positive_bucket_counts),
+    );
+    map.insert(
+        "negative_offset".into(),
+        VrlValue::Integer(parts.negative_offset),
+    );
+    map.insert(
+        "negative_bucket_counts".into(),
+        VrlValue::Bytes(parts.negative_bucket_counts),
+    );
+    map.insert("attributes".into(), parts.attributes);
+    map.insert("resource".into(), (*parts.resource).clone());
+    map.insert("scope".into(), (*parts.scope).clone());
+    map.insert("flags".into(), VrlValue::Integer(parts.flags));
+    map.insert("exemplars".into(), build_exemplars_array(parts.exemplars));
+    map.insert(
+        "aggregation_temporality".into(),
+        VrlValue::Integer(parts.aggregation_temporality),
+    );
+    map.insert(
+        "_metric_type".into(),
+        VrlValue::Bytes(Bytes::from("exp_histogram")),
+    );
     VrlValue::Object(map)
 }
 

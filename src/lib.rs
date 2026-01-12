@@ -68,9 +68,9 @@ use ::arrow::record_batch::RecordBatch;
 use vrl::value::{KeyString, Value};
 
 pub use arrow::{
-    extract_min_timestamp_micros, extract_service_name, gauge_schema, group_batch_by_service,
-    logs_schema, sum_schema, traces_schema, values_to_arrow, PartitionedBatch, PartitionedMetrics,
-    ServiceGroupedBatches,
+    exp_histogram_schema, extract_min_timestamp_micros, extract_service_name, gauge_schema,
+    group_batch_by_service, histogram_schema, logs_schema, sum_schema, traces_schema,
+    values_to_arrow, PartitionedBatch, PartitionedMetrics, ServiceGroupedBatches,
 };
 pub use decode::{
     count_skipped_metric_data_points, decode_logs, decode_metrics, decode_traces,
@@ -83,8 +83,8 @@ pub use output::to_parquet;
 pub use output::{to_ipc, to_json};
 pub use schemas::{schema_def, schema_defs, SchemaDef, SchemaField};
 pub use transform::{
-    VrlError, VrlTransformer, OTLP_GAUGE_PROGRAM, OTLP_LOGS_PROGRAM, OTLP_SUM_PROGRAM,
-    OTLP_TRACES_PROGRAM,
+    VrlError, VrlTransformer, OTLP_EXP_HISTOGRAM_PROGRAM, OTLP_GAUGE_PROGRAM,
+    OTLP_HISTOGRAM_PROGRAM, OTLP_LOGS_PROGRAM, OTLP_SUM_PROGRAM, OTLP_TRACES_PROGRAM,
 };
 
 // ============================================================================
@@ -93,18 +93,22 @@ pub use transform::{
 
 /// Result of transforming OTLP metrics to Arrow RecordBatches.
 ///
-/// Metrics are separated by type because gauge and sum metrics have different schemas.
+/// Metrics are separated by type because each metric type has a different schema.
 /// Each field is `None` if there were no metrics of that type in the input.
 ///
 /// The `skipped` field provides visibility into what data was not processed,
-/// including unsupported metric types (histogram, exponential histogram, summary)
-/// and invalid data points (NaN, Infinity, missing values).
+/// including unsupported metric types (summary) and invalid data points
+/// (NaN, Infinity, missing values).
 #[derive(Debug)]
 pub struct MetricBatches {
     /// RecordBatch containing gauge metrics (if any)
     pub gauge: Option<RecordBatch>,
     /// RecordBatch containing sum metrics (if any)
     pub sum: Option<RecordBatch>,
+    /// RecordBatch containing histogram metrics (if any)
+    pub histogram: Option<RecordBatch>,
+    /// RecordBatch containing exponential histogram metrics (if any)
+    pub exp_histogram: Option<RecordBatch>,
     /// Metrics that were skipped during processing
     pub skipped: SkippedMetrics,
 }
@@ -116,20 +120,28 @@ pub struct JsonMetricBatches {
     pub gauge: Vec<serde_json::Value>,
     /// JSON values for sum metrics
     pub sum: Vec<serde_json::Value>,
+    /// JSON values for histogram metrics
+    pub histogram: Vec<serde_json::Value>,
+    /// JSON values for exponential histogram metrics
+    pub exp_histogram: Vec<serde_json::Value>,
     /// Metrics that were skipped during processing
     pub skipped: SkippedMetrics,
 }
 
 /// Result of applying VRL transformation to metrics.
 ///
-/// Metrics are partitioned by type because gauge and sum metrics require
-/// different VRL transformation programs and have different output schemas.
+/// Metrics are partitioned by type because each metric type requires
+/// a different VRL transformation program and has a different output schema.
 #[derive(Debug, Default)]
 pub struct MetricValues {
     /// Transformed gauge metric values
     pub gauge: Vec<Value>,
     /// Transformed sum metric values
     pub sum: Vec<Value>,
+    /// Transformed histogram metric values
+    pub histogram: Vec<Value>,
+    /// Transformed exponential histogram metric values
+    pub exp_histogram: Vec<Value>,
 }
 
 // ============================================================================
@@ -270,9 +282,29 @@ pub fn transform_metrics(bytes: &[u8], format: InputFormat) -> Result<MetricBatc
         Some(values_to_arrow(&metric_values.sum, &sum_schema())?)
     };
 
+    let histogram = if metric_values.histogram.is_empty() {
+        None
+    } else {
+        Some(values_to_arrow(
+            &metric_values.histogram,
+            &histogram_schema(),
+        )?)
+    };
+
+    let exp_histogram = if metric_values.exp_histogram.is_empty() {
+        None
+    } else {
+        Some(values_to_arrow(
+            &metric_values.exp_histogram,
+            &exp_histogram_schema(),
+        )?)
+    };
+
     Ok(MetricBatches {
         gauge,
         sum,
+        histogram,
+        exp_histogram,
         skipped: decode_result.skipped,
     })
 }
@@ -285,6 +317,8 @@ pub fn transform_metrics_json(bytes: &[u8], format: InputFormat) -> Result<JsonM
     Ok(JsonMetricBatches {
         gauge: values_to_json(metric_values.gauge, "gauge metric")?,
         sum: values_to_json(metric_values.sum, "sum metric")?,
+        histogram: values_to_json(metric_values.histogram, "histogram metric")?,
+        exp_histogram: values_to_json(metric_values.exp_histogram, "exp_histogram metric")?,
         skipped: decode_result.skipped,
     })
 }
@@ -408,9 +442,21 @@ pub fn transform_metrics_partitioned(
         None => ServiceGroupedBatches::default(),
     };
 
+    let histogram = match batches.histogram {
+        Some(batch) => group_batch_by_service(batch),
+        None => ServiceGroupedBatches::default(),
+    };
+
+    let exp_histogram = match batches.exp_histogram {
+        Some(batch) => group_batch_by_service(batch),
+        None => ServiceGroupedBatches::default(),
+    };
+
     Ok(PartitionedMetrics {
         gauge,
         sum,
+        histogram,
+        exp_histogram,
         skipped: batches.skipped,
     })
 }
@@ -543,9 +589,24 @@ pub fn apply_metric_transform(values: Vec<Value>) -> Result<MetricValues> {
                     .map_err(|e| Error::VrlRuntime(format!("sum metric {}: {}", idx, e.0)))?;
                 result.sum.push(transformed);
             }
+            "histogram" => {
+                let (_table, transformed) = transformer
+                    .transform(&OTLP_HISTOGRAM_PROGRAM, value)
+                    .map_err(|e| {
+                    Error::VrlRuntime(format!("histogram metric {}: {}", idx, e.0))
+                })?;
+                result.histogram.push(transformed);
+            }
+            "exp_histogram" => {
+                let (_table, transformed) = transformer
+                    .transform(&OTLP_EXP_HISTOGRAM_PROGRAM, value)
+                    .map_err(|e| {
+                        Error::VrlRuntime(format!("exp_histogram metric {}: {}", idx, e.0))
+                    })?;
+                result.exp_histogram.push(transformed);
+            }
             _ => {
-                // Skip unknown metric types (histogram, exponential_histogram, summary)
-                // These are documented as not supported in decode_metrics
+                // Skip unknown metric types (summary - deprecated in OTLP spec)
             }
         }
     }
@@ -1123,6 +1184,8 @@ mod tests {
         let batches = MetricBatches {
             gauge: None,
             sum: None,
+            histogram: None,
+            exp_histogram: None,
             skipped: SkippedMetrics::default(),
         };
         let debug_str = format!("{:?}", batches);
@@ -1134,6 +1197,8 @@ mod tests {
         let values = MetricValues::default();
         assert!(values.gauge.is_empty());
         assert!(values.sum.is_empty());
+        assert!(values.histogram.is_empty());
+        assert!(values.exp_histogram.is_empty());
     }
 
     #[test]

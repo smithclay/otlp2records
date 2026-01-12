@@ -14,4 +14,6 @@ pub use partition::{
     extract_min_timestamp_micros, extract_service_name, group_batch_by_service, PartitionedBatch,
     PartitionedMetrics, ServiceGroupedBatches,
 };
-pub use schema::{gauge_schema, logs_schema, sum_schema, traces_schema};
+pub use schema::{
+    exp_histogram_schema, gauge_schema, histogram_schema, logs_schema, sum_schema, traces_schema,
+};

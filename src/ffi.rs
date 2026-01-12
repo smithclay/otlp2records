@@ -25,8 +25,8 @@ use arrow::ffi_stream::FFI_ArrowArrayStream;
 
 use crate::decode::InputFormat;
 use crate::{
-    gauge_schema, logs_schema, sum_schema, traces_schema, transform_logs, transform_metrics,
-    transform_traces,
+    exp_histogram_schema, gauge_schema, histogram_schema, logs_schema, sum_schema, traces_schema,
+    transform_logs, transform_metrics, transform_traces,
 };
 
 // ============================================================================
@@ -47,6 +47,10 @@ pub enum OtlpSignalType {
     MetricsGauge = 2,
     /// Sum/counter metrics (C: OTLP_SIGNAL_METRICS_SUM)
     MetricsSum = 3,
+    /// Histogram metrics (C: OTLP_SIGNAL_METRICS_HISTOGRAM)
+    MetricsHistogram = 4,
+    /// Exponential histogram metrics (C: OTLP_SIGNAL_METRICS_EXP_HISTOGRAM)
+    MetricsExpHistogram = 5,
 }
 
 /// Input format for OTLP data.
@@ -151,6 +155,12 @@ impl OtlpParserHandle {
             OtlpSignalType::MetricsSum => {
                 transform_metrics(&self.buffer, self.format).map(|m| m.sum)
             }
+            OtlpSignalType::MetricsHistogram => {
+                transform_metrics(&self.buffer, self.format).map(|m| m.histogram)
+            }
+            OtlpSignalType::MetricsExpHistogram => {
+                transform_metrics(&self.buffer, self.format).map(|m| m.exp_histogram)
+            }
         };
 
         match result {
@@ -178,6 +188,8 @@ impl OtlpParserHandle {
             OtlpSignalType::Traces => Arc::new(traces_schema()),
             OtlpSignalType::MetricsGauge => Arc::new(gauge_schema()),
             OtlpSignalType::MetricsSum => Arc::new(sum_schema()),
+            OtlpSignalType::MetricsHistogram => Arc::new(histogram_schema()),
+            OtlpSignalType::MetricsExpHistogram => Arc::new(exp_histogram_schema()),
         }
     }
 }
@@ -362,6 +374,8 @@ pub unsafe extern "C" fn otlp_get_schema(
             OtlpSignalType::Traces => traces_schema(),
             OtlpSignalType::MetricsGauge => gauge_schema(),
             OtlpSignalType::MetricsSum => sum_schema(),
+            OtlpSignalType::MetricsHistogram => histogram_schema(),
+            OtlpSignalType::MetricsExpHistogram => exp_histogram_schema(),
         };
 
         match FFI_ArrowSchema::try_from(&schema) {
@@ -412,6 +426,12 @@ pub unsafe extern "C" fn otlp_transform(
             OtlpSignalType::Traces => transform_traces(slice, format).map(Some),
             OtlpSignalType::MetricsGauge => transform_metrics(slice, format).map(|m| m.gauge),
             OtlpSignalType::MetricsSum => transform_metrics(slice, format).map(|m| m.sum),
+            OtlpSignalType::MetricsHistogram => {
+                transform_metrics(slice, format).map(|m| m.histogram)
+            }
+            OtlpSignalType::MetricsExpHistogram => {
+                transform_metrics(slice, format).map(|m| m.exp_histogram)
+            }
         };
 
         match batch_result {
@@ -444,6 +464,8 @@ pub unsafe extern "C" fn otlp_transform(
                     OtlpSignalType::Traces => traces_schema(),
                     OtlpSignalType::MetricsGauge => gauge_schema(),
                     OtlpSignalType::MetricsSum => sum_schema(),
+                    OtlpSignalType::MetricsHistogram => histogram_schema(),
+                    OtlpSignalType::MetricsExpHistogram => exp_histogram_schema(),
                 };
 
                 let empty_batch = RecordBatch::new_empty(Arc::new(schema.clone()));

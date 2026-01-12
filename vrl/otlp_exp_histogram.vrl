@@ -1,0 +1,80 @@
+# @schema exp_histogram
+# @description OTLP exponential histogram metrics flattened for Arrow RecordBatch
+#
+# timestamp: timestamp, required, "Observation time in milliseconds"
+# start_timestamp: int64, "Start time in milliseconds"
+# metric_name: string, required, "Metric name"
+# metric_description: string, "Metric description"
+# metric_unit: string, "Unit (e.g., ms, bytes, 1)"
+# count: int64, required, "Total count of observations"
+# sum: float64, "Sum of all observations"
+# min: float64, "Minimum observed value"
+# max: float64, "Maximum observed value"
+# scale: int32, required, "Exponential scale factor"
+# zero_count: int64, required, "Count of zero values"
+# zero_threshold: float64, "Boundary of zero bucket"
+# positive_offset: int32, "Start index for positive buckets"
+# positive_bucket_counts: json, "JSON array of positive bucket counts"
+# negative_offset: int32, "Start index for negative buckets"
+# negative_bucket_counts: json, "JSON array of negative bucket counts"
+# service_name: string, required, "Service name from resource"
+# service_namespace: string
+# service_instance_id: string
+# resource_attributes: json, "Resource attributes blob"
+# scope_name: string, "Instrumentation scope name"
+# scope_version: string, "Instrumentation scope version"
+# scope_attributes: json, "Scope attributes blob"
+# metric_attributes: json, "Data point attributes blob"
+# flags: int32, "Data point flags"
+# exemplars_json: json, "Exemplars with trace context"
+# aggregation_temporality: int32, required, "1=delta, 2=cumulative"
+# @end
+
+# vrl/otlp_exp_histogram.vrl - OTLP exponential histogram metrics -> flat metric event
+# Note: Records are pre-partitioned by _metric_type in Rust before reaching VRL
+
+# Timestamps (nanoseconds -> milliseconds)
+.timestamp = nanos_to_millis(.time_unix_nano)
+.start_timestamp = nanos_to_millis(.start_time_unix_nano)
+
+# Metric metadata (default to empty string)
+.metric_name = string_or_null(.metric_name)
+if .metric_name == null { .metric_name = "" }
+.metric_description = string_or_null(.metric_description)
+if .metric_description == null { .metric_description = "" }
+.metric_unit = string_or_null(.metric_unit)
+if .metric_unit == null { .metric_unit = "" }
+
+# Exponential histogram-specific values (set by decoder)
+# .count, .sum, .min, .max, .scale, .zero_count, .zero_threshold are already set
+# .positive_offset, .positive_bucket_counts are already set (counts as JSON string)
+# .negative_offset, .negative_bucket_counts are already set (counts as JSON string)
+
+# Service info from resource attributes
+.service_name = get_attr(.resource.attributes, "service.name", "unknown")
+.service_namespace = get_attr(.resource.attributes, "service.namespace")
+.service_instance_id = get_attr(.resource.attributes, "service.instance.id")
+
+# Attribute blobs as JSON
+.resource_attributes = json_or_null(.resource.attributes)
+.scope_name = string_or_null(.scope.name)
+.scope_version = string_or_null(.scope.version)
+.scope_attributes = json_or_null(.scope.attributes)
+.metric_attributes = json_or_null(.attributes)
+.exemplars_json = json_or_null(.exemplars)
+
+# Flags and exponential histogram-specific fields
+.flags = int_or_default(.flags, 0)
+.aggregation_temporality = int_or_default(.aggregation_temporality, 0)
+
+# Clean up nested structures
+.time_unix_nano = null
+.start_time_unix_nano = null
+.resource = null
+.scope = null
+.attributes = null
+.exemplars = null
+._metric_type = null
+
+# Routing
+._table = "exp_histogram"

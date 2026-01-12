@@ -111,6 +111,69 @@ pub fn sum_schema() -> Schema {
     OTLP_SUM_SCHEMA.clone()
 }
 
+/// Returns the Arrow schema for OTLP histogram metrics.
+///
+/// Schema fields:
+/// - timestamp: TimestampMillisecond (required)
+/// - start_timestamp: Int64 (optional)
+/// - metric_name: Utf8 (required)
+/// - metric_description: Utf8 (optional)
+/// - metric_unit: Utf8 (optional)
+/// - count: Int64 (required)
+/// - sum: Float64 (optional)
+/// - min: Float64 (optional)
+/// - max: Float64 (optional)
+/// - bucket_counts: Utf8/JSON (required) - JSON array of u64
+/// - explicit_bounds: Utf8/JSON (required) - JSON array of f64
+/// - service_name: Utf8 (required)
+/// - service_namespace: Utf8 (optional)
+/// - service_instance_id: Utf8 (optional)
+/// - resource_attributes: Utf8/JSON (optional)
+/// - scope_name: Utf8 (optional)
+/// - scope_version: Utf8 (optional)
+/// - scope_attributes: Utf8/JSON (optional)
+/// - metric_attributes: Utf8/JSON (optional)
+/// - flags: Int32 (optional)
+/// - exemplars_json: Utf8/JSON (optional)
+/// - aggregation_temporality: Int32 (required)
+pub fn histogram_schema() -> Schema {
+    OTLP_HISTOGRAM_SCHEMA.clone()
+}
+
+/// Returns the Arrow schema for OTLP exponential histogram metrics.
+///
+/// Schema fields:
+/// - timestamp: TimestampMillisecond (required)
+/// - start_timestamp: Int64 (optional)
+/// - metric_name: Utf8 (required)
+/// - metric_description: Utf8 (optional)
+/// - metric_unit: Utf8 (optional)
+/// - count: Int64 (required)
+/// - sum: Float64 (optional)
+/// - min: Float64 (optional)
+/// - max: Float64 (optional)
+/// - scale: Int32 (required)
+/// - zero_count: Int64 (required)
+/// - zero_threshold: Float64 (optional)
+/// - positive_offset: Int32 (optional)
+/// - positive_bucket_counts: Utf8/JSON (optional) - JSON array of u64
+/// - negative_offset: Int32 (optional)
+/// - negative_bucket_counts: Utf8/JSON (optional) - JSON array of u64
+/// - service_name: Utf8 (required)
+/// - service_namespace: Utf8 (optional)
+/// - service_instance_id: Utf8 (optional)
+/// - resource_attributes: Utf8/JSON (optional)
+/// - scope_name: Utf8 (optional)
+/// - scope_version: Utf8 (optional)
+/// - scope_attributes: Utf8/JSON (optional)
+/// - metric_attributes: Utf8/JSON (optional)
+/// - flags: Int32 (optional)
+/// - exemplars_json: Utf8/JSON (optional)
+/// - aggregation_temporality: Int32 (required)
+pub fn exp_histogram_schema() -> Schema {
+    OTLP_EXP_HISTOGRAM_SCHEMA.clone()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

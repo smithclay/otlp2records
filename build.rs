@@ -93,6 +93,8 @@ const VRL_SCRIPTS: &[(&str, &str)] = &[
     ("OTLP_TRACES", "otlp_traces.vrl"),
     ("OTLP_GAUGE", "otlp_gauge.vrl"),
     ("OTLP_SUM", "otlp_sum.vrl"),
+    ("OTLP_HISTOGRAM", "otlp_histogram.vrl"),
+    ("OTLP_EXP_HISTOGRAM", "otlp_exp_histogram.vrl"),
 ];
 
 fn compile_vrl_scripts() {
