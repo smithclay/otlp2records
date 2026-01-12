@@ -61,6 +61,9 @@ pub mod transform;
 #[cfg(all(feature = "wasm", target_arch = "wasm32"))]
 pub mod wasm;
 
+#[cfg(feature = "ffi")]
+pub mod ffi;
+
 use ::arrow::record_batch::RecordBatch;
 use vrl::value::{KeyString, Value};
 

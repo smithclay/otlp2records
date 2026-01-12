@@ -43,13 +43,23 @@ features = ["arrow"]
 getrandom = { version = "0.2", features = ["js"] }
 wasm-bindgen = { version = "0.2", optional = true }
 
+[lib]
+crate-type = ["rlib", "staticlib"]
+
 [features]
 default = []
 parquet = ["dep:parquet"]
 wasm = ["getrandom/js", "dep:wasm-bindgen"]
+ffi = ["dep:cbindgen"]  # Enable C FFI bindings with header generation
 
 [build-dependencies]
 vrl = { version = "0.29", default-features = false, features = ["compiler"] }
+cbindgen = { version = "0.27", optional = true }
+
+[package.metadata.cbindgen]
+language = "C"
+cpp_compat = true
+include_guard = "OTLP2RECORDS_FFI_H"
 
 [profile.release]
 opt-level = "z"

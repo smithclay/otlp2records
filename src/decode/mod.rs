@@ -90,12 +90,18 @@ pub fn decode_logs(bytes: &[u8], format: InputFormat) -> Result<Vec<Value>, Deco
             if looks_like_json(bytes) {
                 match logs::decode_json(bytes) {
                     Ok(values) => Ok(values),
-                    Err(json_err) => logs::decode_protobuf(bytes).map_err(|proto_err| {
-                        DecodeError::Unsupported(format!(
-                            "json decode failed: {}; protobuf fallback failed: {}",
-                            json_err, proto_err
-                        ))
-                    }),
+                    Err(json_err) => {
+                        // Try JSONL if JSON failed (e.g., multiple JSON objects)
+                        match decode_jsonl(bytes, logs::decode_json) {
+                            Ok(values) => Ok(values),
+                            Err(_jsonl_err) => logs::decode_protobuf(bytes).map_err(|proto_err| {
+                                DecodeError::Unsupported(format!(
+                                    "json decode failed: {}; protobuf fallback failed: {}",
+                                    json_err, proto_err
+                                ))
+                            }),
+                        }
+                    }
                 }
             } else {
                 match logs::decode_protobuf(bytes) {
@@ -142,12 +148,20 @@ pub fn decode_traces(bytes: &[u8], format: InputFormat) -> Result<Vec<Value>, De
             if looks_like_json(bytes) {
                 match traces::decode_json(bytes) {
                     Ok(values) => Ok(values),
-                    Err(json_err) => traces::decode_protobuf(bytes).map_err(|proto_err| {
-                        DecodeError::Unsupported(format!(
-                            "json decode failed: {}; protobuf fallback failed: {}",
-                            json_err, proto_err
-                        ))
-                    }),
+                    Err(json_err) => {
+                        // Try JSONL if JSON failed (e.g., multiple JSON objects)
+                        match decode_jsonl(bytes, traces::decode_json) {
+                            Ok(values) => Ok(values),
+                            Err(_jsonl_err) => {
+                                traces::decode_protobuf(bytes).map_err(|proto_err| {
+                                    DecodeError::Unsupported(format!(
+                                        "json decode failed: {}; protobuf fallback failed: {}",
+                                        json_err, proto_err
+                                    ))
+                                })
+                            }
+                        }
+                    }
                 }
             } else {
                 match traces::decode_protobuf(bytes) {
@@ -204,12 +218,20 @@ pub fn decode_metrics(
             if looks_like_json(bytes) {
                 match metrics::decode_json(bytes) {
                     Ok(values) => Ok(values),
-                    Err(json_err) => metrics::decode_protobuf(bytes).map_err(|proto_err| {
-                        DecodeError::Unsupported(format!(
-                            "json decode failed: {}; protobuf fallback failed: {}",
-                            json_err, proto_err
-                        ))
-                    }),
+                    Err(json_err) => {
+                        // Try JSONL if JSON failed (e.g., multiple JSON objects)
+                        match decode_metrics_jsonl(bytes) {
+                            Ok(values) => Ok(values),
+                            Err(_jsonl_err) => {
+                                metrics::decode_protobuf(bytes).map_err(|proto_err| {
+                                    DecodeError::Unsupported(format!(
+                                        "json decode failed: {}; protobuf fallback failed: {}",
+                                        json_err, proto_err
+                                    ))
+                                })
+                            }
+                        }
+                    }
                 }
             } else {
                 match metrics::decode_protobuf(bytes) {
