@@ -80,6 +80,10 @@ typedef enum OtlpSignalType {
     OTLP_SIGNAL_METRICS_GAUGE = 2,
     /** Sum/counter metrics */
     OTLP_SIGNAL_METRICS_SUM = 3,
+    /** Histogram metrics */
+    OTLP_SIGNAL_METRICS_HISTOGRAM = 4,
+    /** Exponential histogram metrics */
+    OTLP_SIGNAL_METRICS_EXP_HISTOGRAM = 5,
 } OtlpSignalType;
 
 /**
