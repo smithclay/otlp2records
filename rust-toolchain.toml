@@ -1,0 +1,3 @@
+[toolchain]
+# we do this because the duckdb extension builder is pinned to this rust version
+channel = "1.88"

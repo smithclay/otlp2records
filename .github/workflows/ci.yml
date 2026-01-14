@@ -17,8 +17,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Pinned to 1.88 for duckdb extension CI-CD compatibility
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.88
 
       - name: Cache cargo registry
         uses: actions/cache@v4
@@ -40,8 +41,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Pinned to 1.88 for duckdb extension CI-CD compatibility
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.88
         with:
           components: clippy
 
@@ -65,8 +67,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Pinned to 1.88 for duckdb extension CI-CD compatibility
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.88
         with:
           components: rustfmt
 
