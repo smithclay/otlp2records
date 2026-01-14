@@ -170,8 +170,7 @@ fn validate_id_field(value: &str, key: &str) -> Result<(), DecodeError> {
     }
 
     Err(DecodeError::Parse(format!(
-        "Failed to decode {}: expected hex or base64",
-        key
+        "Failed to decode {key}: expected hex or base64"
     )))
 }
 

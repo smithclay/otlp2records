@@ -240,8 +240,7 @@ fn test_logs_schema_consistency() {
     for field in required_fields {
         assert!(
             schema.field_with_name(field).is_ok(),
-            "Missing required field: {}",
-            field
+            "Missing required field: {field}"
         );
     }
 }
@@ -272,8 +271,7 @@ fn test_traces_schema_consistency() {
     for field in required_fields {
         assert!(
             schema.field_with_name(field).is_ok(),
-            "Missing required field: {}",
-            field
+            "Missing required field: {field}"
         );
     }
 }
@@ -293,8 +291,7 @@ fn test_metrics_schema_consistency() {
         for field in required_fields {
             assert!(
                 schema.field_with_name(field).is_ok(),
-                "Missing required gauge field: {}",
-                field
+                "Missing required gauge field: {field}"
             );
         }
     }
@@ -313,8 +310,7 @@ fn test_metrics_schema_consistency() {
         for field in required_fields {
             assert!(
                 schema.field_with_name(field).is_ok(),
-                "Missing required sum field: {}",
-                field
+                "Missing required sum field: {field}"
             );
         }
     }
@@ -339,7 +335,7 @@ fn test_logs_to_json_is_valid_ndjson() {
     for line in ndjson_str.lines() {
         if !line.trim().is_empty() {
             let parsed: Result<serde_json::Value, _> = serde_json::from_str(line);
-            assert!(parsed.is_ok(), "Invalid JSON line: {}", line);
+            assert!(parsed.is_ok(), "Invalid JSON line: {line}");
         }
     }
 }
@@ -359,7 +355,7 @@ fn test_traces_to_json_is_valid_ndjson() {
     for line in ndjson_str.lines() {
         if !line.trim().is_empty() {
             let parsed: Result<serde_json::Value, _> = serde_json::from_str(line);
-            assert!(parsed.is_ok(), "Invalid JSON line: {}", line);
+            assert!(parsed.is_ok(), "Invalid JSON line: {line}");
         }
     }
 }

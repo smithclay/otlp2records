@@ -608,7 +608,7 @@ mod tests {
                 assert!(msg.contains("timestamp overflow"));
                 assert!(msg.contains("start_time_unix_nano"));
             }
-            _ => panic!("Expected DecodeError::Unsupported, got: {:?}", err),
+            _ => panic!("Expected DecodeError::Unsupported, got: {err:?}"),
         }
     }
 
@@ -645,7 +645,7 @@ mod tests {
                 assert!(msg.contains("timestamp overflow"));
                 assert!(msg.contains("end_time_unix_nano"));
             }
-            _ => panic!("Expected DecodeError::Unsupported, got: {:?}", err),
+            _ => panic!("Expected DecodeError::Unsupported, got: {err:?}"),
         }
     }
 
@@ -688,7 +688,7 @@ mod tests {
                 assert!(msg.contains("timestamp overflow"));
                 assert!(msg.contains("event.time_unix_nano"));
             }
-            _ => panic!("Expected DecodeError::Unsupported, got: {:?}", err),
+            _ => panic!("Expected DecodeError::Unsupported, got: {err:?}"),
         }
     }
 

@@ -15,4 +15,4 @@ pub use ipc::to_ipc;
 pub use json::to_json;
 
 #[cfg(feature = "parquet")]
-pub use parquet::to_parquet;
+pub use parquet::{to_parquet, to_parquet_bytes};

@@ -377,7 +377,7 @@ mod tests {
 
     fn run_vrl(source: &str, input: Value) -> Result<Value, String> {
         let fns = crate::transform::functions::all();
-        let result = compile(source, &fns).map_err(|e| format!("{:?}", e))?;
+        let result = compile(source, &fns).map_err(|e| format!("{e:?}"))?;
 
         let mut runtime = Runtime::default();
         let mut target = TargetValue {
@@ -389,7 +389,7 @@ mod tests {
         let tz = TimeZone::Named(chrono_tz::UTC);
         runtime
             .resolve(&mut target, &result.program, &tz)
-            .map_err(|e| format!("{:?}", e))?;
+            .map_err(|e| format!("{e:?}"))?;
 
         Ok(target.value)
     }

@@ -1528,8 +1528,8 @@ mod tests {
 
     fn make_gauge_json(as_double: Option<f64>, as_int: Option<&str>) -> String {
         let value_field = match (as_double, as_int) {
-            (Some(d), _) => format!(r#""asDouble": {}"#, d),
-            (_, Some(i)) => format!(r#""asInt": "{}""#, i),
+            (Some(d), _) => format!(r#""asDouble": {d}"#),
+            (_, Some(i)) => format!(r#""asInt": "{i}""#),
             (None, None) => String::new(),
         };
 
@@ -1554,7 +1554,7 @@ mod tests {
             if value_field.is_empty() {
                 String::new()
             } else {
-                format!(", {}", value_field)
+                format!(", {value_field}")
             }
         )
     }

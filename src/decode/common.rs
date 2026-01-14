@@ -31,10 +31,10 @@ pub enum DecodeError {
 impl std::fmt::Display for DecodeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            DecodeError::Json(e) => write!(f, "JSON decode error: {}", e),
-            DecodeError::Protobuf(e) => write!(f, "protobuf decode error: {}", e),
-            DecodeError::Parse(msg) => write!(f, "parse error: {}", msg),
-            DecodeError::Unsupported(msg) => write!(f, "unsupported payload: {}", msg),
+            DecodeError::Json(e) => write!(f, "JSON decode error: {e}"),
+            DecodeError::Protobuf(e) => write!(f, "protobuf decode error: {e}"),
+            DecodeError::Parse(msg) => write!(f, "parse error: {msg}"),
+            DecodeError::Unsupported(msg) => write!(f, "unsupported payload: {msg}"),
         }
     }
 }
@@ -163,8 +163,7 @@ fn kvlist_to_object(kvlist: &KeyValueList) -> VrlValue {
 pub fn safe_timestamp_conversion(timestamp: u64, field_name: &str) -> Result<i64, DecodeError> {
     i64::try_from(timestamp).map_err(|_| {
         DecodeError::Unsupported(format!(
-            "timestamp overflow: {} value {} exceeds i64::MAX (year 2262)",
-            field_name, timestamp
+            "timestamp overflow: {field_name} value {timestamp} exceeds i64::MAX (year 2262)"
         ))
     })
 }
@@ -273,20 +272,17 @@ pub fn json_timestamp_to_i64(value: &JsonNumberOrString, field: &str) -> Result<
         JsonNumberOrString::String(s) => {
             let parsed = s.parse::<i128>().map_err(|_| {
                 DecodeError::Unsupported(format!(
-                    "invalid timestamp: {} value {} is not an integer",
-                    field, s
+                    "invalid timestamp: {field} value {s} is not an integer"
                 ))
             })?;
             if parsed < 0 {
                 return Err(DecodeError::Unsupported(format!(
-                    "invalid timestamp: {} value {} is negative",
-                    field, s
+                    "invalid timestamp: {field} value {s} is negative"
                 )));
             }
             if parsed > i64::MAX as i128 {
                 return Err(DecodeError::Unsupported(format!(
-                    "timestamp overflow: {} value {} exceeds i64::MAX (year 2262)",
-                    field, s
+                    "timestamp overflow: {field} value {s} exceeds i64::MAX (year 2262)"
                 )));
             }
             Ok(parsed as i64)
@@ -295,22 +291,19 @@ pub fn json_timestamp_to_i64(value: &JsonNumberOrString, field: &str) -> Result<
             if let Some(i) = n.as_i64() {
                 if i < 0 {
                     return Err(DecodeError::Unsupported(format!(
-                        "invalid timestamp: {} value {} is negative",
-                        field, n
+                        "invalid timestamp: {field} value {n} is negative"
                     )));
                 }
                 Ok(i)
             } else if let Some(u) = n.as_u64() {
                 i64::try_from(u).map_err(|_| {
                     DecodeError::Unsupported(format!(
-                        "timestamp overflow: {} value {} exceeds i64::MAX (year 2262)",
-                        field, u
+                        "timestamp overflow: {field} value {u} exceeds i64::MAX (year 2262)"
                     ))
                 })
             } else {
                 Err(DecodeError::Unsupported(format!(
-                    "invalid timestamp: {} value {} is not an integer",
-                    field, n
+                    "invalid timestamp: {field} value {n} is not an integer"
                 )))
             }
         }
@@ -509,7 +502,7 @@ mod tests {
     #[test]
     fn decode_error_display() {
         let err = DecodeError::Unsupported("test".into());
-        assert_eq!(format!("{}", err), "unsupported payload: test");
+        assert_eq!(format!("{err}"), "unsupported payload: test");
     }
 
     #[test]

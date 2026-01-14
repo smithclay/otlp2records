@@ -620,8 +620,7 @@ fn values_to_json(values: Vec<Value>, label: &str) -> Result<Vec<serde_json::Val
     for (idx, value) in values.into_iter().enumerate() {
         let json = crate::convert::vrl_value_to_json(&value).ok_or_else(|| {
             Error::InvalidInput(format!(
-                "{} record {} contains unrepresentable JSON value",
-                label, idx
+                "{label} record {idx} contains unrepresentable JSON value"
             ))
         })?;
         out.push(json);
@@ -1188,7 +1187,7 @@ mod tests {
             exp_histogram: None,
             skipped: SkippedMetrics::default(),
         };
-        let debug_str = format!("{:?}", batches);
+        let debug_str = format!("{batches:?}");
         assert!(debug_str.contains("MetricBatches"));
     }
 
@@ -1204,7 +1203,7 @@ mod tests {
     #[test]
     fn test_metric_values_debug() {
         let values = MetricValues::default();
-        let debug_str = format!("{:?}", values);
+        let debug_str = format!("{values:?}");
         assert!(debug_str.contains("MetricValues"));
     }
 

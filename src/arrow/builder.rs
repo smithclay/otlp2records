@@ -140,8 +140,7 @@ impl ColumnBuilder {
             }
             unsupported => {
                 panic!(
-                    "Unsupported Arrow data type: {:?}. Supported types: Timestamp(Millisecond), Int64, Int32, Float64, Boolean, Utf8",
-                    unsupported
+                    "Unsupported Arrow data type: {unsupported:?}. Supported types: Timestamp(Millisecond), Int64, Int32, Float64, Boolean, Utf8"
                 );
             }
         }
@@ -246,8 +245,7 @@ fn append_int32(builder: &mut Int32Builder, value: Option<&Value>) -> Result<(),
             let float_val = f.into_inner();
             if float_val.is_nan() || float_val.is_infinite() {
                 return Err(ArrowError::InvalidArgumentError(format!(
-                    "Cannot convert non-finite float {} to i32",
-                    float_val
+                    "Cannot convert non-finite float {float_val} to i32"
                 )));
             }
             if float_val < (i32::MIN as f64) || float_val > (i32::MAX as f64) {

@@ -60,7 +60,7 @@ impl FunctionExpression for ToIntFn {
                 const MAX_SAFE_FLOAT: f64 = 9_223_372_036_854_774_784.0;
                 const MIN_SAFE_FLOAT: f64 = i64::MIN as f64; // -9223372036854775808.0 is exact
                 if !(MIN_SAFE_FLOAT..=MAX_SAFE_FLOAT).contains(&float_val) {
-                    return Err(format!("float {} is out of range for i64", float_val).into());
+                    return Err(format!("float {float_val} is out of range for i64").into());
                 }
                 Ok(Value::Integer(float_val as i64))
             }
@@ -483,7 +483,7 @@ impl FunctionExpression for FloorFn {
                 const MAX_SAFE_FLOAT: f64 = 9_223_372_036_854_774_784.0;
                 const MIN_SAFE_FLOAT: f64 = i64::MIN as f64;
                 if !(MIN_SAFE_FLOAT..=MAX_SAFE_FLOAT).contains(&floored) {
-                    return Err(format!("floored value {} is out of range for i64", floored).into());
+                    return Err(format!("floored value {floored} is out of range for i64").into());
                 }
                 Ok(Value::Integer(floored as i64))
             }
@@ -505,7 +505,7 @@ mod tests {
 
     fn run_vrl(source: &str, input: Value) -> Result<Value, String> {
         let fns = crate::transform::functions::all();
-        let result = compile(source, &fns).map_err(|e| format!("{:?}", e))?;
+        let result = compile(source, &fns).map_err(|e| format!("{e:?}"))?;
 
         let mut runtime = Runtime::default();
         let mut target = TargetValue {
@@ -517,7 +517,7 @@ mod tests {
         let tz = TimeZone::Named(chrono_tz::UTC);
         runtime
             .resolve(&mut target, &result.program, &tz)
-            .map_err(|e| format!("{:?}", e))?;
+            .map_err(|e| format!("{e:?}"))?;
 
         Ok(target.value)
     }

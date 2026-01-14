@@ -106,7 +106,7 @@ impl VrlTransformer {
 
         self.runtime
             .resolve(&mut target, program, &UTC_TIMEZONE)
-            .map_err(|e| VrlError(format!("{:?}", e)))?;
+            .map_err(|e| VrlError(format!("{e:?}")))?;
 
         let table_key: KeyString = "_table".into();
         let table = if let Value::Object(ref map) = target.value {
@@ -275,6 +275,6 @@ mod tests {
     #[test]
     fn test_vrl_error_display() {
         let err = VrlError("test error".to_string());
-        assert_eq!(format!("{}", err), "VRL error: test error");
+        assert_eq!(format!("{err}"), "VRL error: test error");
     }
 }
