@@ -330,12 +330,9 @@ pub unsafe extern "C" fn otlp_parser_drain(
             arrow::record_batch::RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
 
         // Export to FFI stream
-        match arrow::ffi_stream::FFI_ArrowArrayStream::new(Box::new(reader)) {
-            stream => {
-                std::ptr::write(out_stream, stream);
-                OtlpStatus::Ok
-            }
-        }
+        let stream = arrow::ffi_stream::FFI_ArrowArrayStream::new(Box::new(reader));
+        std::ptr::write(out_stream, stream);
+        OtlpStatus::Ok
     }))
     .unwrap_or_else(|_| {
         if let Some(handle) = handle.as_mut() {

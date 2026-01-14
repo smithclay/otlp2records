@@ -49,11 +49,6 @@ impl ServiceGroupedBatches {
             .map(|pb| (pb.service_name.as_ref(), &pb.batch))
     }
 
-    /// Consume and iterate over partitioned batches
-    pub fn into_iter(self) -> impl Iterator<Item = PartitionedBatch> {
-        self.batches.into_iter()
-    }
-
     /// Check if empty
     pub fn is_empty(&self) -> bool {
         self.batches.is_empty()
@@ -62,6 +57,15 @@ impl ServiceGroupedBatches {
     /// Number of service groups
     pub fn len(&self) -> usize {
         self.batches.len()
+    }
+}
+
+impl IntoIterator for ServiceGroupedBatches {
+    type Item = PartitionedBatch;
+    type IntoIter = std::vec::IntoIter<PartitionedBatch>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.batches.into_iter()
     }
 }
 
