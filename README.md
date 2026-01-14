@@ -6,6 +6,8 @@ Transform OTLP telemetry (logs, traces, metrics) into Arrow RecordBatches.
 
 A high-performance, WASM-compatible library for converting OpenTelemetry Protocol (OTLP) data to Apache Arrow format for efficient storage and querying.
 
+Currently consumed by [duckdb-otlp](https://github.com/smithclay/duckdb-otlp), [otlp2parquet](https://github.com/smithclay/otlp2parquet) and [otlp2pipeline](https://github.com/smithclay/otlp2pipeline).
+
 ## Design Principles
 
 - **No I/O**: Core never touches network or filesystem
