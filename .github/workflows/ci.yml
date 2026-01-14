@@ -44,8 +44,9 @@ jobs:
       # Pinned to 1.88 for duckdb extension CI-CD compatibility
       - name: Install Rust
         uses: dtolnay/rust-toolchain@1.88
-        with:
-          components: clippy
+
+      - name: Install clippy
+        run: rustup component add clippy
 
       - name: Cache cargo registry
         uses: actions/cache@v4
@@ -70,8 +71,9 @@ jobs:
       # Pinned to 1.88 for duckdb extension CI-CD compatibility
       - name: Install Rust
         uses: dtolnay/rust-toolchain@1.88
-        with:
-          components: rustfmt
+
+      - name: Install rustfmt
+        run: rustup component add rustfmt
 
       - name: Check formatting
         run: cargo fmt --check
