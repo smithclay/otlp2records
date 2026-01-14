@@ -1,8 +1,8 @@
 [package]
 name = "otlp2records"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
-license = "MIT OR Apache-2.0"
+license = "Apache-2.0"
 description = "Transform OTLP telemetry to Arrow RecordBatches"
 keywords = ["opentelemetry", "otlp", "arrow", "observability"]
 categories = ["data-structures", "encoding"]
