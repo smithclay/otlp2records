@@ -221,7 +221,7 @@ pub fn decode_bytes_field(encoded: &str) -> Vec<u8> {
 
 /// Convert hex string to bytes
 pub fn hex_to_bytes(hex: &str) -> Option<Vec<u8>> {
-    if !hex.len().is_multiple_of(2) || hex.is_empty() {
+    if hex.len() % 2 != 0 || hex.is_empty() {
         return None;
     }
 
