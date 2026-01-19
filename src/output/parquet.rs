@@ -3,15 +3,37 @@
 //! Serializes Arrow RecordBatches to Parquet format.
 //! This module is only available when the `parquet` feature is enabled.
 
+use std::collections::HashMap;
 use std::io::{Cursor, Write};
+use std::sync::Arc;
 
 use arrow::array::RecordBatch;
+use arrow::datatypes::{Field, Schema};
 use bytes::Bytes;
 use parquet::arrow::ArrowWriter;
+use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 
 use crate::error::Error;
+
+/// Add PARQUET:field_id metadata to each field in the schema.
+/// Field IDs are assigned sequentially starting from 1 (Iceberg convention).
+fn add_field_ids_to_schema(schema: &Schema) -> Schema {
+    let fields_with_ids: Vec<Arc<Field>> = schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(idx, field)| {
+            let field_id = (idx + 1) as i32;
+            let mut metadata: HashMap<String, String> = field.metadata().clone();
+            metadata.insert(PARQUET_FIELD_ID_META_KEY.to_string(), field_id.to_string());
+            Arc::new(field.as_ref().clone().with_metadata(metadata))
+        })
+        .collect();
+
+    Schema::new_with_metadata(fields_with_ids, schema.metadata().clone())
+}
 
 /// Write a RecordBatch to Parquet format using a streaming writer
 ///
@@ -52,11 +74,16 @@ pub fn write_parquet<W: Write + Send>(
             .build()
     });
 
-    let mut arrow_writer = ArrowWriter::try_new(writer, batch.schema(), Some(props))
+    // Add field IDs to schema for Iceberg compatibility
+    let schema_with_ids = Arc::new(add_field_ids_to_schema(batch.schema().as_ref()));
+    let batch_with_ids = RecordBatch::try_new(schema_with_ids.clone(), batch.columns().to_vec())
+        .map_err(Error::Arrow)?;
+
+    let mut arrow_writer = ArrowWriter::try_new(writer, schema_with_ids, Some(props))
         .map_err(|e| Error::Arrow(arrow::error::ArrowError::ExternalError(Box::new(e))))?;
 
     arrow_writer
-        .write(batch)
+        .write(&batch_with_ids)
         .map_err(|e| Error::Arrow(arrow::error::ArrowError::ExternalError(Box::new(e))))?;
 
     arrow_writer

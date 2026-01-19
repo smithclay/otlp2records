@@ -23,7 +23,7 @@
 # Note: Records are pre-partitioned by _metric_type in Rust before reaching VRL
 
 # Timestamps (nanoseconds -> milliseconds)
-.timestamp = nanos_to_millis(.time_unix_nano)
+.timestamp = nanos_to_micros(.time_unix_nano)
 .start_timestamp = nanos_to_millis(.start_time_unix_nano)
 
 # Metric metadata (default to empty string)

@@ -332,7 +332,7 @@ fn parse_field_line(line: &str) -> Option<SchemaField> {
 fn map_to_arrow_type(field_type: &str) -> String {
     match field_type {
         "timestamp" => {
-            "arrow::datatypes::DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None)"
+            "arrow::datatypes::DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None)"
                 .to_string()
         }
         "int64" => "arrow::datatypes::DataType::Int64".to_string(),

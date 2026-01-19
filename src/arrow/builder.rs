@@ -4,7 +4,7 @@
 
 use arrow::array::{
     ArrayRef, BooleanBuilder, Float64Builder, Int32Builder, Int64Builder, StringBuilder,
-    TimestampMillisecondBuilder,
+    TimestampMicrosecondBuilder,
 };
 use arrow::datatypes::{DataType, Schema, TimeUnit};
 use arrow::error::ArrowError;
@@ -26,7 +26,7 @@ use vrl::value::{KeyString, Value};
 /// # Type Mapping
 ///
 /// VRL types are converted to Arrow types as follows:
-/// - `Value::Integer` -> Int64/Int32/TimestampMillisecond (depending on schema)
+/// - `Value::Integer` -> Int64/Int32/TimestampMicrosecond (depending on schema)
 /// - `Value::Float` -> Float64
 /// - `Value::Boolean` -> Boolean
 /// - `Value::Bytes` -> Utf8 (String)
@@ -106,7 +106,7 @@ pub fn values_to_arrow(values: &[Value], schema: &Schema) -> Result<RecordBatch,
 ///
 /// This allows dynamic column building based on schema without complex generics.
 enum ColumnBuilder {
-    Timestamp(TimestampMillisecondBuilder),
+    Timestamp(TimestampMicrosecondBuilder),
     Int64(Int64Builder),
     Int32(Int32Builder),
     Float64(Float64Builder),
@@ -128,8 +128,8 @@ impl ColumnBuilder {
     /// - Utf8
     fn new(data_type: &DataType, capacity: usize) -> Self {
         match data_type {
-            DataType::Timestamp(TimeUnit::Millisecond, _) => {
-                ColumnBuilder::Timestamp(TimestampMillisecondBuilder::with_capacity(capacity))
+            DataType::Timestamp(TimeUnit::Microsecond, _) => {
+                ColumnBuilder::Timestamp(TimestampMicrosecondBuilder::with_capacity(capacity))
             }
             DataType::Int64 => ColumnBuilder::Int64(Int64Builder::with_capacity(capacity)),
             DataType::Int32 => ColumnBuilder::Int32(Int32Builder::with_capacity(capacity)),
@@ -140,7 +140,7 @@ impl ColumnBuilder {
             }
             unsupported => {
                 panic!(
-                    "Unsupported Arrow data type: {unsupported:?}. Supported types: Timestamp(Millisecond), Int64, Int32, Float64, Boolean, Utf8"
+                    "Unsupported Arrow data type: {unsupported:?}. Supported types: Timestamp(Microsecond), Int64, Int32, Float64, Boolean, Utf8"
                 );
             }
         }
@@ -177,9 +177,9 @@ impl ColumnBuilder {
     }
 }
 
-/// Append a VRL value to a TimestampMillisecondBuilder.
+/// Append a VRL value to a TimestampMicrosecondBuilder.
 fn append_timestamp(
-    builder: &mut TimestampMillisecondBuilder,
+    builder: &mut TimestampMicrosecondBuilder,
     value: Option<&Value>,
 ) -> Result<(), ArrowError> {
     match value {
@@ -385,7 +385,7 @@ mod tests {
     use super::*;
     use arrow::array::{
         Array, BooleanArray, Float64Array, Int32Array, Int64Array, StringArray,
-        TimestampMillisecondArray,
+        TimestampMicrosecondArray,
     };
     use arrow::datatypes::{Field, TimeUnit};
     use bytes::Bytes;
@@ -515,7 +515,7 @@ mod tests {
     fn test_timestamp_column() {
         let schema = Schema::new(vec![Field::new(
             "timestamp",
-            DataType::Timestamp(TimeUnit::Millisecond, None),
+            DataType::Timestamp(TimeUnit::Microsecond, None),
             false,
         )]);
 
@@ -529,7 +529,7 @@ mod tests {
         let col = batch
             .column(0)
             .as_any()
-            .downcast_ref::<TimestampMillisecondArray>()
+            .downcast_ref::<TimestampMicrosecondArray>()
             .unwrap();
         assert_eq!(col.value(0), 1700000000000);
         assert_eq!(col.value(1), 1700000001000);
@@ -637,7 +637,7 @@ mod tests {
         let schema = Schema::new(vec![
             Field::new(
                 "timestamp",
-                DataType::Timestamp(TimeUnit::Millisecond, None),
+                DataType::Timestamp(TimeUnit::Microsecond, None),
                 false,
             ),
             Field::new("service_name", DataType::Utf8, false),
@@ -672,7 +672,7 @@ mod tests {
         let ts_col = batch
             .column(0)
             .as_any()
-            .downcast_ref::<TimestampMillisecondArray>()
+            .downcast_ref::<TimestampMicrosecondArray>()
             .unwrap();
         assert_eq!(ts_col.value(0), 1700000000000);
 

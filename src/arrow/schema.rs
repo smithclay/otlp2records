@@ -187,7 +187,7 @@ mod tests {
         let ts_field = schema.field_with_name("timestamp").unwrap();
         assert_eq!(
             ts_field.data_type(),
-            &DataType::Timestamp(TimeUnit::Millisecond, None)
+            &DataType::Timestamp(TimeUnit::Microsecond, None)
         );
         assert!(!ts_field.is_nullable());
 
@@ -213,7 +213,7 @@ mod tests {
         let ts_field = schema.field_with_name("timestamp").unwrap();
         assert_eq!(
             ts_field.data_type(),
-            &DataType::Timestamp(TimeUnit::Millisecond, None)
+            &DataType::Timestamp(TimeUnit::Microsecond, None)
         );
 
         // Check span_kind field

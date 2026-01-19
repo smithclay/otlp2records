@@ -139,6 +139,75 @@ impl FunctionExpression for NanosToMillisFn {
     }
 }
 
+// --- nanos_to_micros ---
+/// Safely converts nanoseconds to microseconds (integer division)
+/// Used for Iceberg-compatible timestamps which require microsecond precision
+#[derive(Clone, Copy, Debug)]
+pub struct NanosToMicros;
+
+impl Function for NanosToMicros {
+    fn identifier(&self) -> &'static str {
+        "nanos_to_micros"
+    }
+
+    fn parameters(&self) -> &'static [Parameter] {
+        &[Parameter {
+            keyword: "value",
+            kind: kind::ANY,
+            required: true,
+        }]
+    }
+
+    fn compile(
+        &self,
+        _state: &TypeState,
+        _ctx: &mut FunctionCompileContext,
+        arguments: ArgumentList,
+    ) -> Compiled {
+        let value = arguments.required("value");
+        Ok(NanosToMicrosFn { value }.as_expr())
+    }
+
+    fn examples(&self) -> &'static [Example] {
+        &[]
+    }
+}
+
+#[derive(Debug, Clone)]
+struct NanosToMicrosFn {
+    value: Box<dyn Expression>,
+}
+
+impl FunctionExpression for NanosToMicrosFn {
+    fn resolve(&self, ctx: &mut Context) -> Resolved {
+        let value = self.value.resolve(ctx)?;
+        let nanos = match value {
+            Value::Integer(i) => i,
+            Value::Float(f) => {
+                let float_val = f.into_inner();
+                if float_val.is_nan() || float_val.is_infinite() {
+                    return Ok(Value::Integer(0));
+                }
+                // Use safe bounds for conversion
+                const MAX_SAFE_FLOAT: f64 = 9_223_372_036_854_774_784.0;
+                const MIN_SAFE_FLOAT: f64 = i64::MIN as f64;
+                if !(MIN_SAFE_FLOAT..=MAX_SAFE_FLOAT).contains(&float_val) {
+                    return Ok(Value::Integer(0));
+                }
+                float_val as i64
+            }
+            Value::Null => return Ok(Value::Integer(0)),
+            _ => return Ok(Value::Integer(0)),
+        };
+        // Integer division - safe, no overflow possible when dividing
+        Ok(Value::Integer(nanos / 1_000))
+    }
+
+    fn type_def(&self, _state: &TypeState) -> TypeDef {
+        TypeDef::integer().infallible()
+    }
+}
+
 // --- json_or_null ---
 /// Encodes value as JSON string if non-empty, null otherwise
 #[derive(Clone, Copy, Debug)]
