@@ -1,9 +1,9 @@
 [package]
 name = "otlp2records"
-version = "0.2.2"
+version = "0.3.0"
 edition = "2021"
 license = "Apache-2.0"
-description = "Transform OTLP telemetry to Arrow RecordBatches"
+description = "Transform OTLP telemetry to flattened records"
 keywords = ["opentelemetry", "otlp", "arrow", "observability"]
 categories = ["data-structures", "encoding"]
 repository = "https://github.com/smithclay/otlp2records"
@@ -21,7 +21,7 @@ ordered-float = "4"
 base64 = "0.21"
 
 # Arrow
-arrow = { version = "54", default-features = false, features = ["ffi", "ipc", "json"] }
+arrow = { version = "57", default-features = false, features = ["ffi", "ipc", "json"] }
 
 # VRL (no stdlib - avoids zstd C dependency)
 vrl = { version = "0.26", default-features = false, features = ["compiler", "value"] }
@@ -34,7 +34,7 @@ chrono-tz = "0.10"
 indexmap = "2"
 
 [dependencies.parquet]
-version = "54"
+version = "57"
 optional = true
 default-features = false
 features = ["arrow"]

@@ -31,7 +31,7 @@
 # vrl/otlp_traces.vrl - OTLP traces -> flat span event
 
 # Timestamps (nanoseconds -> milliseconds)
-.timestamp = nanos_to_millis(.start_time_unix_nano)
+.timestamp = nanos_to_micros(.start_time_unix_nano)
 .end_timestamp = nanos_to_millis(.end_time_unix_nano)
 .duration = nanos_to_millis(.duration_ns)
 
