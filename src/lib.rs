@@ -1257,4 +1257,193 @@ mod tests {
             assert!(!json.is_empty());
         }
     }
+
+    // ========================================================================
+    // Timestamp validation tests - ensure timestamps are not 1970 dates
+    // ========================================================================
+
+    #[test]
+    fn test_timestamp_not_epoch_traces() {
+        // Use a known timestamp: 1703265600000000000 ns = Dec 22, 2023 @ 00:00:00 UTC
+        let request = ExportTraceServiceRequest {
+            resource_spans: vec![ResourceSpans {
+                resource: Some(Resource {
+                    attributes: vec![KeyValue {
+                        key: "service.name".to_string(),
+                        value: Some(AnyValue {
+                            value: Some(any_value::Value::StringValue("test-service".to_string())),
+                        }),
+                    }],
+                    ..Default::default()
+                }),
+                scope_spans: vec![ScopeSpans {
+                    scope: Some(InstrumentationScope::default()),
+                    spans: vec![Span {
+                        trace_id: vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+                        span_id: vec![0, 1, 2, 3, 4, 5, 6, 7],
+                        name: "test-span".to_string(),
+                        start_time_unix_nano: 1_703_265_600_000_000_000, // Dec 22, 2023
+                        end_time_unix_nano: 1_703_265_600_100_000_000,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+        let bytes = request.encode_to_vec();
+
+        let batch = transform_traces(&bytes, InputFormat::Protobuf).unwrap();
+        assert_eq!(batch.num_rows(), 1);
+
+        // Get the timestamp column and verify it's not 0 (epoch)
+        let schema = batch.schema();
+        let ts_idx = schema.index_of("timestamp").unwrap();
+        let ts_column = batch
+            .column(ts_idx)
+            .as_any()
+            .downcast_ref::<::arrow::array::TimestampMicrosecondArray>()
+            .expect("timestamp should be TimestampMicrosecondArray");
+
+        let ts_value = ts_column.value(0);
+        // Expected: 1703265600000000000 ns / 1000 = 1703265600000000 microseconds
+        let expected_micros: i64 = 1_703_265_600_000_000;
+
+        assert_eq!(
+            ts_value, expected_micros,
+            "Timestamp should be Dec 22, 2023, not epoch (1970)"
+        );
+        // Sanity check: value should be much greater than 0 (year 2023 >> year 1970)
+        assert!(
+            ts_value > 1_600_000_000_000_000,
+            "Timestamp {} appears to be too small, possibly 1970 date",
+            ts_value
+        );
+    }
+
+    #[test]
+    fn test_timestamp_not_epoch_logs() {
+        // Use a known timestamp: 1703265600000000000 ns = Dec 22, 2023 @ 00:00:00 UTC
+        let request = ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                resource: Some(Resource {
+                    attributes: vec![KeyValue {
+                        key: "service.name".to_string(),
+                        value: Some(AnyValue {
+                            value: Some(any_value::Value::StringValue("test-service".to_string())),
+                        }),
+                    }],
+                    ..Default::default()
+                }),
+                scope_logs: vec![ScopeLogs {
+                    scope: Some(InstrumentationScope::default()),
+                    log_records: vec![LogRecord {
+                        time_unix_nano: 1_703_265_600_000_000_000, // Dec 22, 2023
+                        observed_time_unix_nano: 1_703_265_600_100_000_000,
+                        severity_number: 9,
+                        severity_text: "INFO".to_string(),
+                        body: Some(AnyValue {
+                            value: Some(any_value::Value::StringValue("Test log".to_string())),
+                        }),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+        let bytes = request.encode_to_vec();
+
+        let batch = transform_logs(&bytes, InputFormat::Protobuf).unwrap();
+        assert_eq!(batch.num_rows(), 1);
+
+        // Get the timestamp column and verify it's not 0 (epoch)
+        let schema = batch.schema();
+        let ts_idx = schema.index_of("timestamp").unwrap();
+        let ts_column = batch
+            .column(ts_idx)
+            .as_any()
+            .downcast_ref::<::arrow::array::TimestampMicrosecondArray>()
+            .expect("timestamp should be TimestampMicrosecondArray");
+
+        let ts_value = ts_column.value(0);
+        // Expected: 1703265600000000000 ns / 1000 = 1703265600000000 microseconds
+        let expected_micros: i64 = 1_703_265_600_000_000;
+
+        assert_eq!(
+            ts_value, expected_micros,
+            "Timestamp should be Dec 22, 2023, not epoch (1970)"
+        );
+        // Sanity check: value should be much greater than 0 (year 2023 >> year 1970)
+        assert!(
+            ts_value > 1_600_000_000_000_000,
+            "Timestamp {} appears to be too small, possibly 1970 date",
+            ts_value
+        );
+    }
+
+    #[test]
+    fn test_timestamp_not_epoch_metrics() {
+        // Use a known timestamp: 1703265600000000000 ns = Dec 22, 2023 @ 00:00:00 UTC
+        let request = ExportMetricsServiceRequest {
+            resource_metrics: vec![ResourceMetrics {
+                resource: Some(Resource {
+                    attributes: vec![KeyValue {
+                        key: "service.name".to_string(),
+                        value: Some(AnyValue {
+                            value: Some(any_value::Value::StringValue("test-service".to_string())),
+                        }),
+                    }],
+                    ..Default::default()
+                }),
+                scope_metrics: vec![ScopeMetrics {
+                    scope: Some(InstrumentationScope::default()),
+                    metrics: vec![Metric {
+                        name: "test.gauge".to_string(),
+                        data: Some(Data::Gauge(Gauge {
+                            data_points: vec![NumberDataPoint {
+                                time_unix_nano: 1_703_265_600_000_000_000, // Dec 22, 2023
+                                value: Some(
+                                    opentelemetry_proto::tonic::metrics::v1::number_data_point::Value::AsDouble(42.0),
+                                ),
+                                ..Default::default()
+                            }],
+                        })),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+        let bytes = request.encode_to_vec();
+
+        let batches = transform_metrics(&bytes, InputFormat::Protobuf).unwrap();
+        let gauge = batches.gauge.expect("should have gauge metrics");
+        assert_eq!(gauge.num_rows(), 1);
+
+        // Get the timestamp column and verify it's not 0 (epoch)
+        let schema = gauge.schema();
+        let ts_idx = schema.index_of("timestamp").unwrap();
+        let ts_column = gauge
+            .column(ts_idx)
+            .as_any()
+            .downcast_ref::<::arrow::array::TimestampMicrosecondArray>()
+            .expect("timestamp should be TimestampMicrosecondArray");
+
+        let ts_value = ts_column.value(0);
+        // Expected: 1703265600000000000 ns / 1000 = 1703265600000000 microseconds
+        let expected_micros: i64 = 1_703_265_600_000_000;
+
+        assert_eq!(
+            ts_value, expected_micros,
+            "Timestamp should be Dec 22, 2023, not epoch (1970)"
+        );
+        // Sanity check: value should be much greater than 0 (year 2023 >> year 1970)
+        assert!(
+            ts_value > 1_600_000_000_000_000,
+            "Timestamp {} appears to be too small, possibly 1970 date",
+            ts_value
+        );
+    }
 }
