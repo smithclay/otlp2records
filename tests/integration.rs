@@ -2,6 +2,7 @@
 //!
 //! These tests use real OTLP fixtures to verify the complete transformation pipeline.
 
+use arrow::array::{Array, TimestampMicrosecondArray};
 use otlp2records::{
     to_ipc, to_json, transform_logs, transform_metrics, transform_traces, InputFormat,
 };
@@ -358,4 +359,159 @@ fn test_traces_to_json_is_valid_ndjson() {
             assert!(parsed.is_ok(), "Invalid JSON line: {line}");
         }
     }
+}
+
+// ============================================================================
+// Timestamp validation tests - verify timestamps from real .pb files are not 1970
+// ============================================================================
+
+/// Minimum valid timestamp in microseconds (year 2020)
+/// Any timestamp before this is likely a bug (1970 epoch date)
+const MIN_VALID_TIMESTAMP_MICROS: i64 = 1_577_836_800_000_000; // Jan 1, 2020
+
+#[test]
+fn test_traces_large_pb_timestamps_not_epoch() {
+    let pb = include_bytes!("../testdata/traces_large.pb");
+    let batch = transform_traces(pb, InputFormat::Protobuf).unwrap();
+
+    assert!(batch.num_rows() > 0, "Expected at least one span");
+
+    // Get the timestamp column
+    let schema = batch.schema();
+    let ts_idx = schema.index_of("timestamp").unwrap();
+    let ts_column = batch
+        .column(ts_idx)
+        .as_any()
+        .downcast_ref::<TimestampMicrosecondArray>()
+        .expect("timestamp should be TimestampMicrosecondArray");
+
+    // Check all timestamps are valid (not 1970 epoch)
+    for i in 0..ts_column.len() {
+        if !ts_column.is_null(i) {
+            let ts_value = ts_column.value(i);
+            assert!(
+                ts_value > MIN_VALID_TIMESTAMP_MICROS,
+                "Row {}: timestamp {} appears to be 1970 epoch date (expected > {})",
+                i,
+                ts_value,
+                MIN_VALID_TIMESTAMP_MICROS
+            );
+        }
+    }
+
+    println!(
+        "Verified {} trace timestamps are not 1970 epoch dates",
+        batch.num_rows()
+    );
+}
+
+#[test]
+fn test_logs_large_pb_timestamps_not_epoch() {
+    let pb = include_bytes!("../testdata/logs_large.pb");
+    let batch = transform_logs(pb, InputFormat::Protobuf).unwrap();
+
+    assert!(batch.num_rows() > 0, "Expected at least one log record");
+
+    // Get the timestamp column
+    let schema = batch.schema();
+    let ts_idx = schema.index_of("timestamp").unwrap();
+    let ts_column = batch
+        .column(ts_idx)
+        .as_any()
+        .downcast_ref::<TimestampMicrosecondArray>()
+        .expect("timestamp should be TimestampMicrosecondArray");
+
+    // Check all timestamps are valid (not 1970 epoch)
+    for i in 0..ts_column.len() {
+        if !ts_column.is_null(i) {
+            let ts_value = ts_column.value(i);
+            assert!(
+                ts_value > MIN_VALID_TIMESTAMP_MICROS,
+                "Row {}: timestamp {} appears to be 1970 epoch date (expected > {})",
+                i,
+                ts_value,
+                MIN_VALID_TIMESTAMP_MICROS
+            );
+        }
+    }
+
+    println!(
+        "Verified {} log timestamps are not 1970 epoch dates",
+        batch.num_rows()
+    );
+}
+
+#[test]
+fn test_metrics_pb_timestamps_not_epoch() {
+    // Test all metric protobuf files
+    let metric_files: &[(&[u8], &str)] = &[
+        (include_bytes!("../testdata/metrics_gauge.pb"), "gauge"),
+        (include_bytes!("../testdata/metrics_sum.pb"), "sum"),
+        (
+            include_bytes!("../testdata/metrics_histogram.pb"),
+            "histogram",
+        ),
+        (
+            include_bytes!("../testdata/metrics_exponential_histogram.pb"),
+            "exp_histogram",
+        ),
+        (include_bytes!("../testdata/metrics_mixed.pb"), "mixed"),
+    ];
+
+    for (pb, name) in metric_files {
+        let batches = transform_metrics(*pb, InputFormat::Protobuf).unwrap();
+
+        // Check gauge timestamps
+        if let Some(gauge) = &batches.gauge {
+            verify_metric_timestamps(gauge, &format!("{name}/gauge"));
+        }
+
+        // Check sum timestamps
+        if let Some(sum) = &batches.sum {
+            verify_metric_timestamps(sum, &format!("{name}/sum"));
+        }
+
+        // Check histogram timestamps
+        if let Some(histogram) = &batches.histogram {
+            verify_metric_timestamps(histogram, &format!("{name}/histogram"));
+        }
+
+        // Check exponential histogram timestamps
+        if let Some(exp_histogram) = &batches.exp_histogram {
+            verify_metric_timestamps(exp_histogram, &format!("{name}/exp_histogram"));
+        }
+    }
+}
+
+fn verify_metric_timestamps(batch: &arrow::record_batch::RecordBatch, context: &str) {
+    if batch.num_rows() == 0 {
+        return;
+    }
+
+    let schema = batch.schema();
+    let ts_idx = schema.index_of("timestamp").unwrap();
+    let ts_column = batch
+        .column(ts_idx)
+        .as_any()
+        .downcast_ref::<TimestampMicrosecondArray>()
+        .expect("timestamp should be TimestampMicrosecondArray");
+
+    for i in 0..ts_column.len() {
+        if !ts_column.is_null(i) {
+            let ts_value = ts_column.value(i);
+            assert!(
+                ts_value > MIN_VALID_TIMESTAMP_MICROS,
+                "{} row {}: timestamp {} appears to be 1970 epoch date",
+                context,
+                i,
+                ts_value
+            );
+        }
+    }
+
+    println!(
+        "Verified {} {} timestamps are not 1970 epoch dates",
+        batch.num_rows(),
+        context
+    );
 }
