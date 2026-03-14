@@ -1,5 +1,6 @@
 /target
 rust-toolchain.toml
+Cargo.lock
 
 # Parquet outputs from examples
 testdata/output/
