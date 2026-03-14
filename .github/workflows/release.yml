@@ -1,0 +1,137 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: Tag to publish (e.g. v1.2.3)
+        required: false
+        type: string
+      commit_sha:
+        description: Commit SHA to attach the release to (defaults to tag commit)
+        required: false
+        type: string
+
+jobs:
+  prepare:
+    name: Prepare Metadata
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.vars.outputs.tag }}
+      version: ${{ steps.vars.outputs.version }}
+      commit: ${{ steps.vars.outputs.commit }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Collect release inputs
+        id: vars
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PUSH_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            TAG="$(jq -r '.inputs.tag_name // ""' "$GITHUB_EVENT_PATH")"
+            if [ -z "$TAG" ]; then
+              echo "tag_name input is required for manual releases." >&2
+              exit 1
+            fi
+            git fetch --force origin "refs/tags/$TAG:refs/tags/$TAG"
+            COMMIT="$(jq -r '.inputs.commit_sha // ""' "$GITHUB_EVENT_PATH")"
+            if [ -z "$COMMIT" ]; then
+              COMMIT="$(git rev-list -n 1 "$TAG")"
+            fi
+          else
+            TAG="$PUSH_TAG"
+            if [ -z "$TAG" ]; then
+              echo "Unable to determine tag for push event; aborting release." >&2
+              exit 1
+            fi
+            git fetch --force origin "refs/tags/$TAG:refs/tags/$TAG"
+            COMMIT="$(git rev-list -n 1 "$TAG")"
+          fi
+
+          if [ -z "$COMMIT" ]; then
+            echo "Unable to resolve commit for tag '$TAG'." >&2
+            exit 1
+          fi
+
+          if [[ "$TAG" != v* ]]; then
+            echo "Tag '$TAG' does not follow v*.*.* pattern; aborting release." >&2
+            exit 1
+          fi
+
+          VERSION="${TAG#v}"
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "commit=$COMMIT" >> "$GITHUB_OUTPUT"
+
+      - name: Verify Cargo.toml version matches tag
+        env:
+          VERSION: ${{ steps.vars.outputs.version }}
+        run: |
+          CARGO_VERSION=$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          if [ "$CARGO_VERSION" != "$VERSION" ]; then
+            echo "::error::Cargo.toml version ($CARGO_VERSION) does not match tag ($VERSION)"
+            exit 1
+          fi
+          echo "Version verified: $CARGO_VERSION"
+
+  ci:
+    name: Run CI Checks
+    needs: prepare
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+      checks: write
+    secrets: inherit
+
+  publish-github:
+    name: Publish GitHub Release
+    needs:
+      - prepare
+      - ci
+    if: needs.prepare.outputs.tag != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.commit }}
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          gh release create "$TAG" \
+            --title "$TAG" \
+            --generate-notes
+
+  publish-crates:
+    name: Publish to crates.io
+    needs:
+      - prepare
+      - ci
+    if: needs.prepare.outputs.tag != ''
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.commit }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1.86
+
+      - name: Publish to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish
