@@ -1,7 +1,8 @@
 //! Arrow RecordBatch builder
 //!
-//! Converts VRL Values to Arrow RecordBatches using schema-driven building.
+//! Converts record values to Arrow RecordBatches using schema-driven building.
 
+use crate::value::Value;
 use arrow::array::{
     ArrayRef, BooleanBuilder, Float64Builder, Int32Builder, Int64Builder, StringBuilder,
     TimestampMicrosecondBuilder,
@@ -10,13 +11,12 @@ use arrow::datatypes::{DataType, Schema, TimeUnit};
 use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
 use std::sync::Arc;
-use vrl::value::{KeyString, Value};
 
-/// Converts a slice of VRL Values to an Arrow RecordBatch.
+/// Converts a slice of record values to an Arrow RecordBatch.
 ///
 /// # Arguments
 ///
-/// * `values` - Slice of VRL Object values to convert
+/// * `values` - Slice of Object values to convert
 /// * `schema` - Arrow schema defining the expected fields and types
 ///
 /// # Returns
@@ -25,7 +25,7 @@ use vrl::value::{KeyString, Value};
 ///
 /// # Type Mapping
 ///
-/// VRL types are converted to Arrow types as follows:
+/// Value types are converted to Arrow types as follows:
 /// - `Value::Integer` -> Int64/Int32/TimestampMicrosecond (depending on schema)
 /// - `Value::Float` -> Float64
 /// - `Value::Boolean` -> Boolean
@@ -35,7 +35,7 @@ use vrl::value::{KeyString, Value};
 /// # Example
 ///
 /// ```ignore
-/// use vrl::value::{Value, ObjectMap};
+/// use otlp2records::{ObjectMap, Value};
 /// use arrow::datatypes::{Schema, Field, DataType};
 ///
 /// let schema = Schema::new(vec![
@@ -69,8 +69,7 @@ pub fn values_to_arrow(values: &[Value], schema: &Schema) -> Result<RecordBatch,
         match value {
             Value::Object(map) => {
                 for (idx, field_name) in field_names.iter().enumerate() {
-                    let key: KeyString = (*field_name).into();
-                    let field_value = map.get(&key);
+                    let field_value = map.get(*field_name);
                     builders[idx].append(field_value)?;
                 }
             }
@@ -146,7 +145,7 @@ impl ColumnBuilder {
         }
     }
 
-    /// Append a VRL value to the builder.
+    /// Append a value to the builder.
     fn append(&mut self, value: Option<&Value>) -> Result<(), ArrowError> {
         match self {
             ColumnBuilder::Timestamp(builder) => append_timestamp(builder, value),
@@ -177,7 +176,7 @@ impl ColumnBuilder {
     }
 }
 
-/// Append a VRL value to a TimestampMicrosecondBuilder.
+/// Append a value to a TimestampMicrosecondBuilder.
 fn append_timestamp(
     builder: &mut TimestampMicrosecondBuilder,
     value: Option<&Value>,
@@ -196,6 +195,7 @@ fn append_timestamp(
             builder.append_null();
             Ok(())
         }
+        Some(Value::Shared(value)) => append_timestamp(builder, Some(value)),
         Some(other) => Err(ArrowError::InvalidArgumentError(format!(
             "Cannot convert {:?} to timestamp",
             value_type_name(other)
@@ -203,7 +203,7 @@ fn append_timestamp(
     }
 }
 
-/// Append a VRL value to an Int64Builder.
+/// Append a value to an Int64Builder.
 fn append_int64(builder: &mut Int64Builder, value: Option<&Value>) -> Result<(), ArrowError> {
     match value {
         Some(Value::Integer(i)) => {
@@ -219,6 +219,7 @@ fn append_int64(builder: &mut Int64Builder, value: Option<&Value>) -> Result<(),
             builder.append_null();
             Ok(())
         }
+        Some(Value::Shared(value)) => append_int64(builder, Some(value)),
         Some(other) => Err(ArrowError::InvalidArgumentError(format!(
             "Cannot convert {:?} to int64",
             value_type_name(other)
@@ -226,7 +227,7 @@ fn append_int64(builder: &mut Int64Builder, value: Option<&Value>) -> Result<(),
     }
 }
 
-/// Append a VRL value to an Int32Builder.
+/// Append a value to an Int32Builder.
 fn append_int32(builder: &mut Int32Builder, value: Option<&Value>) -> Result<(), ArrowError> {
     match value {
         Some(Value::Integer(i)) => {
@@ -263,6 +264,7 @@ fn append_int32(builder: &mut Int32Builder, value: Option<&Value>) -> Result<(),
             builder.append_null();
             Ok(())
         }
+        Some(Value::Shared(value)) => append_int32(builder, Some(value)),
         Some(other) => Err(ArrowError::InvalidArgumentError(format!(
             "Cannot convert {:?} to int32",
             value_type_name(other)
@@ -270,7 +272,7 @@ fn append_int32(builder: &mut Int32Builder, value: Option<&Value>) -> Result<(),
     }
 }
 
-/// Append a VRL value to a Float64Builder.
+/// Append a value to a Float64Builder.
 fn append_float64(builder: &mut Float64Builder, value: Option<&Value>) -> Result<(), ArrowError> {
     match value {
         Some(Value::Float(f)) => {
@@ -286,6 +288,7 @@ fn append_float64(builder: &mut Float64Builder, value: Option<&Value>) -> Result
             builder.append_null();
             Ok(())
         }
+        Some(Value::Shared(value)) => append_float64(builder, Some(value)),
         Some(other) => Err(ArrowError::InvalidArgumentError(format!(
             "Cannot convert {:?} to float64",
             value_type_name(other)
@@ -293,7 +296,7 @@ fn append_float64(builder: &mut Float64Builder, value: Option<&Value>) -> Result
     }
 }
 
-/// Append a VRL value to a BooleanBuilder.
+/// Append a value to a BooleanBuilder.
 fn append_boolean(builder: &mut BooleanBuilder, value: Option<&Value>) -> Result<(), ArrowError> {
     match value {
         Some(Value::Boolean(b)) => {
@@ -304,6 +307,7 @@ fn append_boolean(builder: &mut BooleanBuilder, value: Option<&Value>) -> Result
             builder.append_null();
             Ok(())
         }
+        Some(Value::Shared(value)) => append_boolean(builder, Some(value)),
         Some(other) => Err(ArrowError::InvalidArgumentError(format!(
             "Cannot convert {:?} to boolean",
             value_type_name(other)
@@ -311,7 +315,7 @@ fn append_boolean(builder: &mut BooleanBuilder, value: Option<&Value>) -> Result
     }
 }
 
-/// Append a VRL value to a StringBuilder.
+/// Append a value to a StringBuilder.
 ///
 /// # Note on UTF-8 handling
 ///
@@ -348,24 +352,15 @@ fn append_string(builder: &mut StringBuilder, value: Option<&Value>) -> Result<(
         }
         Some(Value::Object(_)) | Some(Value::Array(_)) => {
             // Serialize complex types as JSON
-            let json_str = serde_json::to_string(value.unwrap())
-                .map_err(|e| ArrowError::ExternalError(Box::new(e)))?;
+            let json_str = crate::convert::value_to_json_lossy(value.unwrap()).to_string();
             builder.append_value(&json_str);
             Ok(())
         }
-        Some(Value::Timestamp(ts)) => {
-            // Convert timestamp to ISO string
-            builder.append_value(ts.to_string());
-            Ok(())
-        }
-        Some(Value::Regex(r)) => {
-            builder.append_value(r.to_string());
-            Ok(())
-        }
+        Some(Value::Shared(value)) => append_string(builder, Some(value)),
     }
 }
 
-/// Get a human-readable name for a VRL Value type.
+/// Get a human-readable name for a Value type.
 fn value_type_name(value: &Value) -> &'static str {
     match value {
         Value::Bytes(_) => "bytes",
@@ -374,8 +369,7 @@ fn value_type_name(value: &Value) -> &'static str {
         Value::Boolean(_) => "boolean",
         Value::Object(_) => "object",
         Value::Array(_) => "array",
-        Value::Timestamp(_) => "timestamp",
-        Value::Regex(_) => "regex",
+        Value::Shared(value) => value_type_name(value),
         Value::Null => "null",
     }
 }
@@ -383,6 +377,7 @@ fn value_type_name(value: &Value) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::value::ObjectMap;
     use arrow::array::{
         Array, BooleanArray, Float64Array, Int32Array, Int64Array, StringArray,
         TimestampMicrosecondArray,
@@ -390,7 +385,6 @@ mod tests {
     use arrow::datatypes::{Field, TimeUnit};
     use bytes::Bytes;
     use ordered_float::NotNan;
-    use vrl::value::ObjectMap;
 
     fn make_object(pairs: Vec<(&str, Value)>) -> Value {
         let mut map = ObjectMap::new();

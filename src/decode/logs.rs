@@ -1,16 +1,16 @@
 //! OTLP log decoding - protobuf and JSON
 
+use crate::value::{ObjectMap, Value as RecordValue};
 use bytes::Bytes;
 use const_hex::encode as hex_encode;
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use prost::Message;
 use serde::Deserialize;
 use std::sync::Arc;
-use vrl::value::{ObjectMap, Value as VrlValue};
 
 use super::common::{
-    for_each_resource_scope, json_any_value_to_vrl, json_attrs_to_value, json_resource_to_value,
-    json_scope_to_value, json_timestamp_to_i64, otlp_any_value_to_vrl, otlp_attributes_to_value,
+    for_each_resource_scope, json_any_value_to_value, json_attrs_to_value, json_resource_to_value,
+    json_scope_to_value, json_timestamp_to_i64, otlp_any_value_to_value, otlp_attributes_to_value,
     otlp_resource_to_value, otlp_scope_to_value, safe_timestamp_conversion, DecodeError,
     JsonAnyValue, JsonInstrumentationScope, JsonKeyValue, JsonNumberOrString, JsonResource,
 };
@@ -19,14 +19,14 @@ use super::common::{
 // Protobuf decoding
 // ============================================================================
 
-pub fn decode_protobuf(body: &[u8]) -> Result<Vec<VrlValue>, DecodeError> {
+pub fn decode_protobuf(body: &[u8]) -> Result<Vec<RecordValue>, DecodeError> {
     let request = ExportLogsServiceRequest::decode(body)?;
-    export_logs_to_vrl_proto(request)
+    export_logs_to_values_proto(request)
 }
 
-fn export_logs_to_vrl_proto(
+fn export_logs_to_values_proto(
     request: ExportLogsServiceRequest,
-) -> Result<Vec<VrlValue>, DecodeError> {
+) -> Result<Vec<RecordValue>, DecodeError> {
     let mut values = preallocate_log_values(&request.resource_logs, |rl| {
         rl.scope_logs.iter().map(|sl| sl.log_records.len()).sum()
     });
@@ -50,8 +50,8 @@ fn export_logs_to_vrl_proto(
                 let body = log_record
                     .body
                     .as_ref()
-                    .map(otlp_any_value_to_vrl)
-                    .unwrap_or(VrlValue::Null);
+                    .map(otlp_any_value_to_value)
+                    .unwrap_or(RecordValue::Null);
 
                 let parts = LogRecordParts {
                     time_unix_nano: safe_timestamp_conversion(
@@ -86,16 +86,16 @@ fn export_logs_to_vrl_proto(
 // JSON decoding
 // ============================================================================
 
-pub fn decode_json(body: &[u8]) -> Result<Vec<VrlValue>, DecodeError> {
+pub fn decode_json(body: &[u8]) -> Result<Vec<RecordValue>, DecodeError> {
     // Normalize JSON to convert enum strings to numbers before parsing
     let normalized = super::normalize::normalize_json_bytes(body)?;
     let request: JsonExportLogsServiceRequest = serde_json::from_slice(&normalized)?;
-    export_logs_json_to_vrl(request)
+    export_logs_json_to_values(request)
 }
 
-fn export_logs_json_to_vrl(
+fn export_logs_json_to_values(
     request: JsonExportLogsServiceRequest,
-) -> Result<Vec<VrlValue>, DecodeError> {
+) -> Result<Vec<RecordValue>, DecodeError> {
     let mut values = preallocate_log_values(&request.resource_logs, |rl| {
         rl.scope_logs.iter().map(|sl| sl.log_records.len()).sum()
     });
@@ -118,8 +118,8 @@ fn export_logs_json_to_vrl(
             for log_record in log_records {
                 let body = log_record
                     .body
-                    .map(json_any_value_to_vrl)
-                    .unwrap_or(VrlValue::Null);
+                    .map(json_any_value_to_value)
+                    .unwrap_or(RecordValue::Null);
 
                 let parts = LogRecordParts {
                     time_unix_nano: json_timestamp_to_i64(
@@ -204,22 +204,22 @@ struct JsonLogRecord {
 // Record builder
 // ============================================================================
 
-/// Precomputed fields for building a log record into VRL values
+/// Precomputed fields for building a log record into record values
 struct LogRecordParts {
     time_unix_nano: i64,
     observed_time_unix_nano: i64,
     severity_number: i64,
     severity_text: Bytes,
-    body: VrlValue,
+    body: RecordValue,
     trace_id: Bytes,
     span_id: Bytes,
-    attributes: VrlValue,
-    resource: Arc<VrlValue>,
-    scope: Arc<VrlValue>,
+    attributes: RecordValue,
+    resource: Arc<RecordValue>,
+    scope: Arc<RecordValue>,
 }
 
 /// Pre-allocate a values Vec sized to the number of log records a request contains
-fn preallocate_log_values<R, F>(resource_logs: &[R], count_logs: F) -> Vec<VrlValue>
+fn preallocate_log_values<R, F>(resource_logs: &[R], count_logs: F) -> Vec<RecordValue>
 where
     F: Fn(&R) -> usize,
 {
@@ -227,29 +227,32 @@ where
     Vec::with_capacity(capacity)
 }
 
-/// Build a VRL-ready log record from parts
-fn build_log_record(parts: LogRecordParts) -> VrlValue {
+/// Build a record log record from parts
+fn build_log_record(parts: LogRecordParts) -> RecordValue {
     let mut map = ObjectMap::new();
     map.insert(
         "time_unix_nano".into(),
-        VrlValue::Integer(parts.time_unix_nano),
+        RecordValue::Integer(parts.time_unix_nano),
     );
     map.insert(
         "observed_time_unix_nano".into(),
-        VrlValue::Integer(parts.observed_time_unix_nano),
+        RecordValue::Integer(parts.observed_time_unix_nano),
     );
     map.insert(
         "severity_number".into(),
-        VrlValue::Integer(parts.severity_number),
+        RecordValue::Integer(parts.severity_number),
     );
-    map.insert("severity_text".into(), VrlValue::Bytes(parts.severity_text));
+    map.insert(
+        "severity_text".into(),
+        RecordValue::Bytes(parts.severity_text),
+    );
     map.insert("body".into(), parts.body);
-    map.insert("trace_id".into(), VrlValue::Bytes(parts.trace_id));
-    map.insert("span_id".into(), VrlValue::Bytes(parts.span_id));
+    map.insert("trace_id".into(), RecordValue::Bytes(parts.trace_id));
+    map.insert("span_id".into(), RecordValue::Bytes(parts.span_id));
     map.insert("attributes".into(), parts.attributes);
-    map.insert("resource".into(), (*parts.resource).clone());
-    map.insert("scope".into(), (*parts.scope).clone());
-    VrlValue::Object(map)
+    map.insert("resource".into(), RecordValue::Shared(parts.resource));
+    map.insert("scope".into(), RecordValue::Shared(parts.scope));
+    RecordValue::Object(map)
 }
 
 // ============================================================================
@@ -290,11 +293,11 @@ mod tests {
         assert_eq!(records.len(), 1);
 
         let record = &records[0];
-        if let VrlValue::Object(map) = record {
-            assert_eq!(map.get("severity_number"), Some(&VrlValue::Integer(9)));
+        if let RecordValue::Object(map) = record {
+            assert_eq!(map.get("severity_number"), Some(&RecordValue::Integer(9)));
             assert_eq!(
                 map.get("severity_text"),
-                Some(&VrlValue::Bytes(Bytes::from("INFO")))
+                Some(&RecordValue::Bytes(Bytes::from("INFO")))
             );
         } else {
             panic!("expected object");
@@ -346,12 +349,12 @@ mod tests {
         assert_eq!(records.len(), 1);
 
         let record = &records[0];
-        if let VrlValue::Object(map) = record {
-            assert_eq!(map.get("time_unix_nano"), Some(&VrlValue::Integer(123)));
+        if let RecordValue::Object(map) = record {
+            assert_eq!(map.get("time_unix_nano"), Some(&RecordValue::Integer(123)));
             // trace_id should be hex encoded
             assert_eq!(
                 map.get("trace_id"),
-                Some(&VrlValue::Bytes(Bytes::from("00010203")))
+                Some(&RecordValue::Bytes(Bytes::from("00010203")))
             );
         } else {
             panic!("expected object");

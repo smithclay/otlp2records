@@ -1,13 +1,13 @@
 //! Partition utilities for Arrow RecordBatches.
 //!
 //! Provides service-based partitioning and metadata extraction for
-//! storage routing without exposing VRL internals.
+//! storage routing without exposing intermediate record internals.
 
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, AsArray};
 use arrow::compute::take;
-use arrow::datatypes::{Int64Type, TimestampMillisecondType};
+use arrow::datatypes::{Int64Type, TimestampMicrosecondType};
 use arrow::record_batch::RecordBatch;
 use indexmap::IndexMap;
 
@@ -145,7 +145,6 @@ pub fn group_batch_by_service(batch: RecordBatch) -> ServiceGroupedBatches {
 /// Extract the minimum timestamp from a RecordBatch.
 ///
 /// Looks for a "timestamp" column and returns the minimum value in microseconds.
-/// The timestamp column stores milliseconds, so we multiply by 1000.
 /// Returns 0 if no valid timestamps found.
 pub fn extract_min_timestamp_micros(batch: &RecordBatch) -> i64 {
     if batch.num_rows() == 0 {
@@ -157,13 +156,10 @@ pub fn extract_min_timestamp_micros(batch: &RecordBatch) -> i64 {
         None => return 0,
     };
 
-    // Timestamp column is TimestampMillisecond
-    if let Some(ts_array) = ts_col.as_primitive_opt::<TimestampMillisecondType>() {
-        let min_ms = ts_array.iter().flatten().min().unwrap_or(0);
-        // Convert milliseconds to microseconds
-        min_ms * 1000
+    if let Some(ts_array) = ts_col.as_primitive_opt::<TimestampMicrosecondType>() {
+        ts_array.iter().flatten().min().unwrap_or(0)
     } else if let Some(ts_array) = ts_col.as_primitive_opt::<Int64Type>() {
-        // Fallback for Int64 timestamp column
+        // Fallback for an Int64 timestamp column, assumed to be milliseconds.
         let min_ms = ts_array.iter().flatten().min().unwrap_or(0);
         min_ms * 1000
     } else {
@@ -199,26 +195,26 @@ pub fn extract_service_name(batch: &RecordBatch) -> Arc<str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{Int32Array, StringBuilder, TimestampMillisecondBuilder};
+    use arrow::array::{Int32Array, StringBuilder, TimestampMicrosecondBuilder};
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
     use std::sync::Arc as StdArc;
 
-    fn create_test_batch(services: &[&str], timestamps_ms: &[i64]) -> RecordBatch {
+    fn create_test_batch(services: &[&str], timestamps_micros: &[i64]) -> RecordBatch {
         let schema = StdArc::new(Schema::new(vec![
             Field::new(
                 "timestamp",
-                DataType::Timestamp(TimeUnit::Millisecond, None),
+                DataType::Timestamp(TimeUnit::Microsecond, None),
                 false,
             ),
             Field::new("service_name", DataType::Utf8, false),
             Field::new("value", DataType::Int32, false),
         ]));
 
-        let mut ts_builder = TimestampMillisecondBuilder::new();
+        let mut ts_builder = TimestampMicrosecondBuilder::new();
         let mut service_builder = StringBuilder::new();
         let mut value_builder = Int32Array::builder(services.len());
 
-        for (i, (service, ts)) in services.iter().zip(timestamps_ms.iter()).enumerate() {
+        for (i, (service, ts)) in services.iter().zip(timestamps_micros.iter()).enumerate() {
             ts_builder.append_value(*ts);
             service_builder.append_value(service);
             value_builder.append_value(i as i32);
@@ -244,8 +240,7 @@ mod tests {
         assert_eq!(grouped.total_records, 3);
         assert_eq!(grouped.batches[0].service_name.as_ref(), "svc-a");
         assert_eq!(grouped.batches[0].record_count, 3);
-        // min timestamp is 100ms = 100_000 micros
-        assert_eq!(grouped.batches[0].min_timestamp_micros, 100_000);
+        assert_eq!(grouped.batches[0].min_timestamp_micros, 100);
     }
 
     #[test]
@@ -262,15 +257,15 @@ mod tests {
         // Check order is preserved (first occurrence)
         assert_eq!(grouped.batches[0].service_name.as_ref(), "svc-a");
         assert_eq!(grouped.batches[0].record_count, 2);
-        assert_eq!(grouped.batches[0].min_timestamp_micros, 100_000); // min(100, 150) * 1000
+        assert_eq!(grouped.batches[0].min_timestamp_micros, 100); // min(100, 150)
 
         assert_eq!(grouped.batches[1].service_name.as_ref(), "svc-b");
         assert_eq!(grouped.batches[1].record_count, 2);
-        assert_eq!(grouped.batches[1].min_timestamp_micros, 200_000); // min(200, 250) * 1000
+        assert_eq!(grouped.batches[1].min_timestamp_micros, 200); // min(200, 250)
 
         assert_eq!(grouped.batches[2].service_name.as_ref(), "svc-c");
         assert_eq!(grouped.batches[2].record_count, 1);
-        assert_eq!(grouped.batches[2].min_timestamp_micros, 300_000);
+        assert_eq!(grouped.batches[2].min_timestamp_micros, 300);
     }
 
     #[test]
@@ -278,7 +273,7 @@ mod tests {
         let schema = StdArc::new(Schema::new(vec![
             Field::new(
                 "timestamp",
-                DataType::Timestamp(TimeUnit::Millisecond, None),
+                DataType::Timestamp(TimeUnit::Microsecond, None),
                 false,
             ),
             Field::new("service_name", DataType::Utf8, false),
@@ -294,7 +289,7 @@ mod tests {
     fn test_extract_min_timestamp_micros() {
         let batch = create_test_batch(&["svc-a", "svc-a"], &[100, 50]);
         let min_ts = extract_min_timestamp_micros(&batch);
-        assert_eq!(min_ts, 50_000); // 50ms * 1000 = 50000 micros
+        assert_eq!(min_ts, 50);
     }
 
     #[test]

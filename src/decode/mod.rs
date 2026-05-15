@@ -1,4 +1,4 @@
-//! OTLP decode layer - transforms raw bytes into VRL Values
+//! OTLP decode layer - transforms raw bytes into record values
 //!
 //! This module provides decoders for OTLP logs, traces, and metrics in both
 //! protobuf and JSON formats. The output is `Vec<Value>` where each Value
@@ -22,12 +22,12 @@ mod metrics;
 mod normalize;
 mod traces;
 
+use crate::value::Value;
 pub use common::{looks_like_json, DecodeError};
 pub use metrics::{DecodeMetricsResult, SkippedMetrics};
 pub use normalize::{
     count_skipped_metric_data_points, normalise_json_value, normalize_json_bytes, MetricSkipCounts,
 };
-use vrl::value::Value;
 
 /// Input format for OTLP decoding
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -68,14 +68,14 @@ impl InputFormat {
     }
 }
 
-/// Decode OTLP logs from raw bytes into VRL Values.
+/// Decode OTLP logs from raw bytes into record values.
 ///
 /// Each returned Value represents a single log record with fields:
 /// - `time_unix_nano`: i64
 /// - `observed_time_unix_nano`: i64
 /// - `severity_number`: i64
 /// - `severity_text`: string
-/// - `body`: any VRL value
+/// - `body`: any record value
 /// - `trace_id`: hex string
 /// - `span_id`: hex string
 /// - `attributes`: object
@@ -116,7 +116,7 @@ pub fn decode_logs(bytes: &[u8], format: InputFormat) -> Result<Vec<Value>, Deco
     }
 }
 
-/// Decode OTLP traces from raw bytes into VRL Values.
+/// Decode OTLP traces from raw bytes into record values.
 ///
 /// Each returned Value represents a single span with fields:
 /// - `trace_id`: hex string
@@ -174,7 +174,7 @@ pub fn decode_traces(bytes: &[u8], format: InputFormat) -> Result<Vec<Value>, De
     }
 }
 
-/// Decode OTLP metrics from raw bytes into VRL Values.
+/// Decode OTLP metrics from raw bytes into record values.
 ///
 /// Each returned Value represents a single metric data point with fields:
 /// - `time_unix_nano`: i64

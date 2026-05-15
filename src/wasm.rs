@@ -9,7 +9,7 @@
 //! ```javascript
 //! import init, { transform_logs_wasm, transform_traces_wasm } from 'otlp2records';
 //!
-//! // Initialize the WASM module (this also initializes VRL programs)
+//! // Initialize the WASM module
 //! await init();
 //!
 //! // Transform OTLP logs to Arrow IPC bytes
@@ -35,7 +35,6 @@ use wasm_bindgen::prelude::*;
 use crate::arrow::{gauge_schema, sum_schema};
 use crate::decode::InputFormat;
 use crate::output::to_ipc;
-use crate::transform::init_programs;
 use crate::{transform_logs, transform_metrics, transform_traces};
 
 /// Parse format string to InputFormat enum.
@@ -108,11 +107,7 @@ fn transform_metrics_sum_impl(bytes: &[u8], format: &str) -> Result<Vec<u8>, Str
     }
 }
 
-/// Initialize VRL programs for faster cold starts.
-///
-/// This function is automatically called when the WASM module is loaded.
-/// It pre-compiles VRL transformation programs so that subsequent calls
-/// to transform functions don't incur compilation overhead.
+/// Initialize the WASM module.
 ///
 /// # Example
 ///
@@ -123,14 +118,11 @@ fn transform_metrics_sum_impl(bytes: &[u8], format: &str) -> Result<Vec<u8>, Str
 /// await init();
 /// ```
 #[wasm_bindgen(start)]
-pub fn init() {
-    // Initialize VRL programs on WASM startup to avoid cold-start latency
-    init_programs();
-}
+pub fn init() {}
 
 /// Transform OTLP logs to Arrow IPC bytes.
 ///
-/// Decodes OTLP log data, applies VRL transformation, and serializes to Arrow IPC format.
+/// Decodes OTLP log data, transforms it, and serializes to Arrow IPC format.
 ///
 /// # Arguments
 ///
@@ -156,7 +148,7 @@ pub fn transform_logs_wasm(bytes: &[u8], format: &str) -> Result<Vec<u8>, JsErro
 
 /// Transform OTLP traces to Arrow IPC bytes.
 ///
-/// Decodes OTLP trace data, applies VRL transformation, and serializes to Arrow IPC format.
+/// Decodes OTLP trace data, transforms it, and serializes to Arrow IPC format.
 ///
 /// # Arguments
 ///
@@ -182,7 +174,7 @@ pub fn transform_traces_wasm(bytes: &[u8], format: &str) -> Result<Vec<u8>, JsEr
 
 /// Transform OTLP gauge metrics to Arrow IPC bytes.
 ///
-/// Decodes OTLP metric data, filters for gauge metrics, applies VRL transformation,
+/// Decodes OTLP metric data, filters for gauge metrics, transforms it,
 /// and serializes to Arrow IPC format.
 ///
 /// # Arguments
@@ -211,7 +203,7 @@ pub fn transform_metrics_gauge_wasm(bytes: &[u8], format: &str) -> Result<Vec<u8
 
 /// Transform OTLP sum metrics to Arrow IPC bytes.
 ///
-/// Decodes OTLP metric data, filters for sum (counter) metrics, applies VRL transformation,
+/// Decodes OTLP metric data, filters for sum (counter) metrics, transforms it,
 /// and serializes to Arrow IPC format.
 ///
 /// # Arguments

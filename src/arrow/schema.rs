@@ -1,265 +1,287 @@
-//! Arrow schema accessors
-//!
-//! Provides public access to the Arrow schemas generated from VRL @schema annotations.
-//! These schemas are generated at build time by build.rs.
+//! Arrow schema accessors.
 
-use arrow::datatypes::Schema;
+use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use once_cell::sync::Lazy;
 
-// Include compiled VRL schemas from build.rs
-include!(concat!(env!("OUT_DIR"), "/compiled_vrl.rs"));
+static LOGS_SCHEMA: Lazy<Schema> = Lazy::new(|| {
+    Schema::new(vec![
+        ts("timestamp", false),
+        i64_field("observed_timestamp", false),
+        utf8("trace_id", true),
+        utf8("span_id", true),
+        utf8("service_name", false),
+        utf8("service_namespace", true),
+        utf8("service_instance_id", true),
+        i32_field("severity_number", false),
+        utf8("severity_text", false),
+        utf8("body", true),
+        utf8("resource_attributes", true),
+        utf8("scope_name", true),
+        utf8("scope_version", true),
+        utf8("scope_attributes", true),
+        utf8("log_attributes", true),
+    ])
+});
 
-/// Returns the Arrow schema for OTLP logs.
-///
-/// Schema fields:
-/// - timestamp: TimestampMillisecond (required)
-/// - observed_timestamp: Int64 (required)
-/// - trace_id: Utf8 (optional)
-/// - span_id: Utf8 (optional)
-/// - service_name: Utf8 (required)
-/// - service_namespace: Utf8 (optional)
-/// - service_instance_id: Utf8 (optional)
-/// - severity_number: Int32 (required)
-/// - severity_text: Utf8 (required)
-/// - body: Utf8 (optional)
-/// - resource_attributes: Utf8/JSON (optional)
-/// - scope_name: Utf8 (optional)
-/// - scope_version: Utf8 (optional)
-/// - scope_attributes: Utf8/JSON (optional)
-/// - log_attributes: Utf8/JSON (optional)
+static TRACES_SCHEMA: Lazy<Schema> = Lazy::new(|| {
+    Schema::new(vec![
+        ts("timestamp", false),
+        i64_field("end_timestamp", false),
+        i64_field("duration", false),
+        utf8("trace_id", true),
+        utf8("span_id", true),
+        utf8("parent_span_id", true),
+        utf8("trace_state", true),
+        utf8("service_name", false),
+        utf8("service_namespace", true),
+        utf8("service_instance_id", true),
+        utf8("span_name", false),
+        i32_field("span_kind", false),
+        i32_field("status_code", false),
+        utf8("status_message", true),
+        utf8("resource_attributes", true),
+        utf8("scope_name", true),
+        utf8("scope_version", true),
+        utf8("scope_attributes", true),
+        utf8("span_attributes", true),
+        utf8("events_json", true),
+        utf8("links_json", true),
+        i32_field("dropped_attributes_count", true),
+        i32_field("dropped_events_count", true),
+        i32_field("dropped_links_count", true),
+        i32_field("flags", true),
+    ])
+});
+
+static GAUGE_SCHEMA: Lazy<Schema> = Lazy::new(|| {
+    Schema::new(vec![
+        ts("timestamp", false),
+        i64_field("start_timestamp", true),
+        utf8("metric_name", false),
+        utf8("metric_description", true),
+        utf8("metric_unit", true),
+        f64_field("value", false),
+        utf8("service_name", false),
+        utf8("service_namespace", true),
+        utf8("service_instance_id", true),
+        utf8("resource_attributes", true),
+        utf8("scope_name", true),
+        utf8("scope_version", true),
+        utf8("scope_attributes", true),
+        utf8("metric_attributes", true),
+        i32_field("flags", true),
+        utf8("exemplars_json", true),
+    ])
+});
+
+static SUM_SCHEMA: Lazy<Schema> = Lazy::new(|| {
+    Schema::new(vec![
+        ts("timestamp", false),
+        i64_field("start_timestamp", true),
+        utf8("metric_name", false),
+        utf8("metric_description", true),
+        utf8("metric_unit", true),
+        f64_field("value", false),
+        utf8("service_name", false),
+        utf8("service_namespace", true),
+        utf8("service_instance_id", true),
+        utf8("resource_attributes", true),
+        utf8("scope_name", true),
+        utf8("scope_version", true),
+        utf8("scope_attributes", true),
+        utf8("metric_attributes", true),
+        i32_field("flags", true),
+        utf8("exemplars_json", true),
+        i32_field("aggregation_temporality", false),
+        bool_field("is_monotonic", false),
+    ])
+});
+
+static HISTOGRAM_SCHEMA: Lazy<Schema> = Lazy::new(|| {
+    Schema::new(vec![
+        ts("timestamp", false),
+        i64_field("start_timestamp", true),
+        utf8("metric_name", false),
+        utf8("metric_description", true),
+        utf8("metric_unit", true),
+        i64_field("count", false),
+        f64_field("sum", true),
+        f64_field("min", true),
+        f64_field("max", true),
+        utf8("bucket_counts", false),
+        utf8("explicit_bounds", false),
+        utf8("service_name", false),
+        utf8("service_namespace", true),
+        utf8("service_instance_id", true),
+        utf8("resource_attributes", true),
+        utf8("scope_name", true),
+        utf8("scope_version", true),
+        utf8("scope_attributes", true),
+        utf8("metric_attributes", true),
+        i32_field("flags", true),
+        utf8("exemplars_json", true),
+        i32_field("aggregation_temporality", false),
+    ])
+});
+
+static EXP_HISTOGRAM_SCHEMA: Lazy<Schema> = Lazy::new(|| {
+    Schema::new(vec![
+        ts("timestamp", false),
+        i64_field("start_timestamp", true),
+        utf8("metric_name", false),
+        utf8("metric_description", true),
+        utf8("metric_unit", true),
+        i64_field("count", false),
+        f64_field("sum", true),
+        f64_field("min", true),
+        f64_field("max", true),
+        i32_field("scale", false),
+        i64_field("zero_count", false),
+        f64_field("zero_threshold", true),
+        i32_field("positive_offset", true),
+        utf8("positive_bucket_counts", true),
+        i32_field("negative_offset", true),
+        utf8("negative_bucket_counts", true),
+        utf8("service_name", false),
+        utf8("service_namespace", true),
+        utf8("service_instance_id", true),
+        utf8("resource_attributes", true),
+        utf8("scope_name", true),
+        utf8("scope_version", true),
+        utf8("scope_attributes", true),
+        utf8("metric_attributes", true),
+        i32_field("flags", true),
+        utf8("exemplars_json", true),
+        i32_field("aggregation_temporality", false),
+    ])
+});
+
 pub fn logs_schema() -> Schema {
-    OTLP_LOGS_SCHEMA.clone()
+    LOGS_SCHEMA.clone()
 }
 
-/// Returns the Arrow schema for OTLP trace spans.
-///
-/// Schema fields:
-/// - timestamp: TimestampMillisecond (required)
-/// - end_timestamp: Int64 (required)
-/// - duration: Int64 (required)
-/// - trace_id: Utf8 (optional)
-/// - span_id: Utf8 (optional)
-/// - parent_span_id: Utf8 (optional)
-/// - trace_state: Utf8 (optional)
-/// - service_name: Utf8 (required)
-/// - service_namespace: Utf8 (optional)
-/// - service_instance_id: Utf8 (optional)
-/// - span_name: Utf8 (required)
-/// - span_kind: Int32 (required)
-/// - status_code: Int32 (required)
-/// - status_message: Utf8 (optional)
-/// - resource_attributes: Utf8/JSON (optional)
-/// - scope_name: Utf8 (optional)
-/// - scope_version: Utf8 (optional)
-/// - scope_attributes: Utf8/JSON (optional)
-/// - span_attributes: Utf8/JSON (optional)
-/// - events_json: Utf8/JSON (optional)
-/// - links_json: Utf8/JSON (optional)
-/// - dropped_attributes_count: Int32 (optional)
-/// - dropped_events_count: Int32 (optional)
-/// - dropped_links_count: Int32 (optional)
-/// - flags: Int32 (optional)
 pub fn traces_schema() -> Schema {
-    OTLP_TRACES_SCHEMA.clone()
+    TRACES_SCHEMA.clone()
 }
 
-/// Returns the Arrow schema for OTLP gauge metrics.
-///
-/// Schema fields:
-/// - timestamp: TimestampMillisecond (required)
-/// - start_timestamp: Int64 (optional)
-/// - metric_name: Utf8 (required)
-/// - metric_description: Utf8 (optional)
-/// - metric_unit: Utf8 (optional)
-/// - value: Float64 (required)
-/// - service_name: Utf8 (required)
-/// - service_namespace: Utf8 (optional)
-/// - service_instance_id: Utf8 (optional)
-/// - resource_attributes: Utf8/JSON (optional)
-/// - scope_name: Utf8 (optional)
-/// - scope_version: Utf8 (optional)
-/// - scope_attributes: Utf8/JSON (optional)
-/// - metric_attributes: Utf8/JSON (optional)
-/// - flags: Int32 (optional)
-/// - exemplars_json: Utf8/JSON (optional)
 pub fn gauge_schema() -> Schema {
-    OTLP_GAUGE_SCHEMA.clone()
+    GAUGE_SCHEMA.clone()
 }
 
-/// Returns the Arrow schema for OTLP sum metrics.
-///
-/// Schema fields:
-/// - timestamp: TimestampMillisecond (required)
-/// - start_timestamp: Int64 (optional)
-/// - metric_name: Utf8 (required)
-/// - metric_description: Utf8 (optional)
-/// - metric_unit: Utf8 (optional)
-/// - value: Float64 (required)
-/// - service_name: Utf8 (required)
-/// - service_namespace: Utf8 (optional)
-/// - service_instance_id: Utf8 (optional)
-/// - resource_attributes: Utf8/JSON (optional)
-/// - scope_name: Utf8 (optional)
-/// - scope_version: Utf8 (optional)
-/// - scope_attributes: Utf8/JSON (optional)
-/// - metric_attributes: Utf8/JSON (optional)
-/// - flags: Int32 (optional)
-/// - exemplars_json: Utf8/JSON (optional)
-/// - aggregation_temporality: Int32 (required)
-/// - is_monotonic: Boolean (required)
 pub fn sum_schema() -> Schema {
-    OTLP_SUM_SCHEMA.clone()
+    SUM_SCHEMA.clone()
 }
 
-/// Returns the Arrow schema for OTLP histogram metrics.
-///
-/// Schema fields:
-/// - timestamp: TimestampMillisecond (required)
-/// - start_timestamp: Int64 (optional)
-/// - metric_name: Utf8 (required)
-/// - metric_description: Utf8 (optional)
-/// - metric_unit: Utf8 (optional)
-/// - count: Int64 (required)
-/// - sum: Float64 (optional)
-/// - min: Float64 (optional)
-/// - max: Float64 (optional)
-/// - bucket_counts: Utf8/JSON (required) - JSON array of u64
-/// - explicit_bounds: Utf8/JSON (required) - JSON array of f64
-/// - service_name: Utf8 (required)
-/// - service_namespace: Utf8 (optional)
-/// - service_instance_id: Utf8 (optional)
-/// - resource_attributes: Utf8/JSON (optional)
-/// - scope_name: Utf8 (optional)
-/// - scope_version: Utf8 (optional)
-/// - scope_attributes: Utf8/JSON (optional)
-/// - metric_attributes: Utf8/JSON (optional)
-/// - flags: Int32 (optional)
-/// - exemplars_json: Utf8/JSON (optional)
-/// - aggregation_temporality: Int32 (required)
 pub fn histogram_schema() -> Schema {
-    OTLP_HISTOGRAM_SCHEMA.clone()
+    HISTOGRAM_SCHEMA.clone()
 }
 
-/// Returns the Arrow schema for OTLP exponential histogram metrics.
-///
-/// Schema fields:
-/// - timestamp: TimestampMillisecond (required)
-/// - start_timestamp: Int64 (optional)
-/// - metric_name: Utf8 (required)
-/// - metric_description: Utf8 (optional)
-/// - metric_unit: Utf8 (optional)
-/// - count: Int64 (required)
-/// - sum: Float64 (optional)
-/// - min: Float64 (optional)
-/// - max: Float64 (optional)
-/// - scale: Int32 (required)
-/// - zero_count: Int64 (required)
-/// - zero_threshold: Float64 (optional)
-/// - positive_offset: Int32 (optional)
-/// - positive_bucket_counts: Utf8/JSON (optional) - JSON array of u64
-/// - negative_offset: Int32 (optional)
-/// - negative_bucket_counts: Utf8/JSON (optional) - JSON array of u64
-/// - service_name: Utf8 (required)
-/// - service_namespace: Utf8 (optional)
-/// - service_instance_id: Utf8 (optional)
-/// - resource_attributes: Utf8/JSON (optional)
-/// - scope_name: Utf8 (optional)
-/// - scope_version: Utf8 (optional)
-/// - scope_attributes: Utf8/JSON (optional)
-/// - metric_attributes: Utf8/JSON (optional)
-/// - flags: Int32 (optional)
-/// - exemplars_json: Utf8/JSON (optional)
-/// - aggregation_temporality: Int32 (required)
 pub fn exp_histogram_schema() -> Schema {
-    OTLP_EXP_HISTOGRAM_SCHEMA.clone()
+    EXP_HISTOGRAM_SCHEMA.clone()
+}
+
+fn ts(name: &str, nullable: bool) -> Field {
+    Field::new(
+        name,
+        DataType::Timestamp(TimeUnit::Microsecond, None),
+        nullable,
+    )
+}
+
+fn utf8(name: &str, nullable: bool) -> Field {
+    Field::new(name, DataType::Utf8, nullable)
+}
+
+fn i64_field(name: &str, nullable: bool) -> Field {
+    Field::new(name, DataType::Int64, nullable)
+}
+
+fn i32_field(name: &str, nullable: bool) -> Field {
+    Field::new(name, DataType::Int32, nullable)
+}
+
+fn f64_field(name: &str, nullable: bool) -> Field {
+    Field::new(name, DataType::Float64, nullable)
+}
+
+fn bool_field(name: &str, nullable: bool) -> Field {
+    Field::new(name, DataType::Boolean, nullable)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::datatypes::{DataType, TimeUnit};
 
     #[test]
-    fn test_logs_schema_has_expected_fields() {
+    fn logs_schema_has_expected_fields() {
         let schema = logs_schema();
-
-        // Check timestamp field
         let ts_field = schema.field_with_name("timestamp").unwrap();
         assert_eq!(
             ts_field.data_type(),
             &DataType::Timestamp(TimeUnit::Microsecond, None)
         );
         assert!(!ts_field.is_nullable());
-
-        // Check service_name field
-        let service_field = schema.field_with_name("service_name").unwrap();
-        assert_eq!(service_field.data_type(), &DataType::Utf8);
-        assert!(!service_field.is_nullable());
-
-        // Check trace_id is optional
-        let trace_id_field = schema.field_with_name("trace_id").unwrap();
-        assert!(trace_id_field.is_nullable());
-
-        // Check severity_number field
-        let severity_field = schema.field_with_name("severity_number").unwrap();
-        assert_eq!(severity_field.data_type(), &DataType::Int32);
+        assert_eq!(
+            schema.field_with_name("service_name").unwrap().data_type(),
+            &DataType::Utf8
+        );
+        assert!(schema.field_with_name("trace_id").unwrap().is_nullable());
+        assert_eq!(
+            schema
+                .field_with_name("severity_number")
+                .unwrap()
+                .data_type(),
+            &DataType::Int32
+        );
     }
 
     #[test]
-    fn test_traces_schema_has_expected_fields() {
+    fn traces_schema_has_expected_fields() {
         let schema = traces_schema();
-
-        // Check timestamp field
-        let ts_field = schema.field_with_name("timestamp").unwrap();
         assert_eq!(
-            ts_field.data_type(),
+            schema.field_with_name("timestamp").unwrap().data_type(),
             &DataType::Timestamp(TimeUnit::Microsecond, None)
         );
-
-        // Check span_kind field
-        let kind_field = schema.field_with_name("span_kind").unwrap();
-        assert_eq!(kind_field.data_type(), &DataType::Int32);
-
-        // Check duration field
-        let duration_field = schema.field_with_name("duration").unwrap();
-        assert_eq!(duration_field.data_type(), &DataType::Int64);
+        assert_eq!(
+            schema.field_with_name("span_kind").unwrap().data_type(),
+            &DataType::Int32
+        );
+        assert_eq!(
+            schema.field_with_name("duration").unwrap().data_type(),
+            &DataType::Int64
+        );
     }
 
     #[test]
-    fn test_gauge_schema_has_expected_fields() {
-        let schema = gauge_schema();
-
-        // Check value field
-        let value_field = schema.field_with_name("value").unwrap();
-        assert_eq!(value_field.data_type(), &DataType::Float64);
-        assert!(!value_field.is_nullable());
-
-        // Check metric_name field
-        let name_field = schema.field_with_name("metric_name").unwrap();
-        assert_eq!(name_field.data_type(), &DataType::Utf8);
-    }
-
-    #[test]
-    fn test_sum_schema_has_expected_fields() {
-        let schema = sum_schema();
-
-        // Check aggregation_temporality field
-        let agg_field = schema.field_with_name("aggregation_temporality").unwrap();
-        assert_eq!(agg_field.data_type(), &DataType::Int32);
-        assert!(!agg_field.is_nullable());
-
-        // Check is_monotonic field
-        let mono_field = schema.field_with_name("is_monotonic").unwrap();
-        assert_eq!(mono_field.data_type(), &DataType::Boolean);
-        assert!(!mono_field.is_nullable());
-    }
-
-    #[test]
-    fn test_schemas_are_cloneable() {
-        // Multiple calls should return independent clones
-        let schema1 = logs_schema();
-        let schema2 = logs_schema();
-
-        assert_eq!(schema1.fields().len(), schema2.fields().len());
+    fn metric_schemas_have_expected_fields() {
+        assert_eq!(
+            gauge_schema().field_with_name("value").unwrap().data_type(),
+            &DataType::Float64
+        );
+        assert!(!sum_schema()
+            .field_with_name("aggregation_temporality")
+            .unwrap()
+            .is_nullable());
+        assert_eq!(
+            sum_schema()
+                .field_with_name("is_monotonic")
+                .unwrap()
+                .data_type(),
+            &DataType::Boolean
+        );
+        assert_eq!(
+            histogram_schema()
+                .field_with_name("bucket_counts")
+                .unwrap()
+                .data_type(),
+            &DataType::Utf8
+        );
+        assert_eq!(
+            exp_histogram_schema()
+                .field_with_name("scale")
+                .unwrap()
+                .data_type(),
+            &DataType::Int32
+        );
     }
 }

@@ -20,7 +20,7 @@ Currently consumed by [duckdb-otlp](https://github.com/smithclay/duckdb-otlp), [
 - Transform OTLP logs, traces, and metrics to Arrow RecordBatches
 - Support for both Protobuf and JSON input formats
 - Output to NDJSON, Arrow IPC, or Parquet
-- VRL (Vector Remap Language) transformations built-in
+- Built-in Rust transformations
 - Efficient memory usage with Arc-shared resource/scope values
 
 ## Installation
@@ -29,13 +29,13 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-otlp2records = "0.1"
+otlp2records = "0.5"
 
 # Optional: Enable Parquet output
-otlp2records = { version = "0.1", features = ["parquet"] }
+otlp2records = { version = "0.5", features = ["parquet"] }
 
 # Optional: Enable WASM bindings
-otlp2records = { version = "0.1", features = ["wasm"] }
+otlp2records = { version = "0.5", features = ["wasm"] }
 ```
 
 ## Usage
@@ -93,10 +93,10 @@ use otlp2records::{
     decode_logs, apply_log_transform, values_to_arrow, logs_schema, InputFormat
 };
 
-// Step 1: Decode OTLP bytes to VRL Values
+// Step 1: Decode OTLP bytes to record values
 let values = decode_logs(bytes, InputFormat::Protobuf)?;
 
-// Step 2: Apply VRL transformation
+// Step 2: Apply the built-in transformation
 let transformed = apply_log_transform(values)?;
 
 // Step 3: Convert to Arrow RecordBatch
@@ -172,7 +172,7 @@ const arrowIpc = transform_logs_wasm(otlpBytes, "protobuf");
                                         |
                                         v
                               +---------+---------+
-                              |   VRL Transform   |
+                              | Rust Transform    |
                               | (field mapping)   |
                               +---------+---------+
                                         |
@@ -192,9 +192,9 @@ const arrowIpc = transform_logs_wasm(otlpBytes, "protobuf");
 
 ### Module Structure
 
-- **decode**: Parse OTLP protobuf/JSON into VRL Values
-- **transform**: Apply VRL programs to normalize data
-- **arrow**: Convert VRL Values to Arrow RecordBatches
+- **decode**: Parse OTLP protobuf/JSON into record values
+- **transform**: Apply Rust projections to normalize data
+- **arrow**: Convert record values to Arrow RecordBatches
 - **output**: Serialize RecordBatches to various formats
 - **wasm**: WASM bindings (optional)
 
@@ -290,7 +290,7 @@ Includes all gauge fields plus:
 
 ## Performance
 
-- Compiled VRL programs cached for reuse
+- Transforms are plain Rust functions with no interpreter or runtime overhead
 - Arc-shared resource/scope values reduce memory allocations
 - Arrow columnar format enables efficient compression
 - Release builds use LTO and size optimization

@@ -1,5 +1,6 @@
 //! Common utilities shared across OTLP decoders
 
+use crate::value::{KeyString, ObjectMap, Value as RecordValue};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use bytes::Bytes;
 use opentelemetry_proto::tonic::common::v1::{
@@ -9,7 +10,6 @@ use opentelemetry_proto::tonic::resource::v1::Resource;
 use ordered_float::NotNan;
 use serde::Deserialize;
 use std::sync::Arc;
-use vrl::value::{KeyString, ObjectMap, Value as VrlValue};
 
 // ============================================================================
 // Error types
@@ -66,15 +66,15 @@ impl From<prost::DecodeError> for DecodeError {
 // Float handling
 // ============================================================================
 
-/// Convert f64 into VRL Value, dropping non-finite numbers consistently
-pub fn finite_float_to_vrl(value: f64) -> VrlValue {
+/// Convert f64 into record value, dropping non-finite numbers consistently
+pub fn finite_float_to_value(value: f64) -> RecordValue {
     if value.is_nan() || value.is_infinite() {
-        VrlValue::Null
+        RecordValue::Null
     } else {
         // Use unwrap_or_else for defensive handling of edge cases
         match NotNan::new(value) {
-            Ok(n) => VrlValue::Float(n),
-            Err(_) => VrlValue::Null,
+            Ok(n) => RecordValue::Float(n),
+            Err(_) => RecordValue::Null,
         }
     }
 }
@@ -83,80 +83,80 @@ pub fn finite_float_to_vrl(value: f64) -> VrlValue {
 // Protobuf utilities
 // ============================================================================
 
-/// Convert protobuf Resource to VRL Value
-pub fn otlp_resource_to_value(resource: Option<&Resource>) -> VrlValue {
+/// Convert protobuf Resource to record value
+pub fn otlp_resource_to_value(resource: Option<&Resource>) -> RecordValue {
     let mut map = ObjectMap::new();
     let attributes = resource
         .map(|res| otlp_attributes_to_value(&res.attributes))
-        .unwrap_or_else(|| VrlValue::Object(ObjectMap::new()));
+        .unwrap_or_else(|| RecordValue::Object(ObjectMap::new()));
     map.insert("attributes".into(), attributes);
-    VrlValue::Object(map)
+    RecordValue::Object(map)
 }
 
-/// Convert protobuf InstrumentationScope to VRL Value
-pub fn otlp_scope_to_value(scope: Option<&InstrumentationScope>) -> VrlValue {
+/// Convert protobuf InstrumentationScope to record value
+pub fn otlp_scope_to_value(scope: Option<&InstrumentationScope>) -> RecordValue {
     let mut map = ObjectMap::new();
     if let Some(scope) = scope {
         map.insert(
             "name".into(),
-            VrlValue::Bytes(Bytes::from(scope.name.clone())),
+            RecordValue::Bytes(Bytes::from(scope.name.clone())),
         );
         map.insert(
             "version".into(),
-            VrlValue::Bytes(Bytes::from(scope.version.clone())),
+            RecordValue::Bytes(Bytes::from(scope.version.clone())),
         );
         map.insert(
             "attributes".into(),
             otlp_attributes_to_value(&scope.attributes),
         );
     } else {
-        map.insert("name".into(), VrlValue::Bytes(Bytes::new()));
-        map.insert("version".into(), VrlValue::Bytes(Bytes::new()));
-        map.insert("attributes".into(), VrlValue::Object(ObjectMap::new()));
+        map.insert("name".into(), RecordValue::Bytes(Bytes::new()));
+        map.insert("version".into(), RecordValue::Bytes(Bytes::new()));
+        map.insert("attributes".into(), RecordValue::Object(ObjectMap::new()));
     }
-    VrlValue::Object(map)
+    RecordValue::Object(map)
 }
 
-/// Convert protobuf KeyValue array to VRL Object
-pub fn otlp_attributes_to_value(attrs: &[KeyValue]) -> VrlValue {
+/// Convert protobuf KeyValue array to record object
+pub fn otlp_attributes_to_value(attrs: &[KeyValue]) -> RecordValue {
     let map: ObjectMap = attrs
         .iter()
         .filter_map(|kv| {
             kv.value
                 .as_ref()
-                .map(|v| (KeyString::from(kv.key.clone()), otlp_any_value_to_vrl(v)))
+                .map(|v| (KeyString::from(kv.key.clone()), otlp_any_value_to_value(v)))
         })
         .collect();
-    VrlValue::Object(map)
+    RecordValue::Object(map)
 }
 
-/// Convert protobuf AnyValue to VRL Value
-pub fn otlp_any_value_to_vrl(av: &AnyValue) -> VrlValue {
+/// Convert protobuf AnyValue to record value
+pub fn otlp_any_value_to_value(av: &AnyValue) -> RecordValue {
     match av.value.as_ref() {
-        Some(any_value::Value::StringValue(s)) => VrlValue::Bytes(Bytes::from(s.clone())),
-        Some(any_value::Value::BoolValue(b)) => VrlValue::Boolean(*b),
-        Some(any_value::Value::IntValue(i)) => VrlValue::Integer(*i),
-        Some(any_value::Value::DoubleValue(d)) => finite_float_to_vrl(*d),
+        Some(any_value::Value::StringValue(s)) => RecordValue::Bytes(Bytes::from(s.clone())),
+        Some(any_value::Value::BoolValue(b)) => RecordValue::Boolean(*b),
+        Some(any_value::Value::IntValue(i)) => RecordValue::Integer(*i),
+        Some(any_value::Value::DoubleValue(d)) => finite_float_to_value(*d),
         Some(any_value::Value::ArrayValue(arr)) => {
-            VrlValue::Array(arr.values.iter().map(otlp_any_value_to_vrl).collect())
+            RecordValue::Array(arr.values.iter().map(otlp_any_value_to_value).collect())
         }
         Some(any_value::Value::KvlistValue(kvlist)) => kvlist_to_object(kvlist),
-        Some(any_value::Value::BytesValue(bytes)) => VrlValue::Bytes(Bytes::from(bytes.clone())),
-        None => VrlValue::Null,
+        Some(any_value::Value::BytesValue(bytes)) => RecordValue::Bytes(Bytes::from(bytes.clone())),
+        None => RecordValue::Null,
     }
 }
 
-fn kvlist_to_object(kvlist: &KeyValueList) -> VrlValue {
+fn kvlist_to_object(kvlist: &KeyValueList) -> RecordValue {
     let map: ObjectMap = kvlist
         .values
         .iter()
         .filter_map(|kv| {
             kv.value
                 .as_ref()
-                .map(|v| (KeyString::from(kv.key.clone()), otlp_any_value_to_vrl(v)))
+                .map(|v| (KeyString::from(kv.key.clone()), otlp_any_value_to_value(v)))
         })
         .collect();
-    VrlValue::Object(map)
+    RecordValue::Object(map)
 }
 
 /// Safely convert u64 timestamp to i64, returning error on overflow
@@ -168,7 +168,7 @@ pub fn safe_timestamp_conversion(timestamp: u64, field_name: &str) -> Result<i64
     })
 }
 
-/// Traverse OTLP resources and scopes, reusing resource/scope VRL values via Arc.
+/// Traverse OTLP resources and scopes, reusing resource/scope record values via Arc.
 pub fn for_each_resource_scope<R, S, T, I, J, RF, SF, CF, E>(
     resources: I,
     mut split: RF,
@@ -178,9 +178,9 @@ pub fn for_each_resource_scope<R, S, T, I, J, RF, SF, CF, E>(
 where
     I: IntoIterator<Item = R>,
     J: IntoIterator<Item = S>,
-    RF: FnMut(R) -> (VrlValue, J),
-    SF: FnMut(S) -> (VrlValue, T),
-    CF: FnMut(T, Arc<VrlValue>, Arc<VrlValue>) -> Result<(), E>,
+    RF: FnMut(R) -> (RecordValue, J),
+    SF: FnMut(S) -> (RecordValue, T),
+    CF: FnMut(T, Arc<RecordValue>, Arc<RecordValue>) -> Result<(), E>,
 {
     for resource in resources {
         let (resource_value, scopes) = split(resource);
@@ -373,56 +373,63 @@ pub struct JsonInstrumentationScope {
     pub attributes: Vec<JsonKeyValue>,
 }
 
-/// Convert JSON AnyValue to VRL Value
-pub fn json_any_value_to_vrl(av: JsonAnyValue) -> VrlValue {
+/// Convert JSON AnyValue to record value
+pub fn json_any_value_to_value(av: JsonAnyValue) -> RecordValue {
     if let Some(s) = av.string_value {
-        VrlValue::Bytes(Bytes::from(s))
+        RecordValue::Bytes(Bytes::from(s))
     } else if let Some(i) = av.int_value {
-        i.as_i64().map(VrlValue::Integer).unwrap_or(VrlValue::Null)
+        i.as_i64()
+            .map(RecordValue::Integer)
+            .unwrap_or(RecordValue::Null)
     } else if let Some(d) = av.double_value {
-        finite_float_to_vrl(d)
+        finite_float_to_value(d)
     } else if let Some(b) = av.bool_value {
-        VrlValue::Boolean(b)
+        RecordValue::Boolean(b)
     } else if let Some(arr) = av.array_value {
-        VrlValue::Array(arr.values.into_iter().map(json_any_value_to_vrl).collect())
+        RecordValue::Array(
+            arr.values
+                .into_iter()
+                .map(json_any_value_to_value)
+                .collect(),
+        )
     } else if let Some(kv) = av.kvlist_value {
         json_attrs_to_value(kv.values)
     } else if let Some(bytes) = av.bytes_value {
-        VrlValue::Bytes(Bytes::from(decode_bytes_field(&bytes)))
+        RecordValue::Bytes(Bytes::from(decode_bytes_field(&bytes)))
     } else {
-        VrlValue::Null
+        RecordValue::Null
     }
 }
 
-/// Convert JSON attributes to VRL Value
-pub fn json_attrs_to_value(attrs: Vec<JsonKeyValue>) -> VrlValue {
+/// Convert JSON attributes to record value
+pub fn json_attrs_to_value(attrs: Vec<JsonKeyValue>) -> RecordValue {
     let map: ObjectMap = attrs
         .into_iter()
-        .filter_map(|kv| kv.value.map(|v| (kv.key.into(), json_any_value_to_vrl(v))))
+        .filter_map(|kv| kv.value.map(|v| (kv.key, json_any_value_to_value(v))))
         .collect();
-    VrlValue::Object(map)
+    RecordValue::Object(map)
 }
 
-/// Convert JSON resource to VRL Value
-pub fn json_resource_to_value(resource: JsonResource) -> VrlValue {
+/// Convert JSON resource to record value
+pub fn json_resource_to_value(resource: JsonResource) -> RecordValue {
     let mut map = ObjectMap::new();
     map.insert(
         "attributes".into(),
         json_attrs_to_value(resource.attributes),
     );
-    VrlValue::Object(map)
+    RecordValue::Object(map)
 }
 
-/// Convert JSON instrumentation scope to VRL Value
-pub fn json_scope_to_value(scope: JsonInstrumentationScope) -> VrlValue {
+/// Convert JSON instrumentation scope to record value
+pub fn json_scope_to_value(scope: JsonInstrumentationScope) -> RecordValue {
     let mut map = ObjectMap::new();
-    map.insert("name".into(), VrlValue::Bytes(Bytes::from(scope.name)));
+    map.insert("name".into(), RecordValue::Bytes(Bytes::from(scope.name)));
     map.insert(
         "version".into(),
-        VrlValue::Bytes(Bytes::from(scope.version)),
+        RecordValue::Bytes(Bytes::from(scope.version)),
     );
     map.insert("attributes".into(), json_attrs_to_value(scope.attributes));
-    VrlValue::Object(map)
+    RecordValue::Object(map)
 }
 
 #[cfg(test)]
@@ -431,23 +438,23 @@ mod tests {
 
     #[test]
     fn finite_float_handles_normal_values() {
-        let result = finite_float_to_vrl(42.5);
-        assert!(matches!(result, VrlValue::Float(_)));
+        let result = finite_float_to_value(42.5);
+        assert!(matches!(result, RecordValue::Float(_)));
     }
 
     #[test]
     fn finite_float_handles_nan() {
-        let result = finite_float_to_vrl(f64::NAN);
-        assert!(matches!(result, VrlValue::Null));
+        let result = finite_float_to_value(f64::NAN);
+        assert!(matches!(result, RecordValue::Null));
     }
 
     #[test]
     fn finite_float_handles_infinity() {
-        let result = finite_float_to_vrl(f64::INFINITY);
-        assert!(matches!(result, VrlValue::Null));
+        let result = finite_float_to_value(f64::INFINITY);
+        assert!(matches!(result, RecordValue::Null));
 
-        let result = finite_float_to_vrl(f64::NEG_INFINITY);
-        assert!(matches!(result, VrlValue::Null));
+        let result = finite_float_to_value(f64::NEG_INFINITY);
+        assert!(matches!(result, RecordValue::Null));
     }
 
     #[test]
