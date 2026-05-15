@@ -40,11 +40,11 @@
 //! ```ignore
 //! use otlp2records::{decode_logs, apply_log_transform, values_to_arrow, logs_schema, InputFormat};
 //!
-//! // Step 1: Decode OTLP bytes to VRL Values
+//! // Step 1: Decode OTLP bytes to record values
 //! let values = decode_logs(bytes, InputFormat::Protobuf)?;
 //!
-//! // Step 2: Apply VRL transformation
-//! let transformed = apply_log_transform(values)?;
+//! // Step 2: Apply the built-in transformation
+//! let transformed = apply_log_transform(values);
 //!
 //! // Step 3: Convert to Arrow RecordBatch
 //! let batch = values_to_arrow(&transformed, &logs_schema())?;
@@ -57,6 +57,7 @@ pub mod error;
 pub mod output;
 pub mod schemas;
 pub mod transform;
+pub mod value;
 
 #[cfg(all(feature = "wasm", target_arch = "wasm32"))]
 pub mod wasm;
@@ -65,7 +66,6 @@ pub mod wasm;
 pub mod ffi;
 
 use ::arrow::record_batch::RecordBatch;
-use vrl::value::{KeyString, Value};
 
 pub use arrow::{
     exp_histogram_schema, extract_min_timestamp_micros, extract_service_name, gauge_schema,
@@ -81,11 +81,8 @@ pub use error::{Error, Result};
 #[cfg(feature = "parquet")]
 pub use output::to_parquet;
 pub use output::{to_ipc, to_json};
-pub use schemas::{schema_def, schema_defs, SchemaDef, SchemaField};
-pub use transform::{
-    VrlError, VrlTransformer, OTLP_EXP_HISTOGRAM_PROGRAM, OTLP_GAUGE_PROGRAM,
-    OTLP_HISTOGRAM_PROGRAM, OTLP_LOGS_PROGRAM, OTLP_SUM_PROGRAM, OTLP_TRACES_PROGRAM,
-};
+pub use schemas::{schema_def, schema_defs, FieldType, SchemaDef, SchemaField};
+pub use value::{KeyString, ObjectMap, Value};
 
 // ============================================================================
 // High-level API types
@@ -128,10 +125,10 @@ pub struct JsonMetricBatches {
     pub skipped: SkippedMetrics,
 }
 
-/// Result of applying VRL transformation to metrics.
+/// Result of applying the built-in transformation to metrics.
 ///
-/// Metrics are partitioned by type because each metric type requires
-/// a different VRL transformation program and has a different output schema.
+/// Metrics are partitioned by type because each metric type has a different
+/// output schema.
 #[derive(Debug, Default)]
 pub struct MetricValues {
     /// Transformed gauge metric values
@@ -151,7 +148,7 @@ pub struct MetricValues {
 /// Transform OTLP logs to Arrow RecordBatch.
 ///
 /// This is the simplest way to convert OTLP log data to Arrow format.
-/// It handles decoding, VRL transformation, and Arrow conversion in one step.
+/// It handles decoding, transformation, and Arrow conversion in one step.
 ///
 /// # Arguments
 ///
@@ -174,8 +171,8 @@ pub fn transform_logs(bytes: &[u8], format: InputFormat) -> Result<RecordBatch> 
     // Step 1: Decode OTLP logs
     let values = decode_logs(bytes, format)?;
 
-    // Step 2: Apply VRL transformation
-    let transformed = apply_log_transform(values)?;
+    // Step 2: Apply transformation
+    let transformed = apply_log_transform(values);
 
     // Step 3: Convert to Arrow
     let batch = values_to_arrow(&transformed, &logs_schema())?;
@@ -186,14 +183,14 @@ pub fn transform_logs(bytes: &[u8], format: InputFormat) -> Result<RecordBatch> 
 /// Transform OTLP logs to JSON values.
 pub fn transform_logs_json(bytes: &[u8], format: InputFormat) -> Result<Vec<serde_json::Value>> {
     let values = decode_logs(bytes, format)?;
-    let transformed = apply_log_transform(values)?;
+    let transformed = apply_log_transform(values);
     values_to_json(transformed, "log")
 }
 
 /// Transform OTLP traces to Arrow RecordBatch.
 ///
 /// This is the simplest way to convert OTLP trace data to Arrow format.
-/// It handles decoding, VRL transformation, and Arrow conversion in one step.
+/// It handles decoding, transformation, and Arrow conversion in one step.
 ///
 /// # Arguments
 ///
@@ -216,8 +213,8 @@ pub fn transform_traces(bytes: &[u8], format: InputFormat) -> Result<RecordBatch
     // Step 1: Decode OTLP traces
     let values = decode_traces(bytes, format)?;
 
-    // Step 2: Apply VRL transformation
-    let transformed = apply_trace_transform(values)?;
+    // Step 2: Apply transformation
+    let transformed = apply_trace_transform(values);
 
     // Step 3: Convert to Arrow
     let batch = values_to_arrow(&transformed, &traces_schema())?;
@@ -228,7 +225,7 @@ pub fn transform_traces(bytes: &[u8], format: InputFormat) -> Result<RecordBatch
 /// Transform OTLP traces to JSON values.
 pub fn transform_traces_json(bytes: &[u8], format: InputFormat) -> Result<Vec<serde_json::Value>> {
     let values = decode_traces(bytes, format)?;
-    let transformed = apply_trace_transform(values)?;
+    let transformed = apply_trace_transform(values);
     values_to_json(transformed, "span")
 }
 
@@ -266,8 +263,8 @@ pub fn transform_metrics(bytes: &[u8], format: InputFormat) -> Result<MetricBatc
     // Step 1: Decode OTLP metrics
     let decode_result = decode_metrics(bytes, format)?;
 
-    // Step 2: Apply VRL transformation (partitions by metric type)
-    let metric_values = apply_metric_transform(decode_result.values)?;
+    // Step 2: Apply transformation (partitions by metric type)
+    let metric_values = apply_metric_transform(decode_result.values);
 
     // Step 3: Convert each partition to Arrow (if non-empty)
     let gauge = if metric_values.gauge.is_empty() {
@@ -312,7 +309,7 @@ pub fn transform_metrics(bytes: &[u8], format: InputFormat) -> Result<MetricBatc
 /// Transform OTLP metrics to JSON values.
 pub fn transform_metrics_json(bytes: &[u8], format: InputFormat) -> Result<JsonMetricBatches> {
     let decode_result = decode_metrics(bytes, format)?;
-    let metric_values = apply_metric_transform(decode_result.values)?;
+    let metric_values = apply_metric_transform(decode_result.values);
 
     Ok(JsonMetricBatches {
         gauge: values_to_json(metric_values.gauge, "gauge metric")?,
@@ -465,7 +462,7 @@ pub fn transform_metrics_partitioned(
 // Lower-level API functions
 // ============================================================================
 
-/// Apply VRL transformation to decoded log values.
+/// Apply the built-in transformation to decoded log values.
 ///
 /// This function provides finer-grained control over the transformation process.
 /// Use this when you need to inspect or modify values between steps, or when
@@ -477,7 +474,7 @@ pub fn transform_metrics_partitioned(
 ///
 /// # Returns
 ///
-/// A vector of transformed values ready for Arrow conversion, or an error.
+/// A vector of transformed values ready for Arrow conversion.
 ///
 /// # Example
 ///
@@ -485,24 +482,14 @@ pub fn transform_metrics_partitioned(
 /// use otlp2records::{decode_logs, apply_log_transform, values_to_arrow, logs_schema, InputFormat};
 ///
 /// let decoded = decode_logs(bytes, InputFormat::Protobuf)?;
-/// let transformed = apply_log_transform(decoded)?;
+/// let transformed = apply_log_transform(decoded);
 /// let batch = values_to_arrow(&transformed, &logs_schema())?;
 /// ```
-pub fn apply_log_transform(values: Vec<Value>) -> Result<Vec<Value>> {
-    let mut transformer = VrlTransformer::new();
-    let mut result = Vec::with_capacity(values.len());
-
-    for (idx, value) in values.into_iter().enumerate() {
-        let (_table, transformed) = transformer
-            .transform(&OTLP_LOGS_PROGRAM, value)
-            .map_err(|e| Error::VrlRuntime(format!("log record {}: {}", idx, e.0)))?;
-        result.push(transformed);
-    }
-
-    Ok(result)
+pub fn apply_log_transform(values: Vec<Value>) -> Vec<Value> {
+    values.into_iter().map(transform::transform_log).collect()
 }
 
-/// Apply VRL transformation to decoded trace values.
+/// Apply the built-in transformation to decoded trace values.
 ///
 /// This function provides finer-grained control over the transformation process.
 /// Use this when you need to inspect or modify values between steps, or when
@@ -514,7 +501,7 @@ pub fn apply_log_transform(values: Vec<Value>) -> Result<Vec<Value>> {
 ///
 /// # Returns
 ///
-/// A vector of transformed values ready for Arrow conversion, or an error.
+/// A vector of transformed values ready for Arrow conversion.
 ///
 /// # Example
 ///
@@ -522,27 +509,17 @@ pub fn apply_log_transform(values: Vec<Value>) -> Result<Vec<Value>> {
 /// use otlp2records::{decode_traces, apply_trace_transform, values_to_arrow, traces_schema, InputFormat};
 ///
 /// let decoded = decode_traces(bytes, InputFormat::Protobuf)?;
-/// let transformed = apply_trace_transform(decoded)?;
+/// let transformed = apply_trace_transform(decoded);
 /// let batch = values_to_arrow(&transformed, &traces_schema())?;
 /// ```
-pub fn apply_trace_transform(values: Vec<Value>) -> Result<Vec<Value>> {
-    let mut transformer = VrlTransformer::new();
-    let mut result = Vec::with_capacity(values.len());
-
-    for (idx, value) in values.into_iter().enumerate() {
-        let (_table, transformed) = transformer
-            .transform(&OTLP_TRACES_PROGRAM, value)
-            .map_err(|e| Error::VrlRuntime(format!("span {}: {}", idx, e.0)))?;
-        result.push(transformed);
-    }
-
-    Ok(result)
+pub fn apply_trace_transform(values: Vec<Value>) -> Vec<Value> {
+    values.into_iter().map(transform::transform_trace).collect()
 }
 
-/// Apply VRL transformation to decoded metric values.
+/// Apply the built-in transformation to decoded metric values.
 ///
 /// This function partitions metrics by type (gauge vs sum) and applies the
-/// appropriate VRL transformation program to each partition.
+/// appropriate transformation to each partition.
 ///
 /// # Arguments
 ///
@@ -550,7 +527,7 @@ pub fn apply_trace_transform(values: Vec<Value>) -> Result<Vec<Value>> {
 ///
 /// # Returns
 ///
-/// A `MetricValues` struct containing transformed gauge and sum values, or an error.
+/// A `MetricValues` struct containing transformed gauge and sum values.
 ///
 /// # Example
 ///
@@ -558,7 +535,7 @@ pub fn apply_trace_transform(values: Vec<Value>) -> Result<Vec<Value>> {
 /// use otlp2records::{decode_metrics, apply_metric_transform, values_to_arrow, gauge_schema, sum_schema, InputFormat};
 ///
 /// let decoded = decode_metrics(bytes, InputFormat::Protobuf)?;
-/// let transformed = apply_metric_transform(decoded)?;
+/// let transformed = apply_metric_transform(decoded);
 ///
 /// if !transformed.gauge.is_empty() {
 ///     let batch = values_to_arrow(&transformed.gauge, &gauge_schema())?;
@@ -567,43 +544,44 @@ pub fn apply_trace_transform(values: Vec<Value>) -> Result<Vec<Value>> {
 ///     let batch = values_to_arrow(&transformed.sum, &sum_schema())?;
 /// }
 /// ```
-pub fn apply_metric_transform(values: Vec<Value>) -> Result<MetricValues> {
-    let mut transformer = VrlTransformer::new();
-    let mut result = MetricValues::default();
+pub fn apply_metric_transform(values: Vec<Value>) -> MetricValues {
+    let mut gauge_count = 0;
+    let mut sum_count = 0;
+    let mut histogram_count = 0;
+    let mut exp_histogram_count = 0;
+    for value in &values {
+        match extract_metric_type(value) {
+            "gauge" => gauge_count += 1,
+            "sum" => sum_count += 1,
+            "histogram" => histogram_count += 1,
+            "exp_histogram" => exp_histogram_count += 1,
+            _ => {}
+        }
+    }
 
-    // Partition metrics by type and transform each with appropriate program
-    for (idx, value) in values.into_iter().enumerate() {
-        // Extract _metric_type field to determine which program to use
-        let metric_type = extract_metric_type(&value);
+    let mut result = MetricValues {
+        gauge: Vec::with_capacity(gauge_count),
+        sum: Vec::with_capacity(sum_count),
+        histogram: Vec::with_capacity(histogram_count),
+        exp_histogram: Vec::with_capacity(exp_histogram_count),
+    };
 
-        match metric_type.as_str() {
+    // Partition metrics by type and transform each with the matching transform function.
+    for value in values {
+        match extract_metric_type(&value) {
             "gauge" => {
-                let (_table, transformed) = transformer
-                    .transform(&OTLP_GAUGE_PROGRAM, value)
-                    .map_err(|e| Error::VrlRuntime(format!("gauge metric {}: {}", idx, e.0)))?;
-                result.gauge.push(transformed);
+                result.gauge.push(transform::transform_gauge(value));
             }
             "sum" => {
-                let (_table, transformed) = transformer
-                    .transform(&OTLP_SUM_PROGRAM, value)
-                    .map_err(|e| Error::VrlRuntime(format!("sum metric {}: {}", idx, e.0)))?;
-                result.sum.push(transformed);
+                result.sum.push(transform::transform_sum(value));
             }
             "histogram" => {
-                let (_table, transformed) = transformer
-                    .transform(&OTLP_HISTOGRAM_PROGRAM, value)
-                    .map_err(|e| {
-                    Error::VrlRuntime(format!("histogram metric {}: {}", idx, e.0))
-                })?;
-                result.histogram.push(transformed);
+                result.histogram.push(transform::transform_histogram(value));
             }
             "exp_histogram" => {
-                let (_table, transformed) = transformer
-                    .transform(&OTLP_EXP_HISTOGRAM_PROGRAM, value)
-                    .map_err(|e| {
-                        Error::VrlRuntime(format!("exp_histogram metric {}: {}", idx, e.0))
-                    })?;
-                result.exp_histogram.push(transformed);
+                result
+                    .exp_histogram
+                    .push(transform::transform_exp_histogram(value));
             }
             _ => {
                 // Skip unknown metric types (summary - deprecated in OTLP spec)
@@ -611,14 +589,14 @@ pub fn apply_metric_transform(values: Vec<Value>) -> Result<MetricValues> {
         }
     }
 
-    Ok(result)
+    result
 }
 
 fn values_to_json(values: Vec<Value>, label: &str) -> Result<Vec<serde_json::Value>> {
     let mut out = Vec::with_capacity(values.len());
 
     for (idx, value) in values.into_iter().enumerate() {
-        let json = crate::convert::vrl_value_to_json(&value).ok_or_else(|| {
+        let json = crate::convert::value_to_json(&value).ok_or_else(|| {
             Error::InvalidInput(format!(
                 "{label} record {idx} contains unrepresentable JSON value"
             ))
@@ -630,14 +608,19 @@ fn values_to_json(values: Vec<Value>, label: &str) -> Result<Vec<serde_json::Val
 }
 
 /// Extract the _metric_type field from a decoded metric value.
-fn extract_metric_type(value: &Value) -> String {
-    let metric_type_key: KeyString = "_metric_type".into();
+fn extract_metric_type(value: &Value) -> &'static str {
     if let Value::Object(map) = value {
-        if let Some(Value::Bytes(bytes)) = map.get(&metric_type_key) {
-            return String::from_utf8_lossy(bytes).to_string();
+        if let Some(Value::Bytes(bytes)) = map.get("_metric_type") {
+            return match bytes.as_ref() {
+                b"gauge" => "gauge",
+                b"sum" => "sum",
+                b"histogram" => "histogram",
+                b"exp_histogram" => "exp_histogram",
+                _ => "",
+            };
         }
     }
-    String::new()
+    ""
 }
 
 // ============================================================================
@@ -1079,7 +1062,7 @@ mod tests {
         let bytes = request.encode_to_vec();
         let decoded = decode_logs(&bytes, InputFormat::Protobuf).unwrap();
 
-        let transformed = apply_log_transform(decoded).unwrap();
+        let transformed = apply_log_transform(decoded);
 
         assert_eq!(transformed.len(), 1);
 
@@ -1100,7 +1083,7 @@ mod tests {
         let bytes = request.encode_to_vec();
         let decoded = decode_traces(&bytes, InputFormat::Protobuf).unwrap();
 
-        let transformed = apply_trace_transform(decoded).unwrap();
+        let transformed = apply_trace_transform(decoded);
 
         assert_eq!(transformed.len(), 1);
 
@@ -1121,7 +1104,7 @@ mod tests {
         let bytes = request.encode_to_vec();
         let decode_result = decode_metrics(&bytes, InputFormat::Protobuf).unwrap();
 
-        let transformed = apply_metric_transform(decode_result.values).unwrap();
+        let transformed = apply_metric_transform(decode_result.values);
 
         assert_eq!(transformed.gauge.len(), 1);
         assert_eq!(transformed.sum.len(), 1);
@@ -1129,19 +1112,19 @@ mod tests {
 
     #[test]
     fn test_apply_log_transform_empty() {
-        let transformed = apply_log_transform(vec![]).unwrap();
+        let transformed = apply_log_transform(vec![]);
         assert!(transformed.is_empty());
     }
 
     #[test]
     fn test_apply_trace_transform_empty() {
-        let transformed = apply_trace_transform(vec![]).unwrap();
+        let transformed = apply_trace_transform(vec![]);
         assert!(transformed.is_empty());
     }
 
     #[test]
     fn test_apply_metric_transform_empty() {
-        let transformed = apply_metric_transform(vec![]).unwrap();
+        let transformed = apply_metric_transform(vec![]);
         assert!(transformed.gauge.is_empty());
         assert!(transformed.sum.is_empty());
     }
@@ -1316,8 +1299,7 @@ mod tests {
         // Sanity check: value should be much greater than 0 (year 2023 >> year 1970)
         assert!(
             ts_value > 1_600_000_000_000_000,
-            "Timestamp {} appears to be too small, possibly 1970 date",
-            ts_value
+            "Timestamp {ts_value} appears to be too small, possibly 1970 date"
         );
     }
 
@@ -1377,8 +1359,7 @@ mod tests {
         // Sanity check: value should be much greater than 0 (year 2023 >> year 1970)
         assert!(
             ts_value > 1_600_000_000_000_000,
-            "Timestamp {} appears to be too small, possibly 1970 date",
-            ts_value
+            "Timestamp {ts_value} appears to be too small, possibly 1970 date"
         );
     }
 
@@ -1442,8 +1423,7 @@ mod tests {
         // Sanity check: value should be much greater than 0 (year 2023 >> year 1970)
         assert!(
             ts_value > 1_600_000_000_000_000,
-            "Timestamp {} appears to be too small, possibly 1970 date",
-            ts_value
+            "Timestamp {ts_value} appears to be too small, possibly 1970 date"
         );
     }
 }

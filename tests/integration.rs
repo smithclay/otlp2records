@@ -391,10 +391,7 @@ fn test_traces_large_pb_timestamps_not_epoch() {
             let ts_value = ts_column.value(i);
             assert!(
                 ts_value > MIN_VALID_TIMESTAMP_MICROS,
-                "Row {}: timestamp {} appears to be 1970 epoch date (expected > {})",
-                i,
-                ts_value,
-                MIN_VALID_TIMESTAMP_MICROS
+                "Row {i}: timestamp {ts_value} appears to be 1970 epoch date (expected > {MIN_VALID_TIMESTAMP_MICROS})"
             );
         }
     }
@@ -427,10 +424,7 @@ fn test_logs_large_pb_timestamps_not_epoch() {
             let ts_value = ts_column.value(i);
             assert!(
                 ts_value > MIN_VALID_TIMESTAMP_MICROS,
-                "Row {}: timestamp {} appears to be 1970 epoch date (expected > {})",
-                i,
-                ts_value,
-                MIN_VALID_TIMESTAMP_MICROS
+                "Row {i}: timestamp {ts_value} appears to be 1970 epoch date (expected > {MIN_VALID_TIMESTAMP_MICROS})"
             );
         }
     }
@@ -459,7 +453,7 @@ fn test_metrics_pb_timestamps_not_epoch() {
     ];
 
     for (pb, name) in metric_files {
-        let batches = transform_metrics(*pb, InputFormat::Protobuf).unwrap();
+        let batches = transform_metrics(pb, InputFormat::Protobuf).unwrap();
 
         // Check gauge timestamps
         if let Some(gauge) = &batches.gauge {
@@ -501,10 +495,7 @@ fn verify_metric_timestamps(batch: &arrow::record_batch::RecordBatch, context: &
             let ts_value = ts_column.value(i);
             assert!(
                 ts_value > MIN_VALID_TIMESTAMP_MICROS,
-                "{} row {}: timestamp {} appears to be 1970 epoch date",
-                context,
-                i,
-                ts_value
+                "{context} row {i}: timestamp {ts_value} appears to be 1970 epoch date"
             );
         }
     }

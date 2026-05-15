@@ -21,14 +21,6 @@ pub enum Error {
     #[error("arrow error: {0}")]
     Arrow(#[from] arrow::error::ArrowError),
 
-    /// Error during VRL compilation
-    #[error("VRL compilation error: {0}")]
-    VrlCompilation(String),
-
-    /// Error during VRL execution
-    #[error("VRL runtime error: {0}")]
-    VrlRuntime(String),
-
     /// Error during JSON serialization/deserialization
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),

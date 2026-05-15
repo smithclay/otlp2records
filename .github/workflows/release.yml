@@ -129,7 +129,7 @@ jobs:
           ref: ${{ needs.prepare.outputs.commit }}
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@1.86
+        uses: dtolnay/rust-toolchain@1.88
 
       - name: Publish to crates.io
         env:

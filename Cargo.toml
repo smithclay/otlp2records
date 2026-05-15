@@ -1,6 +1,6 @@
 [package]
 name = "otlp2records"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "Transform OTLP telemetry to flattened records"
@@ -23,9 +23,6 @@ base64 = "0.21"
 # Arrow
 arrow = { version = "58", default-features = false, features = ["ffi", "ipc", "json"] }
 
-# VRL (no stdlib - avoids zstd C dependency)
-vrl = { version = "0.26", default-features = false, features = ["compiler", "value"] }
-
 # Utils
 thiserror = "2"
 const-hex = "1"
@@ -46,6 +43,10 @@ wasm-bindgen = { version = "0.2", optional = true }
 [lib]
 crate-type = ["rlib", "staticlib"]
 
+[[example]]
+name = "pb_to_parquet"
+required-features = ["parquet"]
+
 [features]
 default = []
 parquet = ["dep:parquet"]
@@ -53,7 +54,6 @@ wasm = ["getrandom/js", "dep:wasm-bindgen"]
 ffi = ["dep:cbindgen"]  # Enable C FFI bindings with header generation
 
 [build-dependencies]
-vrl = { version = "0.26", default-features = false, features = ["compiler"] }
 cbindgen = { version = "0.27", optional = true }
 
 [package.metadata.cbindgen]

@@ -1,8 +1,8 @@
 //! Arrow layer for otlp2records
 //!
-//! Provides Arrow RecordBatch construction from VRL-transformed values:
+//! Provides Arrow RecordBatch construction from transformed values:
 //! - Schema accessors for logs, traces, and metrics
-//! - RecordBatch builder for converting VRL Values to Arrow arrays
+//! - RecordBatch builder for converting record values to Arrow arrays
 //! - Partitioning utilities for service-based grouping
 
 mod builder;

@@ -1,12 +1,12 @@
 //! OTLP trace decoding - protobuf and JSON
 
+use crate::value::{ObjectMap, Value as RecordValue};
 use bytes::Bytes;
 use const_hex::encode as hex_encode;
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use prost::Message;
 use serde::Deserialize;
 use std::sync::Arc;
-use vrl::value::{ObjectMap, Value as VrlValue};
 
 use super::common::{
     for_each_resource_scope, json_attrs_to_value, json_resource_to_value, json_scope_to_value,
@@ -19,14 +19,14 @@ use super::common::{
 // Protobuf decoding
 // ============================================================================
 
-pub fn decode_protobuf(body: &[u8]) -> Result<Vec<VrlValue>, DecodeError> {
+pub fn decode_protobuf(body: &[u8]) -> Result<Vec<RecordValue>, DecodeError> {
     let request = ExportTraceServiceRequest::decode(body)?;
-    export_traces_to_vrl_proto(request)
+    export_traces_to_values_proto(request)
 }
 
-fn export_traces_to_vrl_proto(
+fn export_traces_to_values_proto(
     request: ExportTraceServiceRequest,
-) -> Result<Vec<VrlValue>, DecodeError> {
+) -> Result<Vec<RecordValue>, DecodeError> {
     let mut values = preallocate_span_values(&request.resource_spans, |rs| {
         rs.scope_spans.iter().map(|ss| ss.spans.len()).sum()
     });
@@ -122,16 +122,16 @@ fn export_traces_to_vrl_proto(
 // JSON decoding
 // ============================================================================
 
-pub fn decode_json(body: &[u8]) -> Result<Vec<VrlValue>, DecodeError> {
+pub fn decode_json(body: &[u8]) -> Result<Vec<RecordValue>, DecodeError> {
     // Normalize JSON to convert enum strings to numbers before parsing
     let normalized = super::normalize::normalize_json_bytes(body)?;
     let request: JsonExportTraceServiceRequest = serde_json::from_slice(&normalized)?;
-    export_traces_json_to_vrl(request)
+    export_traces_json_to_values(request)
 }
 
-fn export_traces_json_to_vrl(
+fn export_traces_json_to_values(
     request: JsonExportTraceServiceRequest,
-) -> Result<Vec<VrlValue>, DecodeError> {
+) -> Result<Vec<RecordValue>, DecodeError> {
     let mut values = preallocate_span_values(&request.resource_spans, |rs| {
         rs.scope_spans.iter().map(|ss| ss.spans.len()).sum()
     });
@@ -314,7 +314,7 @@ struct JsonStatus {
 // Record builder
 // ============================================================================
 
-/// Precomputed fields for building a span record into VRL values
+/// Precomputed fields for building a span record into record values
 struct SpanRecordParts {
     trace_id: Bytes,
     span_id: Bytes,
@@ -324,13 +324,13 @@ struct SpanRecordParts {
     kind: i64,
     start_time_unix_nano: i64,
     end_time_unix_nano: i64,
-    attributes: VrlValue,
+    attributes: RecordValue,
     status_code: i64,
     status_message: Bytes,
     events: Vec<SpanEventParts>,
     links: Vec<SpanLinkParts>,
-    resource: Arc<VrlValue>,
-    scope: Arc<VrlValue>,
+    resource: Arc<RecordValue>,
+    scope: Arc<RecordValue>,
     dropped_attributes_count: i64,
     dropped_events_count: i64,
     dropped_links_count: i64,
@@ -340,18 +340,18 @@ struct SpanRecordParts {
 struct SpanEventParts {
     time_unix_nano: i64,
     name: Bytes,
-    attributes: VrlValue,
+    attributes: RecordValue,
 }
 
 struct SpanLinkParts {
     trace_id: Bytes,
     span_id: Bytes,
     trace_state: Bytes,
-    attributes: VrlValue,
+    attributes: RecordValue,
 }
 
 /// Pre-allocate a values Vec sized to the number of spans a request contains
-fn preallocate_span_values<R, F>(resource_spans: &[R], count_spans: F) -> Vec<VrlValue>
+fn preallocate_span_values<R, F>(resource_spans: &[R], count_spans: F) -> Vec<RecordValue>
 where
     F: Fn(&R) -> usize,
 {
@@ -359,33 +359,33 @@ where
     Vec::with_capacity(capacity)
 }
 
-/// Build a VRL-ready span record from parts
-fn build_span_record(parts: SpanRecordParts) -> VrlValue {
+/// Build a record span record from parts
+fn build_span_record(parts: SpanRecordParts) -> RecordValue {
     let mut map = ObjectMap::new();
 
     // Basic span identifiers
-    map.insert("trace_id".into(), VrlValue::Bytes(parts.trace_id));
-    map.insert("span_id".into(), VrlValue::Bytes(parts.span_id));
+    map.insert("trace_id".into(), RecordValue::Bytes(parts.trace_id));
+    map.insert("span_id".into(), RecordValue::Bytes(parts.span_id));
     map.insert(
         "parent_span_id".into(),
-        VrlValue::Bytes(parts.parent_span_id),
+        RecordValue::Bytes(parts.parent_span_id),
     );
-    map.insert("trace_state".into(), VrlValue::Bytes(parts.trace_state));
-    map.insert("name".into(), VrlValue::Bytes(parts.name));
-    map.insert("kind".into(), VrlValue::Integer(parts.kind));
+    map.insert("trace_state".into(), RecordValue::Bytes(parts.trace_state));
+    map.insert("name".into(), RecordValue::Bytes(parts.name));
+    map.insert("kind".into(), RecordValue::Integer(parts.kind));
 
     // Timestamps and duration
     map.insert(
         "start_time_unix_nano".into(),
-        VrlValue::Integer(parts.start_time_unix_nano),
+        RecordValue::Integer(parts.start_time_unix_nano),
     );
     map.insert(
         "end_time_unix_nano".into(),
-        VrlValue::Integer(parts.end_time_unix_nano),
+        RecordValue::Integer(parts.end_time_unix_nano),
     );
     map.insert(
         "duration_ns".into(),
-        VrlValue::Integer(
+        RecordValue::Integer(
             parts
                 .end_time_unix_nano
                 .saturating_sub(parts.start_time_unix_nano),
@@ -396,61 +396,67 @@ fn build_span_record(parts: SpanRecordParts) -> VrlValue {
     map.insert("attributes".into(), parts.attributes);
 
     // Status
-    map.insert("status_code".into(), VrlValue::Integer(parts.status_code));
+    map.insert(
+        "status_code".into(),
+        RecordValue::Integer(parts.status_code),
+    );
     map.insert(
         "status_message".into(),
-        VrlValue::Bytes(parts.status_message),
+        RecordValue::Bytes(parts.status_message),
     );
 
     // Events
-    let events_array: Vec<VrlValue> = parts
+    let events_array: Vec<RecordValue> = parts
         .events
         .into_iter()
         .map(|e| {
             let mut event_map = ObjectMap::new();
-            event_map.insert("time_unix_nano".into(), VrlValue::Integer(e.time_unix_nano));
-            event_map.insert("name".into(), VrlValue::Bytes(e.name));
+            event_map.insert(
+                "time_unix_nano".into(),
+                RecordValue::Integer(e.time_unix_nano),
+            );
+            event_map.insert("name".into(), RecordValue::Bytes(e.name));
             event_map.insert("attributes".into(), e.attributes);
-            VrlValue::Object(event_map)
+            RecordValue::Object(event_map)
         })
         .collect();
-    map.insert("events".into(), VrlValue::Array(events_array));
+    map.insert("events".into(), RecordValue::Array(events_array));
 
     // Links
-    let links_array: Vec<VrlValue> = parts
+    let links_array: Vec<RecordValue> = parts
         .links
         .into_iter()
         .map(|l| {
             let mut link_map = ObjectMap::new();
-            link_map.insert("trace_id".into(), VrlValue::Bytes(l.trace_id));
-            link_map.insert("span_id".into(), VrlValue::Bytes(l.span_id));
-            link_map.insert("trace_state".into(), VrlValue::Bytes(l.trace_state));
+            link_map.insert("trace_id".into(), RecordValue::Bytes(l.trace_id));
+            link_map.insert("span_id".into(), RecordValue::Bytes(l.span_id));
+            link_map.insert("trace_state".into(), RecordValue::Bytes(l.trace_state));
             link_map.insert("attributes".into(), l.attributes);
-            VrlValue::Object(link_map)
+            RecordValue::Object(link_map)
         })
         .collect();
-    map.insert("links".into(), VrlValue::Array(links_array));
+    map.insert("links".into(), RecordValue::Array(links_array));
 
     // Resource and scope
-    map.insert("resource".into(), (*parts.resource).clone());
-    map.insert("scope".into(), (*parts.scope).clone());
+    map.insert("resource".into(), RecordValue::Shared(parts.resource));
+    map.insert("scope".into(), RecordValue::Shared(parts.scope));
 
     // Dropped counts and flags
     map.insert(
         "dropped_attributes_count".into(),
-        VrlValue::Integer(parts.dropped_attributes_count),
+        RecordValue::Integer(parts.dropped_attributes_count),
     );
     map.insert(
         "dropped_events_count".into(),
-        VrlValue::Integer(parts.dropped_events_count),
+        RecordValue::Integer(parts.dropped_events_count),
     );
     map.insert(
         "dropped_links_count".into(),
-        VrlValue::Integer(parts.dropped_links_count),
+        RecordValue::Integer(parts.dropped_links_count),
     );
-    map.insert("flags".into(), VrlValue::Integer(parts.flags));
+    map.insert("flags".into(), RecordValue::Integer(parts.flags));
 
-    VrlValue::Object(map)
+    RecordValue::Object(map)
 }
 
 // ============================================================================
@@ -492,15 +498,15 @@ mod tests {
         assert_eq!(records.len(), 1);
 
         let record = &records[0];
-        if let VrlValue::Object(map) = record {
+        if let RecordValue::Object(map) = record {
             assert_eq!(
                 map.get("name"),
-                Some(&VrlValue::Bytes(Bytes::from("test-span")))
+                Some(&RecordValue::Bytes(Bytes::from("test-span")))
             );
-            assert_eq!(map.get("kind"), Some(&VrlValue::Integer(2)));
+            assert_eq!(map.get("kind"), Some(&RecordValue::Integer(2)));
             assert_eq!(
                 map.get("duration_ns"),
-                Some(&VrlValue::Integer(1_000_000_000))
+                Some(&RecordValue::Integer(1_000_000_000))
             );
         } else {
             panic!("expected object");
@@ -554,21 +560,21 @@ mod tests {
         assert_eq!(records.len(), 1);
 
         let record = &records[0];
-        if let VrlValue::Object(map) = record {
+        if let RecordValue::Object(map) = record {
             assert_eq!(
                 map.get("name"),
-                Some(&VrlValue::Bytes(Bytes::from("test-span")))
+                Some(&RecordValue::Bytes(Bytes::from("test-span")))
             );
             // trace_id should be hex encoded
             assert_eq!(
                 map.get("trace_id"),
-                Some(&VrlValue::Bytes(Bytes::from(
+                Some(&RecordValue::Bytes(Bytes::from(
                     "000102030405060708090a0b0c0d0e0f"
                 )))
             );
             assert_eq!(
                 map.get("duration_ns"),
-                Some(&VrlValue::Integer(1_000_000_000))
+                Some(&RecordValue::Integer(1_000_000_000))
             );
         } else {
             panic!("expected object");
@@ -781,9 +787,9 @@ mod tests {
         let records = decode_protobuf(&body).unwrap();
         assert_eq!(records.len(), 1);
 
-        if let VrlValue::Object(map) = &records[0] {
+        if let RecordValue::Object(map) = &records[0] {
             let links = map.get("links").unwrap();
-            if let VrlValue::Array(arr) = links {
+            if let RecordValue::Array(arr) = links {
                 assert_eq!(arr.len(), 1);
             } else {
                 panic!("expected array");

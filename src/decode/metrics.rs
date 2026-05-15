@@ -35,6 +35,7 @@ impl SkippedMetrics {
     }
 }
 
+use crate::value::{ObjectMap, Value as RecordValue};
 use bytes::Bytes;
 use const_hex::encode as hex_encode;
 use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
@@ -43,10 +44,9 @@ use opentelemetry_proto::tonic::metrics::v1::number_data_point::Value;
 use prost::Message;
 use serde::Deserialize;
 use std::sync::Arc;
-use vrl::value::{ObjectMap, Value as VrlValue};
 
 use super::common::{
-    decode_bytes_field, finite_float_to_vrl, for_each_resource_scope, json_attrs_to_value,
+    decode_bytes_field, finite_float_to_value, for_each_resource_scope, json_attrs_to_value,
     json_resource_to_value, json_scope_to_value, json_timestamp_to_i64, otlp_attributes_to_value,
     otlp_resource_to_value, otlp_scope_to_value, safe_timestamp_conversion, DecodeError,
     JsonInstrumentationScope, JsonKeyValue, JsonNumberOrString, JsonResource,
@@ -59,14 +59,14 @@ use super::common::{
 /// Result of decoding metrics, including values and tracking of skipped items
 pub struct DecodeMetricsResult {
     /// Successfully decoded metric values
-    pub values: Vec<VrlValue>,
+    pub values: Vec<RecordValue>,
     /// Metrics that were skipped during decoding
     pub skipped: SkippedMetrics,
 }
 
 pub fn decode_protobuf(body: &[u8]) -> Result<DecodeMetricsResult, DecodeError> {
     let request = ExportMetricsServiceRequest::decode(body)?;
-    export_metrics_to_vrl_proto(request)
+    export_metrics_to_values_proto(request)
 }
 
 /// Shared context for metric metadata to reduce function argument count
@@ -74,11 +74,11 @@ struct MetricContext {
     metric_name: Bytes,
     metric_description: Bytes,
     metric_unit: Bytes,
-    resource: Arc<VrlValue>,
-    scope: Arc<VrlValue>,
+    resource: Arc<RecordValue>,
+    scope: Arc<RecordValue>,
 }
 
-fn export_metrics_to_vrl_proto(
+fn export_metrics_to_values_proto(
     request: ExportMetricsServiceRequest,
 ) -> Result<DecodeMetricsResult, DecodeError> {
     let mut values = preallocate_metric_values(&request.resource_metrics, |rm| {
@@ -196,7 +196,7 @@ fn count_data_points(metric: &opentelemetry_proto::tonic::metrics::v1::Metric) -
 fn build_gauge_from_point(
     point: &opentelemetry_proto::tonic::metrics::v1::NumberDataPoint,
     ctx: &MetricContext,
-) -> Result<Option<VrlValue>, DecodeError> {
+) -> Result<Option<RecordValue>, DecodeError> {
     let time_unix_nano = safe_timestamp_conversion(point.time_unix_nano, "gauge.time_unix_nano")?;
     let start_time_unix_nano =
         safe_timestamp_conversion(point.start_time_unix_nano, "gauge.start_time_unix_nano")?;
@@ -204,13 +204,13 @@ fn build_gauge_from_point(
     // Always produce Float for schema compatibility
     // Skip records with missing or non-finite values (NaN/Infinity)
     let value = match &point.value {
-        Some(Value::AsInt(i)) => finite_float_to_vrl(*i as f64),
-        Some(Value::AsDouble(d)) => finite_float_to_vrl(*d),
+        Some(Value::AsInt(i)) => finite_float_to_value(*i as f64),
+        Some(Value::AsDouble(d)) => finite_float_to_value(*d),
         None => return Ok(None),
     };
 
     // Skip if value is null (NaN/Infinity was converted to null)
-    if matches!(value, VrlValue::Null) {
+    if matches!(value, RecordValue::Null) {
         return Ok(None);
     }
 
@@ -238,7 +238,7 @@ fn build_sum_from_point(
     ctx: &MetricContext,
     aggregation_temporality: i64,
     is_monotonic: bool,
-) -> Result<Option<VrlValue>, DecodeError> {
+) -> Result<Option<RecordValue>, DecodeError> {
     let time_unix_nano = safe_timestamp_conversion(point.time_unix_nano, "sum.time_unix_nano")?;
     let start_time_unix_nano =
         safe_timestamp_conversion(point.start_time_unix_nano, "sum.start_time_unix_nano")?;
@@ -246,13 +246,13 @@ fn build_sum_from_point(
     // Always produce Float for schema compatibility
     // Skip records with missing or non-finite values (NaN/Infinity)
     let value = match &point.value {
-        Some(Value::AsInt(i)) => finite_float_to_vrl(*i as f64),
-        Some(Value::AsDouble(d)) => finite_float_to_vrl(*d),
+        Some(Value::AsInt(i)) => finite_float_to_value(*i as f64),
+        Some(Value::AsDouble(d)) => finite_float_to_value(*d),
         None => return Ok(None),
     };
 
     // Skip if value is null (NaN/Infinity was converted to null)
-    if matches!(value, VrlValue::Null) {
+    if matches!(value, RecordValue::Null) {
         return Ok(None);
     }
 
@@ -281,7 +281,7 @@ fn build_histogram_from_point(
     point: &opentelemetry_proto::tonic::metrics::v1::HistogramDataPoint,
     ctx: &MetricContext,
     aggregation_temporality: i64,
-) -> Result<VrlValue, DecodeError> {
+) -> Result<RecordValue, DecodeError> {
     let time_unix_nano =
         safe_timestamp_conversion(point.time_unix_nano, "histogram.time_unix_nano")?;
     let start_time_unix_nano =
@@ -322,7 +322,7 @@ fn build_exp_histogram_from_point(
     point: &opentelemetry_proto::tonic::metrics::v1::ExponentialHistogramDataPoint,
     ctx: &MetricContext,
     aggregation_temporality: i64,
-) -> Result<VrlValue, DecodeError> {
+) -> Result<RecordValue, DecodeError> {
     let time_unix_nano =
         safe_timestamp_conversion(point.time_unix_nano, "exp_histogram.time_unix_nano")?;
     let start_time_unix_nano = safe_timestamp_conversion(
@@ -392,12 +392,12 @@ fn build_exemplars(
             // Always produce Float for schema compatibility
             let value = match &e.value {
                 Some(opentelemetry_proto::tonic::metrics::v1::exemplar::Value::AsInt(i)) => {
-                    finite_float_to_vrl(*i as f64)
+                    finite_float_to_value(*i as f64)
                 }
                 Some(opentelemetry_proto::tonic::metrics::v1::exemplar::Value::AsDouble(d)) => {
-                    finite_float_to_vrl(*d)
+                    finite_float_to_value(*d)
                 }
-                None => VrlValue::Null,
+                None => RecordValue::Null,
             };
 
             Ok(ExemplarParts {
@@ -419,10 +419,10 @@ pub fn decode_json(body: &[u8]) -> Result<DecodeMetricsResult, DecodeError> {
     // Normalize JSON to convert enum strings to numbers before parsing
     let normalized = super::normalize::normalize_json_bytes(body)?;
     let request: JsonExportMetricsServiceRequest = serde_json::from_slice(&normalized)?;
-    export_metrics_to_vrl_json(request)
+    export_metrics_to_values_json(request)
 }
 
-fn export_metrics_to_vrl_json(
+fn export_metrics_to_values_json(
     request: JsonExportMetricsServiceRequest,
 ) -> Result<DecodeMetricsResult, DecodeError> {
     let mut values = preallocate_metric_values(&request.resource_metrics, |rm| {
@@ -540,7 +540,7 @@ fn track_skipped_json_value(
 fn build_gauge_from_json_point(
     point: JsonNumberDataPoint,
     ctx: &MetricContext,
-) -> Result<Option<VrlValue>, DecodeError> {
+) -> Result<Option<RecordValue>, DecodeError> {
     // Skip records with missing or non-finite values (NaN/Infinity)
     let value = match extract_number_value(&point.as_int, &point.as_double) {
         Some(v) => v,
@@ -574,7 +574,7 @@ fn build_sum_from_json_point(
     ctx: &MetricContext,
     aggregation_temporality: i64,
     is_monotonic: bool,
-) -> Result<Option<VrlValue>, DecodeError> {
+) -> Result<Option<RecordValue>, DecodeError> {
     // Skip records with missing or non-finite values (NaN/Infinity)
     let value = match extract_number_value(&point.as_int, &point.as_double) {
         Some(v) => v,
@@ -609,7 +609,7 @@ fn build_histogram_from_json_point(
     point: JsonHistogramDataPoint,
     ctx: &MetricContext,
     aggregation_temporality: i64,
-) -> Result<VrlValue, DecodeError> {
+) -> Result<RecordValue, DecodeError> {
     let exemplars = build_json_exemplars(point.exemplars)?;
 
     // Convert bucket_counts to JSON string
@@ -655,7 +655,7 @@ fn build_exp_histogram_from_json_point(
     point: JsonExpHistogramDataPoint,
     ctx: &MetricContext,
     aggregation_temporality: i64,
-) -> Result<VrlValue, DecodeError> {
+) -> Result<RecordValue, DecodeError> {
     let exemplars = build_json_exemplars(point.exemplars)?;
 
     // Extract positive bucket data
@@ -725,19 +725,19 @@ fn build_exp_histogram_from_json_point(
 fn extract_number_value(
     as_int: &Option<JsonNumberOrString>,
     as_double: &Option<f64>,
-) -> Option<VrlValue> {
+) -> Option<RecordValue> {
     if let Some(i) = as_int {
-        let value = i.as_i64().map(|n| finite_float_to_vrl(n as f64))?;
-        // finite_float_to_vrl returns Null for NaN/Infinity
-        if matches!(value, VrlValue::Null) {
+        let value = i.as_i64().map(|n| finite_float_to_value(n as f64))?;
+        // finite_float_to_value returns Null for NaN/Infinity
+        if matches!(value, RecordValue::Null) {
             None
         } else {
             Some(value)
         }
     } else if let Some(d) = as_double {
-        let value = finite_float_to_vrl(*d);
-        // finite_float_to_vrl returns Null for NaN/Infinity
-        if matches!(value, VrlValue::Null) {
+        let value = finite_float_to_value(*d);
+        // finite_float_to_value returns Null for NaN/Infinity
+        if matches!(value, RecordValue::Null) {
             None
         } else {
             Some(value)
@@ -752,7 +752,7 @@ fn build_json_exemplars(exemplars: Vec<JsonExemplar>) -> Result<Vec<ExemplarPart
         .into_iter()
         .map(|e| {
             // Exemplar values can be null - they're supplementary metadata
-            let value = extract_number_value(&e.as_int, &e.as_double).unwrap_or(VrlValue::Null);
+            let value = extract_number_value(&e.as_int, &e.as_double).unwrap_or(RecordValue::Null);
             Ok(ExemplarParts {
                 time_unix_nano: json_timestamp_to_i64(
                     &e.time_unix_nano,
@@ -972,47 +972,47 @@ struct JsonExemplar {
 // Record builder
 // ============================================================================
 
-/// Precomputed fields for building a gauge metric record into VRL values
+/// Precomputed fields for building a gauge metric record into record values
 struct GaugeRecordParts {
     time_unix_nano: i64,
     start_time_unix_nano: i64,
     metric_name: Bytes,
     metric_description: Bytes,
     metric_unit: Bytes,
-    value: VrlValue,
-    attributes: VrlValue,
-    resource: Arc<VrlValue>,
-    scope: Arc<VrlValue>,
+    value: RecordValue,
+    attributes: RecordValue,
+    resource: Arc<RecordValue>,
+    scope: Arc<RecordValue>,
     flags: i64,
     exemplars: Vec<ExemplarParts>,
 }
 
 struct ExemplarParts {
     time_unix_nano: i64,
-    value: VrlValue,
+    value: RecordValue,
     trace_id: Bytes,
     span_id: Bytes,
-    filtered_attributes: VrlValue,
+    filtered_attributes: RecordValue,
 }
 
-/// Precomputed fields for building a sum metric record into VRL values
+/// Precomputed fields for building a sum metric record into record values
 struct SumRecordParts {
     time_unix_nano: i64,
     start_time_unix_nano: i64,
     metric_name: Bytes,
     metric_description: Bytes,
     metric_unit: Bytes,
-    value: VrlValue,
-    attributes: VrlValue,
-    resource: Arc<VrlValue>,
-    scope: Arc<VrlValue>,
+    value: RecordValue,
+    attributes: RecordValue,
+    resource: Arc<RecordValue>,
+    scope: Arc<RecordValue>,
     flags: i64,
     exemplars: Vec<ExemplarParts>,
     aggregation_temporality: i64,
     is_monotonic: bool,
 }
 
-/// Precomputed fields for building a histogram metric record into VRL values
+/// Precomputed fields for building a histogram metric record into record values
 struct HistogramRecordParts {
     time_unix_nano: i64,
     start_time_unix_nano: i64,
@@ -1025,15 +1025,15 @@ struct HistogramRecordParts {
     max: Option<f64>,
     bucket_counts: Bytes,
     explicit_bounds: Bytes,
-    attributes: VrlValue,
-    resource: Arc<VrlValue>,
-    scope: Arc<VrlValue>,
+    attributes: RecordValue,
+    resource: Arc<RecordValue>,
+    scope: Arc<RecordValue>,
     flags: i64,
     exemplars: Vec<ExemplarParts>,
     aggregation_temporality: i64,
 }
 
-/// Precomputed fields for building an exponential histogram metric record into VRL values
+/// Precomputed fields for building an exponential histogram metric record into record values
 struct ExpHistogramRecordParts {
     time_unix_nano: i64,
     start_time_unix_nano: i64,
@@ -1051,16 +1051,16 @@ struct ExpHistogramRecordParts {
     positive_bucket_counts: Bytes,
     negative_offset: i64,
     negative_bucket_counts: Bytes,
-    attributes: VrlValue,
-    resource: Arc<VrlValue>,
-    scope: Arc<VrlValue>,
+    attributes: RecordValue,
+    resource: Arc<RecordValue>,
+    scope: Arc<RecordValue>,
     flags: i64,
     exemplars: Vec<ExemplarParts>,
     aggregation_temporality: i64,
 }
 
 /// Pre-allocate values Vec for metrics
-fn preallocate_metric_values<R, F>(resource_metrics: &[R], count_points: F) -> Vec<VrlValue>
+fn preallocate_metric_values<R, F>(resource_metrics: &[R], count_points: F) -> Vec<RecordValue>
 where
     F: Fn(&R) -> usize,
 {
@@ -1069,194 +1069,227 @@ where
 }
 
 /// Helper function to build exemplars array from parts
-fn build_exemplars_array(exemplars: Vec<ExemplarParts>) -> VrlValue {
-    let exemplars_array: Vec<VrlValue> = exemplars
+fn build_exemplars_array(exemplars: Vec<ExemplarParts>) -> RecordValue {
+    let exemplars_array: Vec<RecordValue> = exemplars
         .into_iter()
         .map(|e| {
-            let mut map = ObjectMap::new();
-            map.insert("time_unix_nano".into(), VrlValue::Integer(e.time_unix_nano));
+            let mut map = ObjectMap::with_capacity(5);
+            map.insert(
+                "time_unix_nano".into(),
+                RecordValue::Integer(e.time_unix_nano),
+            );
             map.insert("value".into(), e.value);
-            map.insert("trace_id".into(), VrlValue::Bytes(e.trace_id));
-            map.insert("span_id".into(), VrlValue::Bytes(e.span_id));
+            map.insert("trace_id".into(), RecordValue::Bytes(e.trace_id));
+            map.insert("span_id".into(), RecordValue::Bytes(e.span_id));
             map.insert("filtered_attributes".into(), e.filtered_attributes);
-            VrlValue::Object(map)
+            RecordValue::Object(map)
         })
         .collect();
-    VrlValue::Array(exemplars_array)
+    RecordValue::Array(exemplars_array)
 }
 
-fn build_gauge_record(parts: GaugeRecordParts) -> VrlValue {
-    let mut map = ObjectMap::new();
+fn build_gauge_record(parts: GaugeRecordParts) -> RecordValue {
+    let mut map = ObjectMap::with_capacity(12);
     map.insert(
         "time_unix_nano".into(),
-        VrlValue::Integer(parts.time_unix_nano),
+        RecordValue::Integer(parts.time_unix_nano),
     );
     map.insert(
         "start_time_unix_nano".into(),
-        VrlValue::Integer(parts.start_time_unix_nano),
+        RecordValue::Integer(parts.start_time_unix_nano),
     );
-    map.insert("metric_name".into(), VrlValue::Bytes(parts.metric_name));
+    map.insert("metric_name".into(), RecordValue::Bytes(parts.metric_name));
     map.insert(
         "metric_description".into(),
-        VrlValue::Bytes(parts.metric_description),
+        RecordValue::Bytes(parts.metric_description),
     );
-    map.insert("metric_unit".into(), VrlValue::Bytes(parts.metric_unit));
+    map.insert("metric_unit".into(), RecordValue::Bytes(parts.metric_unit));
     map.insert("value".into(), parts.value);
     map.insert("attributes".into(), parts.attributes);
-    map.insert("resource".into(), (*parts.resource).clone());
-    map.insert("scope".into(), (*parts.scope).clone());
-    map.insert("flags".into(), VrlValue::Integer(parts.flags));
+    map.insert("resource".into(), RecordValue::Shared(parts.resource));
+    map.insert("scope".into(), RecordValue::Shared(parts.scope));
+    map.insert("flags".into(), RecordValue::Integer(parts.flags));
     map.insert("exemplars".into(), build_exemplars_array(parts.exemplars));
-    map.insert("_metric_type".into(), VrlValue::Bytes(Bytes::from("gauge")));
-    VrlValue::Object(map)
+    map.insert(
+        "_metric_type".into(),
+        RecordValue::Bytes(Bytes::from("gauge")),
+    );
+    RecordValue::Object(map)
 }
 
-fn build_sum_record(parts: SumRecordParts) -> VrlValue {
-    let mut map = ObjectMap::new();
+fn build_sum_record(parts: SumRecordParts) -> RecordValue {
+    let mut map = ObjectMap::with_capacity(14);
     map.insert(
         "time_unix_nano".into(),
-        VrlValue::Integer(parts.time_unix_nano),
+        RecordValue::Integer(parts.time_unix_nano),
     );
     map.insert(
         "start_time_unix_nano".into(),
-        VrlValue::Integer(parts.start_time_unix_nano),
+        RecordValue::Integer(parts.start_time_unix_nano),
     );
-    map.insert("metric_name".into(), VrlValue::Bytes(parts.metric_name));
+    map.insert("metric_name".into(), RecordValue::Bytes(parts.metric_name));
     map.insert(
         "metric_description".into(),
-        VrlValue::Bytes(parts.metric_description),
+        RecordValue::Bytes(parts.metric_description),
     );
-    map.insert("metric_unit".into(), VrlValue::Bytes(parts.metric_unit));
+    map.insert("metric_unit".into(), RecordValue::Bytes(parts.metric_unit));
     map.insert("value".into(), parts.value);
     map.insert("attributes".into(), parts.attributes);
-    map.insert("resource".into(), (*parts.resource).clone());
-    map.insert("scope".into(), (*parts.scope).clone());
-    map.insert("flags".into(), VrlValue::Integer(parts.flags));
+    map.insert("resource".into(), RecordValue::Shared(parts.resource));
+    map.insert("scope".into(), RecordValue::Shared(parts.scope));
+    map.insert("flags".into(), RecordValue::Integer(parts.flags));
     map.insert("exemplars".into(), build_exemplars_array(parts.exemplars));
     map.insert(
         "aggregation_temporality".into(),
-        VrlValue::Integer(parts.aggregation_temporality),
-    );
-    map.insert("is_monotonic".into(), VrlValue::Boolean(parts.is_monotonic));
-    map.insert("_metric_type".into(), VrlValue::Bytes(Bytes::from("sum")));
-    VrlValue::Object(map)
-}
-
-fn build_histogram_record(parts: HistogramRecordParts) -> VrlValue {
-    let mut map = ObjectMap::new();
-    map.insert(
-        "time_unix_nano".into(),
-        VrlValue::Integer(parts.time_unix_nano),
+        RecordValue::Integer(parts.aggregation_temporality),
     );
     map.insert(
-        "start_time_unix_nano".into(),
-        VrlValue::Integer(parts.start_time_unix_nano),
-    );
-    map.insert("metric_name".into(), VrlValue::Bytes(parts.metric_name));
-    map.insert(
-        "metric_description".into(),
-        VrlValue::Bytes(parts.metric_description),
-    );
-    map.insert("metric_unit".into(), VrlValue::Bytes(parts.metric_unit));
-    map.insert("count".into(), VrlValue::Integer(parts.count));
-    map.insert(
-        "sum".into(),
-        parts.sum.map(finite_float_to_vrl).unwrap_or(VrlValue::Null),
-    );
-    map.insert(
-        "min".into(),
-        parts.min.map(finite_float_to_vrl).unwrap_or(VrlValue::Null),
-    );
-    map.insert(
-        "max".into(),
-        parts.max.map(finite_float_to_vrl).unwrap_or(VrlValue::Null),
-    );
-    map.insert("bucket_counts".into(), VrlValue::Bytes(parts.bucket_counts));
-    map.insert(
-        "explicit_bounds".into(),
-        VrlValue::Bytes(parts.explicit_bounds),
-    );
-    map.insert("attributes".into(), parts.attributes);
-    map.insert("resource".into(), (*parts.resource).clone());
-    map.insert("scope".into(), (*parts.scope).clone());
-    map.insert("flags".into(), VrlValue::Integer(parts.flags));
-    map.insert("exemplars".into(), build_exemplars_array(parts.exemplars));
-    map.insert(
-        "aggregation_temporality".into(),
-        VrlValue::Integer(parts.aggregation_temporality),
+        "is_monotonic".into(),
+        RecordValue::Boolean(parts.is_monotonic),
     );
     map.insert(
         "_metric_type".into(),
-        VrlValue::Bytes(Bytes::from("histogram")),
+        RecordValue::Bytes(Bytes::from("sum")),
     );
-    VrlValue::Object(map)
+    RecordValue::Object(map)
 }
 
-fn build_exp_histogram_record(parts: ExpHistogramRecordParts) -> VrlValue {
-    let mut map = ObjectMap::new();
+fn build_histogram_record(parts: HistogramRecordParts) -> RecordValue {
+    let mut map = ObjectMap::with_capacity(19);
     map.insert(
         "time_unix_nano".into(),
-        VrlValue::Integer(parts.time_unix_nano),
+        RecordValue::Integer(parts.time_unix_nano),
     );
     map.insert(
         "start_time_unix_nano".into(),
-        VrlValue::Integer(parts.start_time_unix_nano),
+        RecordValue::Integer(parts.start_time_unix_nano),
     );
-    map.insert("metric_name".into(), VrlValue::Bytes(parts.metric_name));
+    map.insert("metric_name".into(), RecordValue::Bytes(parts.metric_name));
     map.insert(
         "metric_description".into(),
-        VrlValue::Bytes(parts.metric_description),
+        RecordValue::Bytes(parts.metric_description),
     );
-    map.insert("metric_unit".into(), VrlValue::Bytes(parts.metric_unit));
-    map.insert("count".into(), VrlValue::Integer(parts.count));
+    map.insert("metric_unit".into(), RecordValue::Bytes(parts.metric_unit));
+    map.insert("count".into(), RecordValue::Integer(parts.count));
     map.insert(
         "sum".into(),
-        parts.sum.map(finite_float_to_vrl).unwrap_or(VrlValue::Null),
+        parts
+            .sum
+            .map(finite_float_to_value)
+            .unwrap_or(RecordValue::Null),
     );
     map.insert(
         "min".into(),
-        parts.min.map(finite_float_to_vrl).unwrap_or(VrlValue::Null),
+        parts
+            .min
+            .map(finite_float_to_value)
+            .unwrap_or(RecordValue::Null),
     );
     map.insert(
         "max".into(),
-        parts.max.map(finite_float_to_vrl).unwrap_or(VrlValue::Null),
+        parts
+            .max
+            .map(finite_float_to_value)
+            .unwrap_or(RecordValue::Null),
     );
-    map.insert("scale".into(), VrlValue::Integer(parts.scale));
-    map.insert("zero_count".into(), VrlValue::Integer(parts.zero_count));
+    map.insert(
+        "bucket_counts".into(),
+        RecordValue::Bytes(parts.bucket_counts),
+    );
+    map.insert(
+        "explicit_bounds".into(),
+        RecordValue::Bytes(parts.explicit_bounds),
+    );
+    map.insert("attributes".into(), parts.attributes);
+    map.insert("resource".into(), RecordValue::Shared(parts.resource));
+    map.insert("scope".into(), RecordValue::Shared(parts.scope));
+    map.insert("flags".into(), RecordValue::Integer(parts.flags));
+    map.insert("exemplars".into(), build_exemplars_array(parts.exemplars));
+    map.insert(
+        "aggregation_temporality".into(),
+        RecordValue::Integer(parts.aggregation_temporality),
+    );
+    map.insert(
+        "_metric_type".into(),
+        RecordValue::Bytes(Bytes::from("histogram")),
+    );
+    RecordValue::Object(map)
+}
+
+fn build_exp_histogram_record(parts: ExpHistogramRecordParts) -> RecordValue {
+    let mut map = ObjectMap::with_capacity(24);
+    map.insert(
+        "time_unix_nano".into(),
+        RecordValue::Integer(parts.time_unix_nano),
+    );
+    map.insert(
+        "start_time_unix_nano".into(),
+        RecordValue::Integer(parts.start_time_unix_nano),
+    );
+    map.insert("metric_name".into(), RecordValue::Bytes(parts.metric_name));
+    map.insert(
+        "metric_description".into(),
+        RecordValue::Bytes(parts.metric_description),
+    );
+    map.insert("metric_unit".into(), RecordValue::Bytes(parts.metric_unit));
+    map.insert("count".into(), RecordValue::Integer(parts.count));
+    map.insert(
+        "sum".into(),
+        parts
+            .sum
+            .map(finite_float_to_value)
+            .unwrap_or(RecordValue::Null),
+    );
+    map.insert(
+        "min".into(),
+        parts
+            .min
+            .map(finite_float_to_value)
+            .unwrap_or(RecordValue::Null),
+    );
+    map.insert(
+        "max".into(),
+        parts
+            .max
+            .map(finite_float_to_value)
+            .unwrap_or(RecordValue::Null),
+    );
+    map.insert("scale".into(), RecordValue::Integer(parts.scale));
+    map.insert("zero_count".into(), RecordValue::Integer(parts.zero_count));
     map.insert(
         "zero_threshold".into(),
-        finite_float_to_vrl(parts.zero_threshold),
+        finite_float_to_value(parts.zero_threshold),
     );
     map.insert(
         "positive_offset".into(),
-        VrlValue::Integer(parts.positive_offset),
+        RecordValue::Integer(parts.positive_offset),
     );
     map.insert(
         "positive_bucket_counts".into(),
-        VrlValue::Bytes(parts.positive_bucket_counts),
+        RecordValue::Bytes(parts.positive_bucket_counts),
     );
     map.insert(
         "negative_offset".into(),
-        VrlValue::Integer(parts.negative_offset),
+        RecordValue::Integer(parts.negative_offset),
     );
     map.insert(
         "negative_bucket_counts".into(),
-        VrlValue::Bytes(parts.negative_bucket_counts),
+        RecordValue::Bytes(parts.negative_bucket_counts),
     );
     map.insert("attributes".into(), parts.attributes);
-    map.insert("resource".into(), (*parts.resource).clone());
-    map.insert("scope".into(), (*parts.scope).clone());
-    map.insert("flags".into(), VrlValue::Integer(parts.flags));
+    map.insert("resource".into(), RecordValue::Shared(parts.resource));
+    map.insert("scope".into(), RecordValue::Shared(parts.scope));
+    map.insert("flags".into(), RecordValue::Integer(parts.flags));
     map.insert("exemplars".into(), build_exemplars_array(parts.exemplars));
     map.insert(
         "aggregation_temporality".into(),
-        VrlValue::Integer(parts.aggregation_temporality),
+        RecordValue::Integer(parts.aggregation_temporality),
     );
     map.insert(
         "_metric_type".into(),
-        VrlValue::Bytes(Bytes::from("exp_histogram")),
+        RecordValue::Bytes(Bytes::from("exp_histogram")),
     );
-    VrlValue::Object(map)
+    RecordValue::Object(map)
 }
 
 // ============================================================================
@@ -1308,14 +1341,14 @@ mod tests {
         let decode_result = result.unwrap();
         assert_eq!(decode_result.values.len(), 1);
 
-        if let VrlValue::Object(map) = &decode_result.values[0] {
+        if let RecordValue::Object(map) = &decode_result.values[0] {
             assert_eq!(
                 map.get("metric_name"),
-                Some(&VrlValue::Bytes(Bytes::from("test.gauge")))
+                Some(&RecordValue::Bytes(Bytes::from("test.gauge")))
             );
             assert_eq!(
                 map.get("_metric_type"),
-                Some(&VrlValue::Bytes(Bytes::from("gauge")))
+                Some(&RecordValue::Bytes(Bytes::from("gauge")))
             );
         } else {
             panic!("expected object");
@@ -1360,20 +1393,20 @@ mod tests {
         let decode_result = result.unwrap();
         assert_eq!(decode_result.values.len(), 1);
 
-        if let VrlValue::Object(map) = &decode_result.values[0] {
+        if let RecordValue::Object(map) = &decode_result.values[0] {
             assert_eq!(
                 map.get("metric_name"),
-                Some(&VrlValue::Bytes(Bytes::from("test.sum")))
+                Some(&RecordValue::Bytes(Bytes::from("test.sum")))
             );
             assert_eq!(
                 map.get("_metric_type"),
-                Some(&VrlValue::Bytes(Bytes::from("sum")))
+                Some(&RecordValue::Bytes(Bytes::from("sum")))
             );
             assert_eq!(
                 map.get("aggregation_temporality"),
-                Some(&VrlValue::Integer(2))
+                Some(&RecordValue::Integer(2))
             );
-            assert_eq!(map.get("is_monotonic"), Some(&VrlValue::Boolean(true)));
+            assert_eq!(map.get("is_monotonic"), Some(&RecordValue::Boolean(true)));
         } else {
             panic!("expected object");
         }
@@ -1607,14 +1640,14 @@ mod tests {
         assert_eq!(result.values.len(), 1);
 
         let record = &result.values[0];
-        if let VrlValue::Object(map) = record {
+        if let RecordValue::Object(map) = record {
             assert_eq!(
                 map.get("metric_name"),
-                Some(&VrlValue::Bytes(Bytes::from("test.gauge")))
+                Some(&RecordValue::Bytes(Bytes::from("test.gauge")))
             );
             assert_eq!(
                 map.get("_metric_type"),
-                Some(&VrlValue::Bytes(Bytes::from("gauge")))
+                Some(&RecordValue::Bytes(Bytes::from("gauge")))
             );
         } else {
             panic!("expected object");
