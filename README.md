@@ -191,7 +191,7 @@ const arrowIpc = transform_logs_wasm(otlpBytes, "protobuf");
 
 | Field | Type | Description |
 |-------|------|-------------|
-| timestamp | TimestampMs | Log record timestamp |
+| timestamp | TimestampMicrosecond | Log record timestamp |
 | observed_timestamp | Int64 | When log was observed (ms) |
 | trace_id | String | Trace correlation ID (hex) |
 | span_id | String | Span correlation ID (hex) |
@@ -211,7 +211,7 @@ const arrowIpc = transform_logs_wasm(otlpBytes, "protobuf");
 
 | Field | Type | Description |
 |-------|------|-------------|
-| timestamp | TimestampMs | Span start time |
+| timestamp | TimestampMicrosecond | Span start time |
 | end_timestamp | Int64 | Span end time (ms) |
 | duration | Int64 | Duration in milliseconds |
 | trace_id | String | Trace ID (hex) |
@@ -241,7 +241,7 @@ const arrowIpc = transform_logs_wasm(otlpBytes, "protobuf");
 
 | Field | Type | Description |
 |-------|------|-------------|
-| timestamp | TimestampMs | Data point timestamp |
+| timestamp | TimestampMicrosecond | Data point timestamp |
 | start_timestamp | Int64 | Start of measurement window (ms) |
 | metric_name | String | Metric name |
 | metric_description | String | Metric description |
