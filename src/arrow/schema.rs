@@ -1,6 +1,6 @@
 //! Arrow schema accessors.
 
-use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use once_cell::sync::Lazy;
 
 static LOGS_SCHEMA: Lazy<Schema> = Lazy::new(|| {

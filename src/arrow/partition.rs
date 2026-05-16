@@ -5,10 +5,10 @@
 
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, AsArray};
-use arrow::compute::take;
-use arrow::datatypes::{Int64Type, TimestampMicrosecondType};
-use arrow::record_batch::RecordBatch;
+use arrow_array::cast::AsArray;
+use arrow_array::types::{Int64Type, TimestampMicrosecondType};
+use arrow_array::{ArrayRef, RecordBatch};
+use arrow_select::take::take;
 use indexmap::IndexMap;
 
 use crate::decode::SkippedMetrics;
@@ -117,7 +117,7 @@ pub fn group_batch_by_service(batch: RecordBatch) -> ServiceGroupedBatches {
     let batches = groups
         .into_iter()
         .map(|(service, indices)| {
-            let indices = arrow::array::UInt32Array::from(indices);
+            let indices = arrow_array::UInt32Array::from(indices);
             let columns: Vec<ArrayRef> = batch
                 .columns()
                 .iter()
@@ -195,8 +195,9 @@ pub fn extract_service_name(batch: &RecordBatch) -> Arc<str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{Int32Array, StringBuilder, TimestampMicrosecondBuilder};
-    use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+    use arrow_array::builder::{StringBuilder, TimestampMicrosecondBuilder};
+    use arrow_array::Int32Array;
+    use arrow_schema::{DataType, Field, Schema, TimeUnit};
     use std::sync::Arc as StdArc;
 
     fn create_test_batch(services: &[&str], timestamps_micros: &[i64]) -> RecordBatch {

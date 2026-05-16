@@ -2,7 +2,7 @@
 //!
 //! These tests use real OTLP fixtures to verify the complete transformation pipeline.
 
-use arrow::array::{Array, TimestampMicrosecondArray};
+use arrow_array::{Array, TimestampMicrosecondArray};
 use otlp2records::{
     to_ipc, to_json, transform_logs, transform_metrics, transform_traces, InputFormat,
 };
@@ -477,7 +477,7 @@ fn test_metrics_pb_timestamps_not_epoch() {
     }
 }
 
-fn verify_metric_timestamps(batch: &arrow::record_batch::RecordBatch, context: &str) {
+fn verify_metric_timestamps(batch: &arrow_array::RecordBatch, context: &str) {
     if batch.num_rows() == 0 {
         return;
     }

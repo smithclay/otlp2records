@@ -75,7 +75,7 @@ fn transform_traces_impl(bytes: &[u8], format: &str) -> Result<Vec<u8>, String> 
 
 /// Transform OTLP gauge metrics to Arrow IPC bytes (internal implementation).
 fn transform_metrics_gauge_impl(bytes: &[u8], format: &str) -> Result<Vec<u8>, String> {
-    use arrow::array::RecordBatch;
+    use arrow_array::RecordBatch;
 
     let input_format = parse_format(format)?;
     let batches = transform_metrics(bytes, input_format).map_err(|e| e.to_string())?;
@@ -92,7 +92,7 @@ fn transform_metrics_gauge_impl(bytes: &[u8], format: &str) -> Result<Vec<u8>, S
 
 /// Transform OTLP sum metrics to Arrow IPC bytes (internal implementation).
 fn transform_metrics_sum_impl(bytes: &[u8], format: &str) -> Result<Vec<u8>, String> {
-    use arrow::array::RecordBatch;
+    use arrow_array::RecordBatch;
 
     let input_format = parse_format(format)?;
     let batches = transform_metrics(bytes, input_format).map_err(|e| e.to_string())?;
@@ -434,7 +434,7 @@ mod tests {
         assert!(!ipc_bytes.is_empty());
 
         // Verify we can read back the IPC
-        use arrow::ipc::reader::StreamReader;
+        use arrow_ipc::reader::StreamReader;
         use std::io::Cursor;
 
         let cursor = Cursor::new(ipc_bytes);
@@ -470,7 +470,7 @@ mod tests {
         assert!(!ipc_bytes.is_empty());
 
         // Verify we can read back the IPC
-        use arrow::ipc::reader::StreamReader;
+        use arrow_ipc::reader::StreamReader;
         use std::io::Cursor;
 
         let cursor = Cursor::new(ipc_bytes);

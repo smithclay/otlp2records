@@ -18,10 +18,10 @@ use std::ffi::{c_char, c_int, CString};
 use std::ptr;
 use std::sync::Arc;
 
-use arrow::array::{Array, RecordBatch};
-use arrow::datatypes::Schema;
-use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
-use arrow::ffi_stream::FFI_ArrowArrayStream;
+use arrow_array::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
+use arrow_array::ffi_stream::FFI_ArrowArrayStream;
+use arrow_array::{Array, RecordBatch};
+use arrow_schema::Schema;
 
 use crate::decode::InputFormat;
 use crate::{
@@ -326,11 +326,10 @@ pub unsafe extern "C" fn otlp_parser_drain(
         let schema = handle.get_schema();
 
         // Create a RecordBatchReader from the batches
-        let reader =
-            arrow::record_batch::RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
+        let reader = arrow_array::RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
 
         // Export to FFI stream
-        let stream = arrow::ffi_stream::FFI_ArrowArrayStream::new(Box::new(reader));
+        let stream = arrow_array::ffi_stream::FFI_ArrowArrayStream::new(Box::new(reader));
         std::ptr::write(out_stream, stream);
         OtlpStatus::Ok
     }))
@@ -443,7 +442,7 @@ pub unsafe extern "C" fn otlp_transform(
                 };
 
                 // Convert RecordBatch to StructArray for FFI export
-                let struct_array: arrow::array::StructArray = batch.into();
+                let struct_array: arrow_array::StructArray = batch.into();
                 let array_data = struct_array.into_data();
 
                 // Export array
@@ -471,7 +470,7 @@ pub unsafe extern "C" fn otlp_transform(
                     Err(_) => return OtlpStatus::Internal,
                 };
 
-                let struct_array: arrow::array::StructArray = empty_batch.into();
+                let struct_array: arrow_array::StructArray = empty_batch.into();
                 let array_data = struct_array.into_data();
                 let ffi_array = FFI_ArrowArray::new(&array_data);
 
@@ -546,7 +545,7 @@ pub extern "C" fn otlp_status_message(status: OtlpStatus) -> *const c_char {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::ffi_stream::ArrowArrayStreamReader;
+    use arrow_array::ffi_stream::ArrowArrayStreamReader;
     use opentelemetry_proto::tonic::{
         collector::logs::v1::ExportLogsServiceRequest,
         common::v1::{any_value, AnyValue, InstrumentationScope, KeyValue},
@@ -663,7 +662,7 @@ mod tests {
 
             // Convert back to Rust Schema to verify
             let schema =
-                arrow::datatypes::Schema::try_from(&ffi_schema).expect("Failed to convert schema");
+                arrow_schema::Schema::try_from(&ffi_schema).expect("Failed to convert schema");
 
             // Verify schema has columns (logs schema has 14+ columns)
             assert!(!schema.fields().is_empty());
@@ -697,7 +696,7 @@ mod tests {
 
             // Import back to Rust types to verify
             let array_data =
-                arrow::ffi::from_ffi(ffi_array, &ffi_schema).expect("Failed to import array");
+                arrow_array::ffi::from_ffi(ffi_array, &ffi_schema).expect("Failed to import array");
 
             // Verify we got data (should be a struct array with 1 row)
             assert_eq!(array_data.len(), 1);
