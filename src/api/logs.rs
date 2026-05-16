@@ -1,6 +1,7 @@
 //! Public log transform orchestration.
 
 use arrow_array::RecordBatch;
+use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 
 use crate::{
     api::batch_to_json_values,
@@ -22,6 +23,14 @@ pub fn transform_logs(bytes: &[u8], format: InputFormat) -> Result<RecordBatch> 
         InputFormat::Auto => transform_logs_auto(bytes),
         InputFormat::Json | InputFormat::Jsonl => transform_logs_json_arrow(bytes, format),
     }
+}
+
+#[doc(hidden)]
+pub fn transform_logs_decoded_for_bench(
+    request: ExportLogsServiceRequest,
+    input_bytes: usize,
+) -> Result<RecordBatch> {
+    batch::transform_logs_request(request, input_bytes)
 }
 
 fn transform_logs_json_arrow(bytes: &[u8], format: InputFormat) -> Result<RecordBatch> {

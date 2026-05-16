@@ -1,5 +1,7 @@
 //! Public metric transform orchestration.
 
+use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
+
 use crate::{
     api::{optional_batch_to_json_values, JsonMetricBatches, MetricBatches},
     batch,
@@ -21,6 +23,13 @@ pub fn transform_metrics(bytes: &[u8], format: InputFormat) -> Result<MetricBatc
         InputFormat::Auto => transform_metrics_auto(bytes),
         InputFormat::Json | InputFormat::Jsonl => transform_metrics_json_arrow(bytes, format),
     }
+}
+
+#[doc(hidden)]
+pub fn transform_metrics_decoded_for_bench(
+    request: ExportMetricsServiceRequest,
+) -> Result<MetricBatches> {
+    batch::transform_metrics_request(request)
 }
 
 fn transform_metrics_json_arrow(bytes: &[u8], format: InputFormat) -> Result<MetricBatches> {

@@ -24,7 +24,16 @@ pub(super) fn append_u64_json_array(
     scratch: &mut String,
 ) -> Result<()> {
     scratch.clear();
-    write_u64_json_array(scratch, values)?;
+    scratch.reserve(values.len().saturating_mul(3).saturating_add(2));
+    scratch.push('[');
+    let mut integer = itoa::Buffer::new();
+    for (idx, value) in values.iter().enumerate() {
+        if idx > 0 {
+            scratch.push(',');
+        }
+        scratch.push_str(integer.format(*value));
+    }
+    scratch.push(']');
     builder.append_value(scratch.as_str());
     Ok(())
 }
@@ -352,24 +361,6 @@ fn write_i64_builder<W: fmt::Write + ?Sized>(builder: &mut W, value: i64) -> Res
     fmt::Write::write_fmt(builder, format_args!("{value}")).map_err(|_| {
         Error::InvalidInput("failed to write integer to Arrow string builder".to_string())
     })
-}
-
-#[inline]
-fn write_u64_builder<W: fmt::Write + ?Sized>(builder: &mut W, value: u64) -> Result<()> {
-    fmt::Write::write_fmt(builder, format_args!("{value}")).map_err(|_| {
-        Error::InvalidInput("failed to write integer to Arrow string builder".to_string())
-    })
-}
-
-fn write_u64_json_array<W: fmt::Write + ?Sized>(builder: &mut W, values: &[u64]) -> Result<()> {
-    write_str_builder(builder, "[")?;
-    for (idx, value) in values.iter().enumerate() {
-        if idx > 0 {
-            write_str_builder(builder, ",")?;
-        }
-        write_u64_builder(builder, *value)?;
-    }
-    write_str_builder(builder, "]")
 }
 
 fn write_f64_json_array<W: fmt::Write + ?Sized>(builder: &mut W, values: &[f64]) -> Result<()> {
