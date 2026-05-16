@@ -40,6 +40,13 @@ use crate::{
 
 pub fn transform_logs_protobuf(bytes: &[u8]) -> Result<RecordBatch> {
     let request = ExportLogsServiceRequest::decode(bytes)?;
+    transform_logs_request(request, bytes.len())
+}
+
+pub fn transform_logs_request(
+    request: ExportLogsServiceRequest,
+    input_bytes: usize,
+) -> Result<RecordBatch> {
     let rows = request
         .resource_logs
         .iter()
@@ -50,7 +57,7 @@ pub fn transform_logs_protobuf(bytes: &[u8]) -> Result<RecordBatch> {
                 .sum::<usize>()
         })
         .sum();
-    let mut builders = LogBuilders::with_capacity(rows, bytes.len());
+    let mut builders = LogBuilders::with_capacity(rows, input_bytes);
 
     for resource_logs in request.resource_logs {
         let resource = ResourceContext::from_attrs(
@@ -83,6 +90,13 @@ pub fn transform_logs_protobuf(bytes: &[u8]) -> Result<RecordBatch> {
 
 pub fn transform_traces_protobuf(bytes: &[u8]) -> Result<RecordBatch> {
     let request = ExportTraceServiceRequest::decode(bytes)?;
+    transform_traces_request(request, bytes.len())
+}
+
+pub fn transform_traces_request(
+    request: ExportTraceServiceRequest,
+    input_bytes: usize,
+) -> Result<RecordBatch> {
     let rows = request
         .resource_spans
         .iter()
@@ -93,7 +107,7 @@ pub fn transform_traces_protobuf(bytes: &[u8]) -> Result<RecordBatch> {
                 .sum::<usize>()
         })
         .sum();
-    let mut builders = TraceBuilders::with_capacity(rows, bytes.len());
+    let mut builders = TraceBuilders::with_capacity(rows, input_bytes);
 
     for resource_spans in request.resource_spans {
         let resource = ResourceContext::from_attrs(
@@ -126,6 +140,10 @@ pub fn transform_traces_protobuf(bytes: &[u8]) -> Result<RecordBatch> {
 
 pub fn transform_metrics_protobuf(bytes: &[u8]) -> Result<MetricBatches> {
     let request = ExportMetricsServiceRequest::decode(bytes)?;
+    transform_metrics_request(request)
+}
+
+pub fn transform_metrics_request(request: ExportMetricsServiceRequest) -> Result<MetricBatches> {
     let mut capacities = MetricCapacities::default();
     for resource_metrics in &request.resource_metrics {
         for scope_metrics in &resource_metrics.scope_metrics {

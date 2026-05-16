@@ -20,8 +20,8 @@ Currently consumed by [duckdb-otlp](https://github.com/smithclay/duckdb-otlp), [
 - Transform OTLP logs, traces, and metrics to Arrow RecordBatches
 - Support for both Protobuf and JSON input formats
 - Output to NDJSON, Arrow IPC, or Parquet
-- Direct protobuf-to-Arrow hot path for high-throughput ingestion
-- JSON/JSONL compatibility path for OTLP JSON payloads
+- Direct OTLP-to-Arrow hot path for high-throughput ingestion
+- JSON/JSONL support through OTLP request normalization into the same Arrow builders
 
 ## Installation
 
@@ -110,6 +110,7 @@ const arrowIpc = transform_logs_wasm(otlpBytes, "protobuf");
 |--------|-------------|
 | `InputFormat::Protobuf` | Standard OTLP protobuf encoding |
 | `InputFormat::Json` | OTLP JSON encoding (camelCase field names) |
+| `InputFormat::Jsonl` | Newline-delimited OTLP JSON envelopes |
 | `InputFormat::Auto` | Auto-detect JSON vs protobuf with fallback decoding |
 
 ### High-level Functions
@@ -151,15 +152,17 @@ const arrowIpc = transform_logs_wasm(otlpBytes, "protobuf");
                               | (protobuf/jsonl)  |
                               +---------+---------+
                                         |
-                    +-------------------+-------------------+
-                    |                                       |
-                    v                                       v
-          +---------+---------+                   +---------+---------+
-          | Protobuf Builders |                   | JSON Compat Path  |
-          | (direct to Arrow) |                   | (serde + transform)|
-          +---------+---------+                   +---------+---------+
-                    |                                       |
-                    +-------------------+-------------------+
+                                        v
+                              +---------+---------+
+                              | OTLP Request      |
+                              | (prost structs)   |
+                              +---------+---------+
+                                        |
+                                        v
+                              +---------+---------+
+                              | Arrow Builders    |
+                              | (direct columns)  |
+                              +---------+---------+
                                         |
                                         v
                               +---------+---------+

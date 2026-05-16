@@ -1,158 +1,68 @@
-//! OTLP log decoding - protobuf and JSON
+//! OTLP log JSON decoding into protobuf request structs.
 
-use crate::value::{ObjectMap, Value as RecordValue};
-use bytes::Bytes;
-use const_hex::encode as hex_encode;
-use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
-use prost::Message;
+use opentelemetry_proto::tonic::{
+    collector::logs::v1::ExportLogsServiceRequest,
+    logs::v1::{LogRecord, ResourceLogs, ScopeLogs},
+};
 use serde::Deserialize;
-use std::sync::Arc;
 
 use super::common::{
-    for_each_resource_scope, json_any_value_to_value, json_attrs_to_value, json_resource_to_value,
-    json_scope_to_value, json_timestamp_to_i64, otlp_any_value_to_value, otlp_attributes_to_value,
-    otlp_resource_to_value, otlp_scope_to_value, safe_timestamp_conversion, DecodeError,
-    JsonAnyValue, JsonInstrumentationScope, JsonKeyValue, JsonNumberOrString, JsonResource,
+    decode_bytes_field, json_any_value_to_otlp, json_attrs_to_otlp, json_resource_to_otlp,
+    json_scope_to_otlp, json_timestamp_to_u64, DecodeError, JsonAnyValue, JsonInstrumentationScope,
+    JsonKeyValue, JsonNumberOrString, JsonResource,
 };
 
-// ============================================================================
-// Protobuf decoding
-// ============================================================================
-
-pub fn decode_protobuf(body: &[u8]) -> Result<Vec<RecordValue>, DecodeError> {
-    let request = ExportLogsServiceRequest::decode(body)?;
-    export_logs_to_values_proto(request)
-}
-
-fn export_logs_to_values_proto(
-    request: ExportLogsServiceRequest,
-) -> Result<Vec<RecordValue>, DecodeError> {
-    let mut values = preallocate_log_values(&request.resource_logs, |rl| {
-        rl.scope_logs.iter().map(|sl| sl.log_records.len()).sum()
-    });
-
-    for_each_resource_scope(
-        request.resource_logs,
-        |resource_logs| {
-            (
-                otlp_resource_to_value(resource_logs.resource.as_ref()),
-                resource_logs.scope_logs,
-            )
-        },
-        |scope_logs| {
-            (
-                otlp_scope_to_value(scope_logs.scope.as_ref()),
-                scope_logs.log_records,
-            )
-        },
-        |log_records, resource, scope| {
-            for log_record in log_records {
-                let body = log_record
-                    .body
-                    .as_ref()
-                    .map(otlp_any_value_to_value)
-                    .unwrap_or(RecordValue::Null);
-
-                let parts = LogRecordParts {
-                    time_unix_nano: safe_timestamp_conversion(
-                        log_record.time_unix_nano,
-                        "log.time_unix_nano",
-                    )?,
-                    observed_time_unix_nano: safe_timestamp_conversion(
-                        log_record.observed_time_unix_nano,
-                        "log.observed_time_unix_nano",
-                    )?,
-                    severity_number: log_record.severity_number as i64,
-                    severity_text: Bytes::from(log_record.severity_text),
-                    body,
-                    trace_id: Bytes::from(hex_encode(&log_record.trace_id)),
-                    span_id: Bytes::from(hex_encode(&log_record.span_id)),
-                    attributes: otlp_attributes_to_value(&log_record.attributes),
-                    resource: Arc::clone(&resource),
-                    scope: Arc::clone(&scope),
-                };
-
-                values.push(build_log_record(parts));
-            }
-
-            Ok::<(), DecodeError>(())
-        },
-    )?;
-
-    Ok(values)
-}
-
-// ============================================================================
-// JSON decoding
-// ============================================================================
-
-pub fn decode_json(body: &[u8]) -> Result<Vec<RecordValue>, DecodeError> {
-    // Normalize JSON to convert enum strings to numbers before parsing
+pub fn decode_json_request(body: &[u8]) -> Result<ExportLogsServiceRequest, DecodeError> {
     let normalized = super::normalize::normalize_json_bytes(body)?;
     let request: JsonExportLogsServiceRequest = serde_json::from_slice(&normalized)?;
-    export_logs_json_to_values(request)
+    export_logs_json_to_request(request)
 }
 
-fn export_logs_json_to_values(
+fn export_logs_json_to_request(
     request: JsonExportLogsServiceRequest,
-) -> Result<Vec<RecordValue>, DecodeError> {
-    let mut values = preallocate_log_values(&request.resource_logs, |rl| {
-        rl.scope_logs.iter().map(|sl| sl.log_records.len()).sum()
-    });
+) -> Result<ExportLogsServiceRequest, DecodeError> {
+    let mut resource_logs = Vec::with_capacity(request.resource_logs.len());
 
-    for_each_resource_scope(
-        request.resource_logs,
-        |resource_logs| {
-            (
-                json_resource_to_value(resource_logs.resource),
-                resource_logs.scope_logs,
-            )
-        },
-        |scope_logs| {
-            (
-                json_scope_to_value(scope_logs.scope),
-                scope_logs.log_records,
-            )
-        },
-        |log_records, resource, scope| {
-            for log_record in log_records {
-                let body = log_record
-                    .body
-                    .map(json_any_value_to_value)
-                    .unwrap_or(RecordValue::Null);
-
-                let parts = LogRecordParts {
-                    time_unix_nano: json_timestamp_to_i64(
-                        &log_record.time_unix_nano,
+    for resource in request.resource_logs {
+        let mut scope_logs = Vec::with_capacity(resource.scope_logs.len());
+        for scope in resource.scope_logs {
+            let mut log_records = Vec::with_capacity(scope.log_records.len());
+            for record in scope.log_records {
+                log_records.push(LogRecord {
+                    time_unix_nano: json_timestamp_to_u64(
+                        &record.time_unix_nano,
                         "log.time_unix_nano",
                     )?,
-                    observed_time_unix_nano: json_timestamp_to_i64(
-                        &log_record.observed_time_unix_nano,
+                    observed_time_unix_nano: json_timestamp_to_u64(
+                        &record.observed_time_unix_nano,
                         "log.observed_time_unix_nano",
                     )?,
-                    severity_number: log_record.severity_number as i64,
-                    severity_text: Bytes::from(log_record.severity_text),
-                    body,
-                    trace_id: Bytes::from(log_record.trace_id),
-                    span_id: Bytes::from(log_record.span_id),
-                    attributes: json_attrs_to_value(log_record.attributes),
-                    resource: Arc::clone(&resource),
-                    scope: Arc::clone(&scope),
-                };
-
-                values.push(build_log_record(parts));
+                    severity_number: record.severity_number,
+                    severity_text: record.severity_text,
+                    body: record.body.map(json_any_value_to_otlp),
+                    attributes: json_attrs_to_otlp(record.attributes),
+                    dropped_attributes_count: 0,
+                    flags: 0,
+                    trace_id: decode_bytes_field(&record.trace_id),
+                    span_id: decode_bytes_field(&record.span_id),
+                    event_name: String::new(),
+                });
             }
+            scope_logs.push(ScopeLogs {
+                scope: Some(json_scope_to_otlp(scope.scope)),
+                log_records,
+                schema_url: String::new(),
+            });
+        }
+        resource_logs.push(ResourceLogs {
+            resource: Some(json_resource_to_otlp(resource.resource)),
+            scope_logs,
+            schema_url: String::new(),
+        });
+    }
 
-            Ok::<(), DecodeError>(())
-        },
-    )?;
-
-    Ok(values)
+    Ok(ExportLogsServiceRequest { resource_logs })
 }
-
-// ============================================================================
-// JSON struct definitions
-// ============================================================================
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -200,76 +110,12 @@ struct JsonLogRecord {
     span_id: String,
 }
 
-// ============================================================================
-// Record builder
-// ============================================================================
-
-/// Precomputed fields for building a log record into record values
-struct LogRecordParts {
-    time_unix_nano: i64,
-    observed_time_unix_nano: i64,
-    severity_number: i64,
-    severity_text: Bytes,
-    body: RecordValue,
-    trace_id: Bytes,
-    span_id: Bytes,
-    attributes: RecordValue,
-    resource: Arc<RecordValue>,
-    scope: Arc<RecordValue>,
-}
-
-/// Pre-allocate a values Vec sized to the number of log records a request contains
-fn preallocate_log_values<R, F>(resource_logs: &[R], count_logs: F) -> Vec<RecordValue>
-where
-    F: Fn(&R) -> usize,
-{
-    let capacity: usize = resource_logs.iter().map(&count_logs).sum();
-    Vec::with_capacity(capacity)
-}
-
-/// Build a record log record from parts
-fn build_log_record(parts: LogRecordParts) -> RecordValue {
-    let mut map = ObjectMap::new();
-    map.insert(
-        "time_unix_nano".into(),
-        RecordValue::Integer(parts.time_unix_nano),
-    );
-    map.insert(
-        "observed_time_unix_nano".into(),
-        RecordValue::Integer(parts.observed_time_unix_nano),
-    );
-    map.insert(
-        "severity_number".into(),
-        RecordValue::Integer(parts.severity_number),
-    );
-    map.insert(
-        "severity_text".into(),
-        RecordValue::Bytes(parts.severity_text),
-    );
-    map.insert("body".into(), parts.body);
-    map.insert("trace_id".into(), RecordValue::Bytes(parts.trace_id));
-    map.insert("span_id".into(), RecordValue::Bytes(parts.span_id));
-    map.insert("attributes".into(), parts.attributes);
-    map.insert("resource".into(), RecordValue::Shared(parts.resource));
-    map.insert("scope".into(), RecordValue::Shared(parts.scope));
-    RecordValue::Object(map)
-}
-
-// ============================================================================
-// Tests
-// ============================================================================
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use opentelemetry_proto::tonic::{
-        common::v1::{any_value, AnyValue, InstrumentationScope, KeyValue},
-        logs::v1::LogRecord,
-        resource::v1::Resource,
-    };
 
     #[test]
-    fn decodes_json_payload() {
+    fn decodes_json_request() {
         let body = r#"{
             "resourceLogs": [{
                 "resource": { "attributes": [{ "key": "service.name", "value": { "stringValue": "svc" } }]},
@@ -289,204 +135,9 @@ mod tests {
             }]
         }"#;
 
-        let records = decode_json(body.as_bytes()).unwrap();
-        assert_eq!(records.len(), 1);
-
-        let record = &records[0];
-        if let RecordValue::Object(map) = record {
-            assert_eq!(map.get("severity_number"), Some(&RecordValue::Integer(9)));
-            assert_eq!(
-                map.get("severity_text"),
-                Some(&RecordValue::Bytes(Bytes::from("INFO")))
-            );
-        } else {
-            panic!("expected object");
-        }
-    }
-
-    #[test]
-    fn decodes_protobuf_payload() {
-        let log = LogRecord {
-            time_unix_nano: 123,
-            observed_time_unix_nano: 124,
-            severity_number: 9,
-            severity_text: "INFO".to_string(),
-            body: Some(AnyValue {
-                value: Some(any_value::Value::StringValue("hello".to_string())),
-            }),
-            attributes: vec![KeyValue {
-                key: "k".to_string(),
-                value: Some(AnyValue {
-                    value: Some(any_value::Value::StringValue("v".to_string())),
-                }),
-            }],
-            trace_id: vec![0, 1, 2, 3],
-            span_id: vec![4, 5, 6, 7],
-            ..Default::default()
-        };
-
-        let request = ExportLogsServiceRequest {
-            resource_logs: vec![opentelemetry_proto::tonic::logs::v1::ResourceLogs {
-                resource: Some(Resource {
-                    attributes: vec![],
-                    ..Default::default()
-                }),
-                scope_logs: vec![opentelemetry_proto::tonic::logs::v1::ScopeLogs {
-                    scope: Some(InstrumentationScope {
-                        name: "lib".to_string(),
-                        version: "1".to_string(),
-                        ..Default::default()
-                    }),
-                    log_records: vec![log],
-                    ..Default::default()
-                }],
-                ..Default::default()
-            }],
-        };
-
-        let body = request.encode_to_vec();
-        let records = decode_protobuf(&body).unwrap();
-        assert_eq!(records.len(), 1);
-
-        let record = &records[0];
-        if let RecordValue::Object(map) = record {
-            assert_eq!(map.get("time_unix_nano"), Some(&RecordValue::Integer(123)));
-            // trace_id should be hex encoded
-            assert_eq!(
-                map.get("trace_id"),
-                Some(&RecordValue::Bytes(Bytes::from("00010203")))
-            );
-        } else {
-            panic!("expected object");
-        }
-    }
-
-    #[test]
-    fn rejects_overflow_log_time() {
-        let log = LogRecord {
-            time_unix_nano: u64::MAX,
-            observed_time_unix_nano: 124,
-            severity_number: 9,
-            severity_text: "INFO".to_string(),
-            body: Some(AnyValue {
-                value: Some(any_value::Value::StringValue("hello".to_string())),
-            }),
-            ..Default::default()
-        };
-
-        let request = ExportLogsServiceRequest {
-            resource_logs: vec![opentelemetry_proto::tonic::logs::v1::ResourceLogs {
-                resource: Some(Resource::default()),
-                scope_logs: vec![opentelemetry_proto::tonic::logs::v1::ScopeLogs {
-                    scope: Some(InstrumentationScope::default()),
-                    log_records: vec![log],
-                    ..Default::default()
-                }],
-                ..Default::default()
-            }],
-        };
-
-        let body = request.encode_to_vec();
-        let result = decode_protobuf(&body);
-
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        match err {
-            DecodeError::Unsupported(msg) => {
-                assert!(msg.contains("timestamp overflow"));
-                assert!(msg.contains("time_unix_nano"));
-            }
-            _ => panic!("Expected DecodeError::Unsupported, got: {err:?}"),
-        }
-    }
-
-    #[test]
-    fn rejects_overflow_log_observed_time() {
-        let log = LogRecord {
-            time_unix_nano: 123,
-            observed_time_unix_nano: u64::MAX,
-            severity_number: 9,
-            severity_text: "INFO".to_string(),
-            body: Some(AnyValue {
-                value: Some(any_value::Value::StringValue("hello".to_string())),
-            }),
-            ..Default::default()
-        };
-
-        let request = ExportLogsServiceRequest {
-            resource_logs: vec![opentelemetry_proto::tonic::logs::v1::ResourceLogs {
-                resource: Some(Resource::default()),
-                scope_logs: vec![opentelemetry_proto::tonic::logs::v1::ScopeLogs {
-                    scope: Some(InstrumentationScope::default()),
-                    log_records: vec![log],
-                    ..Default::default()
-                }],
-                ..Default::default()
-            }],
-        };
-
-        let body = request.encode_to_vec();
-        let result = decode_protobuf(&body);
-
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        match err {
-            DecodeError::Unsupported(msg) => {
-                assert!(msg.contains("timestamp overflow"));
-                assert!(msg.contains("observed_time_unix_nano"));
-            }
-            _ => panic!("Expected DecodeError::Unsupported, got: {err:?}"),
-        }
-    }
-
-    #[test]
-    fn accepts_valid_log_timestamps() {
-        let log = LogRecord {
-            time_unix_nano: 123,
-            observed_time_unix_nano: 124,
-            severity_number: 9,
-            severity_text: "INFO".to_string(),
-            body: Some(AnyValue {
-                value: Some(any_value::Value::StringValue("hello".to_string())),
-            }),
-            ..Default::default()
-        };
-
-        let request = ExportLogsServiceRequest {
-            resource_logs: vec![opentelemetry_proto::tonic::logs::v1::ResourceLogs {
-                resource: Some(Resource::default()),
-                scope_logs: vec![opentelemetry_proto::tonic::logs::v1::ScopeLogs {
-                    scope: Some(InstrumentationScope::default()),
-                    log_records: vec![log],
-                    ..Default::default()
-                }],
-                ..Default::default()
-            }],
-        };
-
-        let body = request.encode_to_vec();
-        let result = decode_protobuf(&body);
-
-        assert!(result.is_ok());
-        let logs = result.unwrap();
-        assert_eq!(logs.len(), 1);
-    }
-
-    #[test]
-    fn handles_empty_log_request() {
-        let request = ExportLogsServiceRequest {
-            resource_logs: vec![],
-        };
-
-        let body = request.encode_to_vec();
-        let records = decode_protobuf(&body).unwrap();
-        assert!(records.is_empty());
-    }
-
-    #[test]
-    fn handles_empty_json_request() {
-        let body = r#"{"resourceLogs": []}"#;
-        let records = decode_json(body.as_bytes()).unwrap();
-        assert!(records.is_empty());
+        let request = decode_json_request(body.as_bytes()).unwrap();
+        let record = &request.resource_logs[0].scope_logs[0].log_records[0];
+        assert_eq!(record.severity_number, 9);
+        assert_eq!(record.trace_id.len(), 16);
     }
 }

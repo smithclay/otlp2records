@@ -34,14 +34,11 @@
 //! ```
 //!
 mod arrow;
-mod convert;
 mod decode;
 mod error;
 mod fast;
 mod output;
 mod schemas;
-mod transform;
-mod value;
 
 #[cfg(all(feature = "wasm", target_arch = "wasm32"))]
 pub mod wasm;
@@ -51,20 +48,22 @@ pub mod ffi;
 
 use ::arrow_array::RecordBatch;
 
-use arrow::values_to_arrow;
 pub use arrow::{
     exp_histogram_schema, extract_min_timestamp_micros, extract_service_name, gauge_schema,
     group_batch_by_service, histogram_schema, logs_schema, sum_schema, traces_schema,
     PartitionedBatch, PartitionedMetrics, ServiceGroupedBatches,
 };
-use decode::{decode_logs, decode_metrics, decode_traces, looks_like_json};
+use decode::{
+    decode_logs_json_request, decode_logs_jsonl_request, decode_metrics_json_request,
+    decode_metrics_jsonl_request, decode_traces_json_request, decode_traces_jsonl_request,
+    looks_like_json,
+};
 pub use decode::{DecodeError, InputFormat, SkippedMetrics};
 pub use error::{Error, Result};
 #[cfg(feature = "parquet")]
 pub use output::to_parquet;
 pub use output::{to_ipc, to_json};
 pub use schemas::{schema_def, schema_defs, FieldType, SchemaDef, SchemaField};
-use value::Value;
 
 // ============================================================================
 // High-level API types
@@ -107,14 +106,6 @@ pub struct JsonMetricBatches {
     pub skipped: SkippedMetrics,
 }
 
-#[derive(Debug, Default)]
-struct MetricValues {
-    gauge: Vec<Value>,
-    sum: Vec<Value>,
-    histogram: Vec<Value>,
-    exp_histogram: Vec<Value>,
-}
-
 // ============================================================================
 // High-level API functions
 // ============================================================================
@@ -145,21 +136,28 @@ pub fn transform_logs(bytes: &[u8], format: InputFormat) -> Result<RecordBatch> 
     match format {
         InputFormat::Protobuf => fast::transform_logs_protobuf(bytes),
         InputFormat::Auto => transform_logs_auto(bytes),
-        InputFormat::Json | InputFormat::Jsonl => transform_logs_legacy(bytes, format),
+        InputFormat::Json | InputFormat::Jsonl => transform_logs_json_arrow(bytes, format),
     }
 }
 
-fn transform_logs_legacy(bytes: &[u8], format: InputFormat) -> Result<RecordBatch> {
-    let values = decode_logs(bytes, format)?;
-    let transformed = apply_log_transform(values);
-    Ok(values_to_arrow(&transformed, &logs_schema())?)
+fn transform_logs_json_arrow(bytes: &[u8], format: InputFormat) -> Result<RecordBatch> {
+    let request = match format {
+        InputFormat::Json => decode_logs_json_request(bytes)?,
+        InputFormat::Jsonl => decode_logs_jsonl_request(bytes)?,
+        _ => {
+            return Err(Error::Decode(DecodeError::Unsupported(
+                "expected JSON or JSONL logs input".to_string(),
+            )));
+        }
+    };
+    fast::transform_logs_request(request, bytes.len())
 }
 
 fn transform_logs_auto(bytes: &[u8]) -> Result<RecordBatch> {
     if looks_like_json(bytes) {
-        match transform_logs_legacy(bytes, InputFormat::Json) {
+        match transform_logs_json_arrow(bytes, InputFormat::Json) {
             Ok(batch) => Ok(batch),
-            Err(json_err) => match transform_logs_legacy(bytes, InputFormat::Jsonl) {
+            Err(json_err) => match transform_logs_json_arrow(bytes, InputFormat::Jsonl) {
                 Ok(batch) => Ok(batch),
                 Err(_) => fast::transform_logs_protobuf(bytes).map_err(|proto_err| {
                     Error::Decode(DecodeError::Unsupported(format!(
@@ -171,20 +169,20 @@ fn transform_logs_auto(bytes: &[u8]) -> Result<RecordBatch> {
     } else {
         match fast::transform_logs_protobuf(bytes) {
             Ok(batch) => Ok(batch),
-            Err(proto_err) => transform_logs_legacy(bytes, InputFormat::Json).map_err(|json_err| {
-                Error::Decode(DecodeError::Unsupported(format!(
-                    "protobuf decode failed: {proto_err}; json fallback failed: {json_err}"
-                )))
-            }),
+            Err(proto_err) => {
+                transform_logs_json_arrow(bytes, InputFormat::Json).map_err(|json_err| {
+                    Error::Decode(DecodeError::Unsupported(format!(
+                        "protobuf decode failed: {proto_err}; json fallback failed: {json_err}"
+                    )))
+                })
+            }
         }
     }
 }
 
 /// Transform OTLP logs to JSON values.
 pub fn transform_logs_json(bytes: &[u8], format: InputFormat) -> Result<Vec<serde_json::Value>> {
-    let values = decode_logs(bytes, format)?;
-    let transformed = apply_log_transform(values);
-    values_to_json(transformed, "log")
+    batch_to_json_values(&transform_logs(bytes, format)?)
 }
 
 /// Transform OTLP traces to Arrow RecordBatch.
@@ -213,21 +211,28 @@ pub fn transform_traces(bytes: &[u8], format: InputFormat) -> Result<RecordBatch
     match format {
         InputFormat::Protobuf => fast::transform_traces_protobuf(bytes),
         InputFormat::Auto => transform_traces_auto(bytes),
-        InputFormat::Json | InputFormat::Jsonl => transform_traces_legacy(bytes, format),
+        InputFormat::Json | InputFormat::Jsonl => transform_traces_json_arrow(bytes, format),
     }
 }
 
-fn transform_traces_legacy(bytes: &[u8], format: InputFormat) -> Result<RecordBatch> {
-    let values = decode_traces(bytes, format)?;
-    let transformed = apply_trace_transform(values);
-    Ok(values_to_arrow(&transformed, &traces_schema())?)
+fn transform_traces_json_arrow(bytes: &[u8], format: InputFormat) -> Result<RecordBatch> {
+    let request = match format {
+        InputFormat::Json => decode_traces_json_request(bytes)?,
+        InputFormat::Jsonl => decode_traces_jsonl_request(bytes)?,
+        _ => {
+            return Err(Error::Decode(DecodeError::Unsupported(
+                "expected JSON or JSONL traces input".to_string(),
+            )));
+        }
+    };
+    fast::transform_traces_request(request, bytes.len())
 }
 
 fn transform_traces_auto(bytes: &[u8]) -> Result<RecordBatch> {
     if looks_like_json(bytes) {
-        match transform_traces_legacy(bytes, InputFormat::Json) {
+        match transform_traces_json_arrow(bytes, InputFormat::Json) {
             Ok(batch) => Ok(batch),
-            Err(json_err) => match transform_traces_legacy(bytes, InputFormat::Jsonl) {
+            Err(json_err) => match transform_traces_json_arrow(bytes, InputFormat::Jsonl) {
                 Ok(batch) => Ok(batch),
                 Err(_) => fast::transform_traces_protobuf(bytes).map_err(|proto_err| {
                     Error::Decode(DecodeError::Unsupported(format!(
@@ -240,7 +245,7 @@ fn transform_traces_auto(bytes: &[u8]) -> Result<RecordBatch> {
         match fast::transform_traces_protobuf(bytes) {
             Ok(batch) => Ok(batch),
             Err(proto_err) => {
-                transform_traces_legacy(bytes, InputFormat::Json).map_err(|json_err| {
+                transform_traces_json_arrow(bytes, InputFormat::Json).map_err(|json_err| {
                     Error::Decode(DecodeError::Unsupported(format!(
                         "protobuf decode failed: {proto_err}; json fallback failed: {json_err}"
                     )))
@@ -252,9 +257,7 @@ fn transform_traces_auto(bytes: &[u8]) -> Result<RecordBatch> {
 
 /// Transform OTLP traces to JSON values.
 pub fn transform_traces_json(bytes: &[u8], format: InputFormat) -> Result<Vec<serde_json::Value>> {
-    let values = decode_traces(bytes, format)?;
-    let transformed = apply_trace_transform(values);
-    values_to_json(transformed, "span")
+    batch_to_json_values(&transform_traces(bytes, format)?)
 }
 
 /// Transform OTLP metrics to Arrow RecordBatches.
@@ -291,57 +294,28 @@ pub fn transform_metrics(bytes: &[u8], format: InputFormat) -> Result<MetricBatc
     match format {
         InputFormat::Protobuf => fast::transform_metrics_protobuf(bytes),
         InputFormat::Auto => transform_metrics_auto(bytes),
-        InputFormat::Json | InputFormat::Jsonl => transform_metrics_legacy(bytes, format),
+        InputFormat::Json | InputFormat::Jsonl => transform_metrics_json_arrow(bytes, format),
     }
 }
 
-fn transform_metrics_legacy(bytes: &[u8], format: InputFormat) -> Result<MetricBatches> {
-    let decode_result = decode_metrics(bytes, format)?;
-    let metric_values = apply_metric_transform(decode_result.values);
-    let gauge = if metric_values.gauge.is_empty() {
-        None
-    } else {
-        Some(values_to_arrow(&metric_values.gauge, &gauge_schema())?)
+fn transform_metrics_json_arrow(bytes: &[u8], format: InputFormat) -> Result<MetricBatches> {
+    let request = match format {
+        InputFormat::Json => decode_metrics_json_request(bytes)?,
+        InputFormat::Jsonl => decode_metrics_jsonl_request(bytes)?,
+        _ => {
+            return Err(Error::Decode(DecodeError::Unsupported(
+                "expected JSON or JSONL metrics input".to_string(),
+            )));
+        }
     };
-
-    let sum = if metric_values.sum.is_empty() {
-        None
-    } else {
-        Some(values_to_arrow(&metric_values.sum, &sum_schema())?)
-    };
-
-    let histogram = if metric_values.histogram.is_empty() {
-        None
-    } else {
-        Some(values_to_arrow(
-            &metric_values.histogram,
-            &histogram_schema(),
-        )?)
-    };
-
-    let exp_histogram = if metric_values.exp_histogram.is_empty() {
-        None
-    } else {
-        Some(values_to_arrow(
-            &metric_values.exp_histogram,
-            &exp_histogram_schema(),
-        )?)
-    };
-
-    Ok(MetricBatches {
-        gauge,
-        sum,
-        histogram,
-        exp_histogram,
-        skipped: decode_result.skipped,
-    })
+    fast::transform_metrics_request(request)
 }
 
 fn transform_metrics_auto(bytes: &[u8]) -> Result<MetricBatches> {
     if looks_like_json(bytes) {
-        match transform_metrics_legacy(bytes, InputFormat::Json) {
+        match transform_metrics_json_arrow(bytes, InputFormat::Json) {
             Ok(batches) => Ok(batches),
-            Err(json_err) => match transform_metrics_legacy(bytes, InputFormat::Jsonl) {
+            Err(json_err) => match transform_metrics_json_arrow(bytes, InputFormat::Jsonl) {
                 Ok(batches) => Ok(batches),
                 Err(_) => fast::transform_metrics_protobuf(bytes).map_err(|proto_err| {
                     Error::Decode(DecodeError::Unsupported(format!(
@@ -354,7 +328,7 @@ fn transform_metrics_auto(bytes: &[u8]) -> Result<MetricBatches> {
         match fast::transform_metrics_protobuf(bytes) {
             Ok(batches) => Ok(batches),
             Err(proto_err) => {
-                transform_metrics_legacy(bytes, InputFormat::Json).map_err(|json_err| {
+                transform_metrics_json_arrow(bytes, InputFormat::Json).map_err(|json_err| {
                     Error::Decode(DecodeError::Unsupported(format!(
                         "protobuf decode failed: {proto_err}; json fallback failed: {json_err}"
                     )))
@@ -366,15 +340,14 @@ fn transform_metrics_auto(bytes: &[u8]) -> Result<MetricBatches> {
 
 /// Transform OTLP metrics to JSON values.
 pub fn transform_metrics_json(bytes: &[u8], format: InputFormat) -> Result<JsonMetricBatches> {
-    let decode_result = decode_metrics(bytes, format)?;
-    let metric_values = apply_metric_transform(decode_result.values);
+    let batches = transform_metrics(bytes, format)?;
 
     Ok(JsonMetricBatches {
-        gauge: values_to_json(metric_values.gauge, "gauge metric")?,
-        sum: values_to_json(metric_values.sum, "sum metric")?,
-        histogram: values_to_json(metric_values.histogram, "histogram metric")?,
-        exp_histogram: values_to_json(metric_values.exp_histogram, "exp_histogram metric")?,
-        skipped: decode_result.skipped,
+        gauge: optional_batch_to_json_values(batches.gauge.as_ref())?,
+        sum: optional_batch_to_json_values(batches.sum.as_ref())?,
+        histogram: optional_batch_to_json_values(batches.histogram.as_ref())?,
+        exp_histogram: optional_batch_to_json_values(batches.exp_histogram.as_ref())?,
+        skipped: batches.skipped,
     })
 }
 
@@ -516,91 +489,24 @@ pub fn transform_metrics_partitioned(
     })
 }
 
-fn apply_log_transform(values: Vec<Value>) -> Vec<Value> {
-    values.into_iter().map(transform::transform_log).collect()
+fn optional_batch_to_json_values(batch: Option<&RecordBatch>) -> Result<Vec<serde_json::Value>> {
+    match batch {
+        Some(batch) => batch_to_json_values(batch),
+        None => Ok(Vec::new()),
+    }
 }
 
-fn apply_trace_transform(values: Vec<Value>) -> Vec<Value> {
-    values.into_iter().map(transform::transform_trace).collect()
-}
-
-fn apply_metric_transform(values: Vec<Value>) -> MetricValues {
-    let mut gauge_count = 0;
-    let mut sum_count = 0;
-    let mut histogram_count = 0;
-    let mut exp_histogram_count = 0;
-    for value in &values {
-        match extract_metric_type(value) {
-            "gauge" => gauge_count += 1,
-            "sum" => sum_count += 1,
-            "histogram" => histogram_count += 1,
-            "exp_histogram" => exp_histogram_count += 1,
-            _ => {}
-        }
-    }
-
-    let mut result = MetricValues {
-        gauge: Vec::with_capacity(gauge_count),
-        sum: Vec::with_capacity(sum_count),
-        histogram: Vec::with_capacity(histogram_count),
-        exp_histogram: Vec::with_capacity(exp_histogram_count),
-    };
-
-    // Partition metrics by type and transform each with the matching transform function.
-    for value in values {
-        match extract_metric_type(&value) {
-            "gauge" => {
-                result.gauge.push(transform::transform_gauge(value));
-            }
-            "sum" => {
-                result.sum.push(transform::transform_sum(value));
-            }
-            "histogram" => {
-                result.histogram.push(transform::transform_histogram(value));
-            }
-            "exp_histogram" => {
-                result
-                    .exp_histogram
-                    .push(transform::transform_exp_histogram(value));
-            }
-            _ => {
-                // Skip unknown metric types (summary - deprecated in OTLP spec)
-            }
-        }
-    }
-
-    result
-}
-
-fn values_to_json(values: Vec<Value>, label: &str) -> Result<Vec<serde_json::Value>> {
-    let mut out = Vec::with_capacity(values.len());
-
-    for (idx, value) in values.into_iter().enumerate() {
-        let json = crate::convert::value_to_json(&value).ok_or_else(|| {
-            Error::InvalidInput(format!(
-                "{label} record {idx} contains unrepresentable JSON value"
-            ))
-        })?;
-        out.push(json);
-    }
-
-    Ok(out)
-}
-
-/// Extract the _metric_type field from a decoded metric value.
-fn extract_metric_type(value: &Value) -> &'static str {
-    if let Value::Object(map) = value {
-        if let Some(Value::Bytes(bytes)) = map.get("_metric_type") {
-            return match bytes.as_ref() {
-                b"gauge" => "gauge",
-                b"sum" => "sum",
-                b"histogram" => "histogram",
-                b"exp_histogram" => "exp_histogram",
-                _ => "",
-            };
-        }
-    }
-    ""
+fn batch_to_json_values(batch: &RecordBatch) -> Result<Vec<serde_json::Value>> {
+    let bytes = crate::output::to_json(batch)?;
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|err| Error::InvalidInput(format!("JSON output was not UTF-8: {err}")))?;
+    text.lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            serde_json::from_str(line)
+                .map_err(|err| Error::InvalidInput(format!("invalid JSON output row: {err}")))
+        })
+        .collect()
 }
 
 // ============================================================================
@@ -610,7 +516,6 @@ fn extract_metric_type(value: &Value) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::value::KeyString;
     use opentelemetry_proto::tonic::{
         collector::logs::v1::ExportLogsServiceRequest,
         collector::metrics::v1::ExportMetricsServiceRequest,
@@ -859,50 +764,6 @@ mod tests {
         }
     }
 
-    fn assert_batches_equivalent(left: &RecordBatch, right: &RecordBatch) {
-        assert_eq!(left.schema(), right.schema());
-        assert_eq!(left.num_rows(), right.num_rows());
-        assert_eq!(to_json(left).unwrap(), to_json(right).unwrap());
-    }
-
-    #[test]
-    fn test_default_protobuf_logs_matches_legacy_transform() {
-        let pb = include_bytes!("../testdata/logs_large.pb");
-        let default = transform_logs(pb, InputFormat::Protobuf).unwrap();
-        let legacy = transform_logs_legacy(pb, InputFormat::Protobuf).unwrap();
-        assert_batches_equivalent(&legacy, &default);
-    }
-
-    #[test]
-    fn test_default_protobuf_traces_matches_legacy_transform() {
-        let pb = include_bytes!("../testdata/traces_large.pb");
-        let default = transform_traces(pb, InputFormat::Protobuf).unwrap();
-        let legacy = transform_traces_legacy(pb, InputFormat::Protobuf).unwrap();
-        assert_batches_equivalent(&legacy, &default);
-    }
-
-    #[test]
-    fn test_default_protobuf_metrics_matches_legacy_transform() {
-        let pb = include_bytes!("../testdata/metrics_mixed.pb");
-        let default = transform_metrics(pb, InputFormat::Protobuf).unwrap();
-        let legacy = transform_metrics_legacy(pb, InputFormat::Protobuf).unwrap();
-
-        assert_eq!(legacy.skipped.summaries, default.skipped.summaries);
-        assert_eq!(legacy.skipped.nan_values, default.skipped.nan_values);
-        assert_eq!(
-            legacy.skipped.infinity_values,
-            default.skipped.infinity_values
-        );
-        assert_eq!(
-            legacy.skipped.missing_values,
-            default.skipped.missing_values
-        );
-
-        assert_batches_equivalent(&legacy.gauge.unwrap(), &default.gauge.unwrap());
-        assert_batches_equivalent(&legacy.sum.unwrap(), &default.sum.unwrap());
-        assert_batches_equivalent(&legacy.histogram.unwrap(), &default.histogram.unwrap());
-    }
-
     // ========================================================================
     // High-level API tests
     // ========================================================================
@@ -1078,83 +939,6 @@ mod tests {
     }
 
     // ========================================================================
-    // Internal JSON compatibility transform tests
-    // ========================================================================
-
-    #[test]
-    fn test_apply_log_transform() {
-        let request = create_test_log_request();
-        let bytes = request.encode_to_vec();
-        let decoded = decode_logs(&bytes, InputFormat::Protobuf).unwrap();
-
-        let transformed = apply_log_transform(decoded);
-
-        assert_eq!(transformed.len(), 1);
-
-        // Verify transformation was applied (should have output schema fields)
-        if let Value::Object(map) = &transformed[0] {
-            let ts_key: KeyString = "timestamp".into();
-            let svc_key: KeyString = "service_name".into();
-            assert!(map.get(&ts_key).is_some());
-            assert!(map.get(&svc_key).is_some());
-        } else {
-            panic!("Expected object value");
-        }
-    }
-
-    #[test]
-    fn test_apply_trace_transform() {
-        let request = create_test_trace_request();
-        let bytes = request.encode_to_vec();
-        let decoded = decode_traces(&bytes, InputFormat::Protobuf).unwrap();
-
-        let transformed = apply_trace_transform(decoded);
-
-        assert_eq!(transformed.len(), 1);
-
-        // Verify transformation was applied
-        if let Value::Object(map) = &transformed[0] {
-            let ts_key: KeyString = "timestamp".into();
-            let span_key: KeyString = "span_name".into();
-            assert!(map.get(&ts_key).is_some());
-            assert!(map.get(&span_key).is_some());
-        } else {
-            panic!("Expected object value");
-        }
-    }
-
-    #[test]
-    fn test_apply_metric_transform() {
-        let request = create_test_metrics_request();
-        let bytes = request.encode_to_vec();
-        let decode_result = decode_metrics(&bytes, InputFormat::Protobuf).unwrap();
-
-        let transformed = apply_metric_transform(decode_result.values);
-
-        assert_eq!(transformed.gauge.len(), 1);
-        assert_eq!(transformed.sum.len(), 1);
-    }
-
-    #[test]
-    fn test_apply_log_transform_empty() {
-        let transformed = apply_log_transform(vec![]);
-        assert!(transformed.is_empty());
-    }
-
-    #[test]
-    fn test_apply_trace_transform_empty() {
-        let transformed = apply_trace_transform(vec![]);
-        assert!(transformed.is_empty());
-    }
-
-    #[test]
-    fn test_apply_metric_transform_empty() {
-        let transformed = apply_metric_transform(vec![]);
-        assert!(transformed.gauge.is_empty());
-        assert!(transformed.sum.is_empty());
-    }
-
-    // ========================================================================
     // Error handling tests
     // ========================================================================
 
@@ -1197,22 +981,6 @@ mod tests {
         };
         let debug_str = format!("{batches:?}");
         assert!(debug_str.contains("MetricBatches"));
-    }
-
-    #[test]
-    fn test_metric_values_default() {
-        let values = MetricValues::default();
-        assert!(values.gauge.is_empty());
-        assert!(values.sum.is_empty());
-        assert!(values.histogram.is_empty());
-        assert!(values.exp_histogram.is_empty());
-    }
-
-    #[test]
-    fn test_metric_values_debug() {
-        let values = MetricValues::default();
-        let debug_str = format!("{values:?}");
-        assert!(debug_str.contains("MetricValues"));
     }
 
     // ========================================================================
