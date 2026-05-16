@@ -25,6 +25,7 @@ mod traces;
 use crate::value::Value;
 pub use common::{looks_like_json, DecodeError};
 pub use metrics::{DecodeMetricsResult, SkippedMetrics};
+#[allow(unused_imports)]
 pub use normalize::{
     count_skipped_metric_data_points, normalise_json_value, normalize_json_bytes, MetricSkipCounts,
 };

@@ -62,9 +62,9 @@ mod tests {
 
     #[test]
     fn test_value_to_json_float() {
-        let v = Value::Float(NotNan::new(3.14).unwrap());
+        let v = Value::Float(NotNan::new(1.25).unwrap());
         let result = value_to_json(&v);
-        assert_eq!(result, Some(serde_json::json!(3.14)));
+        assert_eq!(result, Some(serde_json::json!(1.25)));
     }
 
     #[test]

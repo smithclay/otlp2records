@@ -471,7 +471,7 @@ mod tests {
         let schema = Schema::new(vec![Field::new("value", DataType::Float64, false)]);
 
         let values = vec![
-            make_object(vec![("value", Value::Float(NotNan::new(3.14).unwrap()))]),
+            make_object(vec![("value", Value::Float(NotNan::new(1.25).unwrap()))]),
             make_object(vec![("value", Value::Float(NotNan::new(2.71).unwrap()))]),
         ];
 
@@ -482,7 +482,7 @@ mod tests {
             .as_any()
             .downcast_ref::<Float64Array>()
             .unwrap();
-        assert!((col.value(0) - 3.14).abs() < 0.001);
+        assert!((col.value(0) - 1.25).abs() < 0.001);
         assert!((col.value(1) - 2.71).abs() < 0.001);
     }
 

@@ -138,6 +138,7 @@ pub fn to_parquet(batch: &RecordBatch) -> Result<Vec<u8>, Error> {
 ///
 /// * `Ok(Bytes)` - The Parquet file as Bytes
 /// * `Err(Error)` - If serialization fails
+#[allow(dead_code)]
 pub fn to_parquet_bytes(batch: &RecordBatch) -> Result<Bytes, Error> {
     let vec = to_parquet(batch)?;
     Ok(Bytes::from(vec))

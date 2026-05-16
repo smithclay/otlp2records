@@ -33,31 +33,15 @@
 //! }
 //! ```
 //!
-//! # Lower-level API
-//!
-//! For more control over individual transformation steps:
-//!
-//! ```ignore
-//! use otlp2records::{decode_logs, apply_log_transform, values_to_arrow, logs_schema, InputFormat};
-//!
-//! // Step 1: Decode OTLP bytes to record values
-//! let values = decode_logs(bytes, InputFormat::Protobuf)?;
-//!
-//! // Step 2: Apply the built-in transformation
-//! let transformed = apply_log_transform(values);
-//!
-//! // Step 3: Convert to Arrow RecordBatch
-//! let batch = values_to_arrow(&transformed, &logs_schema())?;
-//! ```
-
-pub mod arrow;
-pub mod convert;
-pub mod decode;
-pub mod error;
-pub mod output;
-pub mod schemas;
-pub mod transform;
-pub mod value;
+mod arrow;
+mod convert;
+mod decode;
+mod error;
+mod fast;
+mod output;
+mod schemas;
+mod transform;
+mod value;
 
 #[cfg(all(feature = "wasm", target_arch = "wasm32"))]
 pub mod wasm;
@@ -67,22 +51,20 @@ pub mod ffi;
 
 use ::arrow_array::RecordBatch;
 
+use arrow::values_to_arrow;
 pub use arrow::{
     exp_histogram_schema, extract_min_timestamp_micros, extract_service_name, gauge_schema,
     group_batch_by_service, histogram_schema, logs_schema, sum_schema, traces_schema,
-    values_to_arrow, PartitionedBatch, PartitionedMetrics, ServiceGroupedBatches,
+    PartitionedBatch, PartitionedMetrics, ServiceGroupedBatches,
 };
-pub use decode::{
-    count_skipped_metric_data_points, decode_logs, decode_metrics, decode_traces,
-    normalise_json_value, normalize_json_bytes, DecodeMetricsResult, InputFormat, MetricSkipCounts,
-    SkippedMetrics,
-};
+use decode::{decode_logs, decode_metrics, decode_traces, looks_like_json};
+pub use decode::{DecodeError, InputFormat, SkippedMetrics};
 pub use error::{Error, Result};
 #[cfg(feature = "parquet")]
 pub use output::to_parquet;
 pub use output::{to_ipc, to_json};
 pub use schemas::{schema_def, schema_defs, FieldType, SchemaDef, SchemaField};
-pub use value::{KeyString, ObjectMap, Value};
+use value::Value;
 
 // ============================================================================
 // High-level API types
@@ -125,20 +107,12 @@ pub struct JsonMetricBatches {
     pub skipped: SkippedMetrics,
 }
 
-/// Result of applying the built-in transformation to metrics.
-///
-/// Metrics are partitioned by type because each metric type has a different
-/// output schema.
 #[derive(Debug, Default)]
-pub struct MetricValues {
-    /// Transformed gauge metric values
-    pub gauge: Vec<Value>,
-    /// Transformed sum metric values
-    pub sum: Vec<Value>,
-    /// Transformed histogram metric values
-    pub histogram: Vec<Value>,
-    /// Transformed exponential histogram metric values
-    pub exp_histogram: Vec<Value>,
+struct MetricValues {
+    gauge: Vec<Value>,
+    sum: Vec<Value>,
+    histogram: Vec<Value>,
+    exp_histogram: Vec<Value>,
 }
 
 // ============================================================================
@@ -168,16 +142,42 @@ pub struct MetricValues {
 /// println!("Transformed {} log records", batch.num_rows());
 /// ```
 pub fn transform_logs(bytes: &[u8], format: InputFormat) -> Result<RecordBatch> {
-    // Step 1: Decode OTLP logs
+    match format {
+        InputFormat::Protobuf => fast::transform_logs_protobuf(bytes),
+        InputFormat::Auto => transform_logs_auto(bytes),
+        InputFormat::Json | InputFormat::Jsonl => transform_logs_legacy(bytes, format),
+    }
+}
+
+fn transform_logs_legacy(bytes: &[u8], format: InputFormat) -> Result<RecordBatch> {
     let values = decode_logs(bytes, format)?;
-
-    // Step 2: Apply transformation
     let transformed = apply_log_transform(values);
+    Ok(values_to_arrow(&transformed, &logs_schema())?)
+}
 
-    // Step 3: Convert to Arrow
-    let batch = values_to_arrow(&transformed, &logs_schema())?;
-
-    Ok(batch)
+fn transform_logs_auto(bytes: &[u8]) -> Result<RecordBatch> {
+    if looks_like_json(bytes) {
+        match transform_logs_legacy(bytes, InputFormat::Json) {
+            Ok(batch) => Ok(batch),
+            Err(json_err) => match transform_logs_legacy(bytes, InputFormat::Jsonl) {
+                Ok(batch) => Ok(batch),
+                Err(_) => fast::transform_logs_protobuf(bytes).map_err(|proto_err| {
+                    Error::Decode(DecodeError::Unsupported(format!(
+                        "json decode failed: {json_err}; protobuf fallback failed: {proto_err}"
+                    )))
+                }),
+            },
+        }
+    } else {
+        match fast::transform_logs_protobuf(bytes) {
+            Ok(batch) => Ok(batch),
+            Err(proto_err) => transform_logs_legacy(bytes, InputFormat::Json).map_err(|json_err| {
+                Error::Decode(DecodeError::Unsupported(format!(
+                    "protobuf decode failed: {proto_err}; json fallback failed: {json_err}"
+                )))
+            }),
+        }
+    }
 }
 
 /// Transform OTLP logs to JSON values.
@@ -210,16 +210,44 @@ pub fn transform_logs_json(bytes: &[u8], format: InputFormat) -> Result<Vec<serd
 /// println!("Transformed {} spans", batch.num_rows());
 /// ```
 pub fn transform_traces(bytes: &[u8], format: InputFormat) -> Result<RecordBatch> {
-    // Step 1: Decode OTLP traces
+    match format {
+        InputFormat::Protobuf => fast::transform_traces_protobuf(bytes),
+        InputFormat::Auto => transform_traces_auto(bytes),
+        InputFormat::Json | InputFormat::Jsonl => transform_traces_legacy(bytes, format),
+    }
+}
+
+fn transform_traces_legacy(bytes: &[u8], format: InputFormat) -> Result<RecordBatch> {
     let values = decode_traces(bytes, format)?;
-
-    // Step 2: Apply transformation
     let transformed = apply_trace_transform(values);
+    Ok(values_to_arrow(&transformed, &traces_schema())?)
+}
 
-    // Step 3: Convert to Arrow
-    let batch = values_to_arrow(&transformed, &traces_schema())?;
-
-    Ok(batch)
+fn transform_traces_auto(bytes: &[u8]) -> Result<RecordBatch> {
+    if looks_like_json(bytes) {
+        match transform_traces_legacy(bytes, InputFormat::Json) {
+            Ok(batch) => Ok(batch),
+            Err(json_err) => match transform_traces_legacy(bytes, InputFormat::Jsonl) {
+                Ok(batch) => Ok(batch),
+                Err(_) => fast::transform_traces_protobuf(bytes).map_err(|proto_err| {
+                    Error::Decode(DecodeError::Unsupported(format!(
+                        "json decode failed: {json_err}; protobuf fallback failed: {proto_err}"
+                    )))
+                }),
+            },
+        }
+    } else {
+        match fast::transform_traces_protobuf(bytes) {
+            Ok(batch) => Ok(batch),
+            Err(proto_err) => {
+                transform_traces_legacy(bytes, InputFormat::Json).map_err(|json_err| {
+                    Error::Decode(DecodeError::Unsupported(format!(
+                        "protobuf decode failed: {proto_err}; json fallback failed: {json_err}"
+                    )))
+                })
+            }
+        }
+    }
 }
 
 /// Transform OTLP traces to JSON values.
@@ -260,13 +288,16 @@ pub fn transform_traces_json(bytes: &[u8], format: InputFormat) -> Result<Vec<se
 /// }
 /// ```
 pub fn transform_metrics(bytes: &[u8], format: InputFormat) -> Result<MetricBatches> {
-    // Step 1: Decode OTLP metrics
+    match format {
+        InputFormat::Protobuf => fast::transform_metrics_protobuf(bytes),
+        InputFormat::Auto => transform_metrics_auto(bytes),
+        InputFormat::Json | InputFormat::Jsonl => transform_metrics_legacy(bytes, format),
+    }
+}
+
+fn transform_metrics_legacy(bytes: &[u8], format: InputFormat) -> Result<MetricBatches> {
     let decode_result = decode_metrics(bytes, format)?;
-
-    // Step 2: Apply transformation (partitions by metric type)
     let metric_values = apply_metric_transform(decode_result.values);
-
-    // Step 3: Convert each partition to Arrow (if non-empty)
     let gauge = if metric_values.gauge.is_empty() {
         None
     } else {
@@ -304,6 +335,33 @@ pub fn transform_metrics(bytes: &[u8], format: InputFormat) -> Result<MetricBatc
         exp_histogram,
         skipped: decode_result.skipped,
     })
+}
+
+fn transform_metrics_auto(bytes: &[u8]) -> Result<MetricBatches> {
+    if looks_like_json(bytes) {
+        match transform_metrics_legacy(bytes, InputFormat::Json) {
+            Ok(batches) => Ok(batches),
+            Err(json_err) => match transform_metrics_legacy(bytes, InputFormat::Jsonl) {
+                Ok(batches) => Ok(batches),
+                Err(_) => fast::transform_metrics_protobuf(bytes).map_err(|proto_err| {
+                    Error::Decode(DecodeError::Unsupported(format!(
+                        "json decode failed: {json_err}; protobuf fallback failed: {proto_err}"
+                    )))
+                }),
+            },
+        }
+    } else {
+        match fast::transform_metrics_protobuf(bytes) {
+            Ok(batches) => Ok(batches),
+            Err(proto_err) => {
+                transform_metrics_legacy(bytes, InputFormat::Json).map_err(|json_err| {
+                    Error::Decode(DecodeError::Unsupported(format!(
+                        "protobuf decode failed: {proto_err}; json fallback failed: {json_err}"
+                    )))
+                })
+            }
+        }
+    }
 }
 
 /// Transform OTLP metrics to JSON values.
@@ -458,93 +516,15 @@ pub fn transform_metrics_partitioned(
     })
 }
 
-// ============================================================================
-// Lower-level API functions
-// ============================================================================
-
-/// Apply the built-in transformation to decoded log values.
-///
-/// This function provides finer-grained control over the transformation process.
-/// Use this when you need to inspect or modify values between steps, or when
-/// you want to handle the Arrow conversion separately.
-///
-/// # Arguments
-///
-/// * `values` - Decoded OTLP log values (from `decode_logs`)
-///
-/// # Returns
-///
-/// A vector of transformed values ready for Arrow conversion.
-///
-/// # Example
-///
-/// ```ignore
-/// use otlp2records::{decode_logs, apply_log_transform, values_to_arrow, logs_schema, InputFormat};
-///
-/// let decoded = decode_logs(bytes, InputFormat::Protobuf)?;
-/// let transformed = apply_log_transform(decoded);
-/// let batch = values_to_arrow(&transformed, &logs_schema())?;
-/// ```
-pub fn apply_log_transform(values: Vec<Value>) -> Vec<Value> {
+fn apply_log_transform(values: Vec<Value>) -> Vec<Value> {
     values.into_iter().map(transform::transform_log).collect()
 }
 
-/// Apply the built-in transformation to decoded trace values.
-///
-/// This function provides finer-grained control over the transformation process.
-/// Use this when you need to inspect or modify values between steps, or when
-/// you want to handle the Arrow conversion separately.
-///
-/// # Arguments
-///
-/// * `values` - Decoded OTLP trace values (from `decode_traces`)
-///
-/// # Returns
-///
-/// A vector of transformed values ready for Arrow conversion.
-///
-/// # Example
-///
-/// ```ignore
-/// use otlp2records::{decode_traces, apply_trace_transform, values_to_arrow, traces_schema, InputFormat};
-///
-/// let decoded = decode_traces(bytes, InputFormat::Protobuf)?;
-/// let transformed = apply_trace_transform(decoded);
-/// let batch = values_to_arrow(&transformed, &traces_schema())?;
-/// ```
-pub fn apply_trace_transform(values: Vec<Value>) -> Vec<Value> {
+fn apply_trace_transform(values: Vec<Value>) -> Vec<Value> {
     values.into_iter().map(transform::transform_trace).collect()
 }
 
-/// Apply the built-in transformation to decoded metric values.
-///
-/// This function partitions metrics by type (gauge vs sum) and applies the
-/// appropriate transformation to each partition.
-///
-/// # Arguments
-///
-/// * `values` - Decoded OTLP metric values (from `decode_metrics`)
-///
-/// # Returns
-///
-/// A `MetricValues` struct containing transformed gauge and sum values.
-///
-/// # Example
-///
-/// ```ignore
-/// use otlp2records::{decode_metrics, apply_metric_transform, values_to_arrow, gauge_schema, sum_schema, InputFormat};
-///
-/// let decoded = decode_metrics(bytes, InputFormat::Protobuf)?;
-/// let transformed = apply_metric_transform(decoded);
-///
-/// if !transformed.gauge.is_empty() {
-///     let batch = values_to_arrow(&transformed.gauge, &gauge_schema())?;
-/// }
-/// if !transformed.sum.is_empty() {
-///     let batch = values_to_arrow(&transformed.sum, &sum_schema())?;
-/// }
-/// ```
-pub fn apply_metric_transform(values: Vec<Value>) -> MetricValues {
+fn apply_metric_transform(values: Vec<Value>) -> MetricValues {
     let mut gauge_count = 0;
     let mut sum_count = 0;
     let mut histogram_count = 0;
@@ -630,6 +610,7 @@ fn extract_metric_type(value: &Value) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::value::KeyString;
     use opentelemetry_proto::tonic::{
         collector::logs::v1::ExportLogsServiceRequest,
         collector::metrics::v1::ExportMetricsServiceRequest,
@@ -878,6 +859,50 @@ mod tests {
         }
     }
 
+    fn assert_batches_equivalent(left: &RecordBatch, right: &RecordBatch) {
+        assert_eq!(left.schema(), right.schema());
+        assert_eq!(left.num_rows(), right.num_rows());
+        assert_eq!(to_json(left).unwrap(), to_json(right).unwrap());
+    }
+
+    #[test]
+    fn test_default_protobuf_logs_matches_legacy_transform() {
+        let pb = include_bytes!("../testdata/logs_large.pb");
+        let default = transform_logs(pb, InputFormat::Protobuf).unwrap();
+        let legacy = transform_logs_legacy(pb, InputFormat::Protobuf).unwrap();
+        assert_batches_equivalent(&legacy, &default);
+    }
+
+    #[test]
+    fn test_default_protobuf_traces_matches_legacy_transform() {
+        let pb = include_bytes!("../testdata/traces_large.pb");
+        let default = transform_traces(pb, InputFormat::Protobuf).unwrap();
+        let legacy = transform_traces_legacy(pb, InputFormat::Protobuf).unwrap();
+        assert_batches_equivalent(&legacy, &default);
+    }
+
+    #[test]
+    fn test_default_protobuf_metrics_matches_legacy_transform() {
+        let pb = include_bytes!("../testdata/metrics_mixed.pb");
+        let default = transform_metrics(pb, InputFormat::Protobuf).unwrap();
+        let legacy = transform_metrics_legacy(pb, InputFormat::Protobuf).unwrap();
+
+        assert_eq!(legacy.skipped.summaries, default.skipped.summaries);
+        assert_eq!(legacy.skipped.nan_values, default.skipped.nan_values);
+        assert_eq!(
+            legacy.skipped.infinity_values,
+            default.skipped.infinity_values
+        );
+        assert_eq!(
+            legacy.skipped.missing_values,
+            default.skipped.missing_values
+        );
+
+        assert_batches_equivalent(&legacy.gauge.unwrap(), &default.gauge.unwrap());
+        assert_batches_equivalent(&legacy.sum.unwrap(), &default.sum.unwrap());
+        assert_batches_equivalent(&legacy.histogram.unwrap(), &default.histogram.unwrap());
+    }
+
     // ========================================================================
     // High-level API tests
     // ========================================================================
@@ -1053,7 +1078,7 @@ mod tests {
     }
 
     // ========================================================================
-    // Lower-level API tests
+    // Internal JSON compatibility transform tests
     // ========================================================================
 
     #[test]

@@ -65,7 +65,7 @@ cpp_compat = true
 include_guard = "OTLP2RECORDS_FFI_H"
 
 [profile.release]
-opt-level = "z"
+opt-level = 3
 lto = true
 codegen-units = 1
 strip = true

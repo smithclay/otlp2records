@@ -20,8 +20,8 @@ Currently consumed by [duckdb-otlp](https://github.com/smithclay/duckdb-otlp), [
 - Transform OTLP logs, traces, and metrics to Arrow RecordBatches
 - Support for both Protobuf and JSON input formats
 - Output to NDJSON, Arrow IPC, or Parquet
-- Built-in Rust transformations
-- Efficient memory usage with Arc-shared resource/scope values
+- Direct protobuf-to-Arrow hot path for high-throughput ingestion
+- JSON/JSONL compatibility path for OTLP JSON payloads
 
 ## Installation
 
@@ -82,25 +82,6 @@ let ipc: Vec<u8> = to_ipc(&batch)?;
 // Output as Parquet (requires "parquet" feature)
 #[cfg(feature = "parquet")]
 let parquet: Vec<u8> = otlp2records::to_parquet(&batch)?;
-```
-
-#### Lower-level API
-
-For more control over the transformation pipeline:
-
-```rust
-use otlp2records::{
-    decode_logs, apply_log_transform, values_to_arrow, logs_schema, InputFormat
-};
-
-// Step 1: Decode OTLP bytes to record values
-let values = decode_logs(bytes, InputFormat::Protobuf)?;
-
-// Step 2: Apply the built-in transformation
-let transformed = apply_log_transform(values)?;
-
-// Step 3: Convert to Arrow RecordBatch
-let batch = values_to_arrow(&transformed, &logs_schema())?;
 ```
 
 ### WASM Usage
@@ -166,20 +147,23 @@ const arrowIpc = transform_logs_wasm(otlpBytes, "protobuf");
                                         |
                                         v
                               +---------+---------+
-                              |      Decode       |
-                              | (prost / serde)   |
+                              |   Format Dispatch |
+                              | (protobuf/jsonl)  |
                               +---------+---------+
+                                        |
+                    +-------------------+-------------------+
+                    |                                       |
+                    v                                       v
+          +---------+---------+                   +---------+---------+
+          | Protobuf Builders |                   | JSON Compat Path  |
+          | (direct to Arrow) |                   | (serde + transform)|
+          +---------+---------+                   +---------+---------+
+                    |                                       |
+                    +-------------------+-------------------+
                                         |
                                         v
                               +---------+---------+
-                              | Rust Transform    |
-                              | (field mapping)   |
-                              +---------+---------+
-                                        |
-                                        v
-                              +---------+---------+
-                              |   Arrow Builder   |
-                              | (RecordBatch)     |
+                              |   RecordBatch     |
                               +---------+---------+
                                         |
                   +---------------------+---------------------+
@@ -190,12 +174,12 @@ const arrowIpc = transform_logs_wasm(otlpBytes, "protobuf");
           +---------------+     +---------------+     +---------------+
 ```
 
-### Module Structure
+### Public Surface
 
-- **decode**: Parse OTLP protobuf/JSON into record values
-- **transform**: Apply Rust projections to normalize data
-- **arrow**: Convert record values to Arrow RecordBatches
-- **output**: Serialize RecordBatches to various formats
+- **transform functions**: Convert OTLP logs, traces, and metrics to Arrow batches
+- **schema functions**: Return the Arrow schemas used by the transform functions
+- **partition helpers**: Group transformed batches by service
+- **output helpers**: Serialize RecordBatches to NDJSON, Arrow IPC, or Parquet
 - **wasm**: WASM bindings (optional)
 
 ## Output Schemas

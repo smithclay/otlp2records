@@ -6,6 +6,7 @@ use arrow_array::{Array, TimestampMicrosecondArray};
 use otlp2records::{
     to_ipc, to_json, transform_logs, transform_metrics, transform_traces, InputFormat,
 };
+use prost::Message;
 
 // ============================================================================
 // Logs Integration Tests
@@ -49,6 +50,106 @@ fn test_logs_to_ipc() {
     assert!(ipc.len() > 6, "IPC output too short");
 }
 
+#[test]
+fn test_logs_default_protobuf_large_fixture() {
+    let pb = include_bytes!("../testdata/logs_large.pb");
+    let batch = transform_logs(pb, InputFormat::Protobuf).unwrap();
+    assert_eq!(batch.num_rows(), 3495);
+}
+
+#[test]
+fn test_logs_default_protobuf_hand_built_payload() {
+    use opentelemetry_proto::tonic::{
+        collector::logs::v1::ExportLogsServiceRequest,
+        common::v1::{any_value, AnyValue, InstrumentationScope, KeyValue},
+        logs::v1::{LogRecord, ResourceLogs, ScopeLogs},
+        resource::v1::Resource,
+    };
+
+    let request = ExportLogsServiceRequest {
+        resource_logs: vec![ResourceLogs {
+            resource: Some(Resource {
+                attributes: vec![
+                    KeyValue {
+                        key: "service.name".to_string(),
+                        value: Some(AnyValue {
+                            value: Some(any_value::Value::StringValue("checkout".to_string())),
+                        }),
+                    },
+                    KeyValue {
+                        key: "service.namespace".to_string(),
+                        value: Some(AnyValue {
+                            value: Some(any_value::Value::StringValue("shop".to_string())),
+                        }),
+                    },
+                    KeyValue {
+                        key: "deployment.environment".to_string(),
+                        value: Some(AnyValue {
+                            value: Some(any_value::Value::StringValue("test".to_string())),
+                        }),
+                    },
+                ],
+                ..Default::default()
+            }),
+            scope_logs: vec![ScopeLogs {
+                scope: Some(InstrumentationScope {
+                    name: "lib".to_string(),
+                    version: "1.2.3".to_string(),
+                    attributes: vec![KeyValue {
+                        key: "scope.key".to_string(),
+                        value: Some(AnyValue {
+                            value: Some(any_value::Value::BoolValue(true)),
+                        }),
+                    }],
+                    ..Default::default()
+                }),
+                log_records: vec![
+                    LogRecord {
+                        time_unix_nano: 1_700_000_000_000_000_000,
+                        observed_time_unix_nano: 1_700_000_000_100_000_000,
+                        severity_number: 9,
+                        severity_text: "INFO".to_string(),
+                        body: Some(AnyValue {
+                            value: Some(any_value::Value::StringValue("hello".to_string())),
+                        }),
+                        trace_id: (0u8..16).collect(),
+                        span_id: (0u8..8).collect(),
+                        attributes: vec![KeyValue {
+                            key: "http.method".to_string(),
+                            value: Some(AnyValue {
+                                value: Some(any_value::Value::StringValue("GET".to_string())),
+                            }),
+                        }],
+                        ..Default::default()
+                    },
+                    LogRecord {
+                        time_unix_nano: 1_700_000_001_000_000_000,
+                        body: Some(AnyValue {
+                            value: Some(any_value::Value::KvlistValue(
+                                opentelemetry_proto::tonic::common::v1::KeyValueList {
+                                    values: vec![KeyValue {
+                                        key: "nested".to_string(),
+                                        value: Some(AnyValue {
+                                            value: Some(any_value::Value::IntValue(42)),
+                                        }),
+                                    }],
+                                },
+                            )),
+                        }),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+    };
+
+    let pb = request.encode_to_vec();
+    let batch = transform_logs(&pb, InputFormat::Protobuf).unwrap();
+    assert_eq!(batch.num_rows(), 2);
+}
+
 // ============================================================================
 // Traces Integration Tests
 // ============================================================================
@@ -87,6 +188,13 @@ fn test_traces_to_ipc() {
 
     let ipc = to_ipc(&batch).unwrap();
     assert!(!ipc.is_empty(), "Expected non-empty IPC output");
+}
+
+#[test]
+fn test_traces_default_protobuf_large_fixture() {
+    let pb = include_bytes!("../testdata/traces_large.pb");
+    let batch = transform_traces(pb, InputFormat::Protobuf).unwrap();
+    assert_eq!(batch.num_rows(), 2621);
 }
 
 // ============================================================================
@@ -207,6 +315,29 @@ fn test_full_pipeline_metrics_mixed_protobuf() {
         let ndjson = to_json(sum).unwrap();
         assert!(!ndjson.is_empty());
     }
+}
+
+#[test]
+fn test_metrics_default_protobuf_mixed_fixture() {
+    let pb = include_bytes!("../testdata/metrics_mixed.pb");
+    let batches = transform_metrics(pb, InputFormat::Protobuf).unwrap();
+    assert!(batches.gauge.is_some());
+    assert!(batches.sum.is_some());
+    assert!(batches.histogram.is_some());
+}
+
+#[test]
+fn test_metrics_default_protobuf_histogram_fixture() {
+    let pb = include_bytes!("../testdata/metrics_histogram.pb");
+    let batches = transform_metrics(pb, InputFormat::Protobuf).unwrap();
+    assert_eq!(batches.histogram.unwrap().num_rows(), 3);
+}
+
+#[test]
+fn test_metrics_default_protobuf_exponential_histogram_fixture() {
+    let pb = include_bytes!("../testdata/metrics_exponential_histogram.pb");
+    let batches = transform_metrics(pb, InputFormat::Protobuf).unwrap();
+    assert_eq!(batches.exp_histogram.unwrap().num_rows(), 2);
 }
 
 // ============================================================================
