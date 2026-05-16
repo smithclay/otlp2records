@@ -3,13 +3,14 @@
 //! Converts record values to Arrow RecordBatches using schema-driven building.
 
 use crate::value::Value;
-use arrow::array::{
-    ArrayRef, BooleanBuilder, Float64Builder, Int32Builder, Int64Builder, StringBuilder,
-    TimestampMicrosecondBuilder,
+use arrow_array::{
+    builder::{
+        BooleanBuilder, Float64Builder, Int32Builder, Int64Builder, StringBuilder,
+        TimestampMicrosecondBuilder,
+    },
+    ArrayRef, RecordBatch,
 };
-use arrow::datatypes::{DataType, Schema, TimeUnit};
-use arrow::error::ArrowError;
-use arrow::record_batch::RecordBatch;
+use arrow_schema::{ArrowError, DataType, Schema, TimeUnit};
 use std::sync::Arc;
 
 /// Converts a slice of record values to an Arrow RecordBatch.
@@ -36,7 +37,7 @@ use std::sync::Arc;
 ///
 /// ```ignore
 /// use otlp2records::{ObjectMap, Value};
-/// use arrow::datatypes::{Schema, Field, DataType};
+/// use arrow_schema::{Schema, Field, DataType};
 ///
 /// let schema = Schema::new(vec![
 ///     Field::new("name", DataType::Utf8, false),
@@ -378,11 +379,11 @@ fn value_type_name(value: &Value) -> &'static str {
 mod tests {
     use super::*;
     use crate::value::ObjectMap;
-    use arrow::array::{
+    use arrow_array::{
         Array, BooleanArray, Float64Array, Int32Array, Int64Array, StringArray,
         TimestampMicrosecondArray,
     };
-    use arrow::datatypes::{Field, TimeUnit};
+    use arrow_schema::{Field, TimeUnit};
     use bytes::Bytes;
     use ordered_float::NotNan;
 

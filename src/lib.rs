@@ -65,7 +65,7 @@ pub mod wasm;
 #[cfg(feature = "ffi")]
 pub mod ffi;
 
-use ::arrow::record_batch::RecordBatch;
+use ::arrow_array::RecordBatch;
 
 pub use arrow::{
     exp_histogram_schema, extract_min_timestamp_micros, extract_service_name, gauge_schema,
@@ -1285,7 +1285,7 @@ mod tests {
         let ts_column = batch
             .column(ts_idx)
             .as_any()
-            .downcast_ref::<::arrow::array::TimestampMicrosecondArray>()
+            .downcast_ref::<::arrow_array::TimestampMicrosecondArray>()
             .expect("timestamp should be TimestampMicrosecondArray");
 
         let ts_value = ts_column.value(0);
@@ -1345,7 +1345,7 @@ mod tests {
         let ts_column = batch
             .column(ts_idx)
             .as_any()
-            .downcast_ref::<::arrow::array::TimestampMicrosecondArray>()
+            .downcast_ref::<::arrow_array::TimestampMicrosecondArray>()
             .expect("timestamp should be TimestampMicrosecondArray");
 
         let ts_value = ts_column.value(0);
@@ -1409,7 +1409,7 @@ mod tests {
         let ts_column = gauge
             .column(ts_idx)
             .as_any()
-            .downcast_ref::<::arrow::array::TimestampMicrosecondArray>()
+            .downcast_ref::<::arrow_array::TimestampMicrosecondArray>()
             .expect("timestamp should be TimestampMicrosecondArray");
 
         let ts_value = ts_column.value(0);

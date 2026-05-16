@@ -3,8 +3,8 @@
 //! Serializes Arrow RecordBatches to newline-delimited JSON (NDJSON).
 //! Each row becomes a JSON object with field names from the schema.
 
-use arrow::array::RecordBatch;
-use arrow::json::LineDelimitedWriter;
+use arrow_array::RecordBatch;
+use arrow_json::LineDelimitedWriter;
 
 use crate::error::Error;
 
@@ -25,7 +25,7 @@ use crate::error::Error;
 /// # Example
 ///
 /// ```ignore
-/// use arrow::array::RecordBatch;
+/// use arrow_array::RecordBatch;
 /// use otlp2records::output::to_json;
 ///
 /// let batch: RecordBatch = /* create batch */;
@@ -47,8 +47,8 @@ pub fn to_json(batch: &RecordBatch) -> Result<Vec<u8>, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{Int64Array, StringArray};
-    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow_array::{Int64Array, StringArray};
+    use arrow_schema::{DataType, Field, Schema};
     use std::sync::Arc;
 
     fn create_test_batch() -> RecordBatch {

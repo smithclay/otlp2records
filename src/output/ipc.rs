@@ -3,8 +3,8 @@
 //! Serializes Arrow RecordBatches to IPC streaming format.
 //! This format is useful for cross-language interoperability (Python, JavaScript, etc.)
 
-use arrow::array::RecordBatch;
-use arrow::ipc::writer::StreamWriter;
+use arrow_array::RecordBatch;
+use arrow_ipc::writer::StreamWriter;
 
 use crate::error::Error;
 
@@ -27,7 +27,7 @@ use crate::error::Error;
 /// # Example
 ///
 /// ```ignore
-/// use arrow::array::RecordBatch;
+/// use arrow_array::RecordBatch;
 /// use otlp2records::output::to_ipc;
 ///
 /// let batch: RecordBatch = /* create batch */;
@@ -47,9 +47,9 @@ pub fn to_ipc(batch: &RecordBatch) -> Result<Vec<u8>, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{Array, Int64Array, StringArray};
-    use arrow::datatypes::{DataType, Field, Schema};
-    use arrow::ipc::reader::StreamReader;
+    use arrow_array::{Array, Int64Array, StringArray};
+    use arrow_ipc::reader::StreamReader;
+    use arrow_schema::{DataType, Field, Schema};
     use std::io::Cursor;
     use std::sync::Arc;
 

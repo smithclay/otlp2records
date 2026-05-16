@@ -19,7 +19,7 @@ pub enum Error {
 
     /// Error during Arrow operations
     #[error("arrow error: {0}")]
-    Arrow(#[from] arrow::error::ArrowError),
+    Arrow(#[from] arrow_schema::ArrowError),
 
     /// Error during JSON serialization/deserialization
     #[error("JSON error: {0}")]

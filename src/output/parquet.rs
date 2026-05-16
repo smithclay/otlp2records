@@ -7,8 +7,8 @@ use std::collections::HashMap;
 use std::io::{Cursor, Write};
 use std::sync::Arc;
 
-use arrow::array::RecordBatch;
-use arrow::datatypes::{Field, Schema};
+use arrow_array::RecordBatch;
+use arrow_schema::{ArrowError, Field, Schema};
 use bytes::Bytes;
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
@@ -55,7 +55,7 @@ fn add_field_ids_to_schema(schema: &Schema) -> Schema {
 /// # Example
 ///
 /// ```ignore
-/// use arrow::array::RecordBatch;
+/// use arrow_array::RecordBatch;
 /// use otlp2records::output::write_parquet;
 /// use std::fs::File;
 ///
@@ -80,15 +80,15 @@ pub fn write_parquet<W: Write + Send>(
         .map_err(Error::Arrow)?;
 
     let mut arrow_writer = ArrowWriter::try_new(writer, schema_with_ids, Some(props))
-        .map_err(|e| Error::Arrow(arrow::error::ArrowError::ExternalError(Box::new(e))))?;
+        .map_err(|e| Error::Arrow(ArrowError::ExternalError(Box::new(e))))?;
 
     arrow_writer
         .write(&batch_with_ids)
-        .map_err(|e| Error::Arrow(arrow::error::ArrowError::ExternalError(Box::new(e))))?;
+        .map_err(|e| Error::Arrow(ArrowError::ExternalError(Box::new(e))))?;
 
     arrow_writer
         .close()
-        .map_err(|e| Error::Arrow(arrow::error::ArrowError::ExternalError(Box::new(e))))?;
+        .map_err(|e| Error::Arrow(ArrowError::ExternalError(Box::new(e))))?;
 
     Ok(())
 }
@@ -113,7 +113,7 @@ pub fn write_parquet<W: Write + Send>(
 /// # Example
 ///
 /// ```ignore
-/// use arrow::array::RecordBatch;
+/// use arrow_array::RecordBatch;
 /// use otlp2records::output::to_parquet;
 ///
 /// let batch: RecordBatch = /* create batch */;
@@ -146,8 +146,8 @@ pub fn to_parquet_bytes(batch: &RecordBatch) -> Result<Bytes, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{Array, Int64Array, StringArray};
-    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow_array::{Array, Int64Array, StringArray};
+    use arrow_schema::{DataType, Field, Schema};
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use std::sync::Arc;
 
