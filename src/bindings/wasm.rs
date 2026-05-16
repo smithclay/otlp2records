@@ -32,10 +32,9 @@
 
 use wasm_bindgen::prelude::*;
 
-use crate::arrow::{gauge_schema, sum_schema};
 use crate::decode::InputFormat;
 use crate::output::to_ipc;
-use crate::{transform_logs, transform_metrics, transform_traces};
+use crate::{gauge_schema, sum_schema, transform_logs, transform_metrics, transform_traces};
 
 /// Parse format string to InputFormat enum.
 ///

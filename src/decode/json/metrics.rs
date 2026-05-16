@@ -1,33 +1,5 @@
 //! OTLP metric JSON decoding into protobuf request structs.
 
-/// Tracks metrics that were skipped during transformation.
-#[derive(Debug, Default, Clone)]
-pub struct SkippedMetrics {
-    /// Count of summary metrics skipped (deprecated in OTLP spec).
-    pub summaries: usize,
-    /// Count of data points skipped due to NaN values.
-    pub nan_values: usize,
-    /// Count of data points skipped due to Infinity values.
-    pub infinity_values: usize,
-    /// Count of data points skipped due to missing values.
-    pub missing_values: usize,
-}
-
-impl SkippedMetrics {
-    /// Returns true if any metrics were skipped.
-    pub fn has_skipped(&self) -> bool {
-        self.summaries > 0
-            || self.nan_values > 0
-            || self.infinity_values > 0
-            || self.missing_values > 0
-    }
-
-    /// Returns total count of skipped items.
-    pub fn total(&self) -> usize {
-        self.summaries + self.nan_values + self.infinity_values + self.missing_values
-    }
-}
-
 use opentelemetry_proto::tonic::{
     collector::metrics::v1::ExportMetricsServiceRequest,
     metrics::v1::{

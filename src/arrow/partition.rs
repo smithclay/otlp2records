@@ -11,7 +11,7 @@ use arrow_array::{ArrayRef, RecordBatch};
 use arrow_select::take::take;
 use indexmap::IndexMap;
 
-use crate::decode::SkippedMetrics;
+use crate::api::SkippedMetrics;
 
 /// A RecordBatch with partition metadata for storage routing.
 ///
