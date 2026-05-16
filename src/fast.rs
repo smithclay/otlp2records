@@ -1,6 +1,6 @@
 //! Direct protobuf-to-Arrow hot paths.
 
-use std::{io, sync::Arc};
+use std::{fmt, io, sync::Arc};
 
 use arrow_array::{
     builder::{
@@ -344,6 +344,7 @@ struct LogBuilders {
     scope_version: StringBuilder,
     scope_attributes: StringBuilder,
     log_attributes: StringBuilder,
+    json_scratch: String,
 }
 
 impl LogBuilders {
@@ -364,6 +365,7 @@ impl LogBuilders {
             scope_version: string_builder_bytes(rows, rows.saturating_mul(8)),
             scope_attributes: string_builder_bytes(rows, input_bytes / 4),
             log_attributes: string_builder_bytes(rows, input_bytes),
+            json_scratch: String::new(),
         }
     }
 
@@ -402,7 +404,11 @@ impl LogBuilders {
         append_opt(&mut self.scope_name, scope.name.as_deref());
         append_opt(&mut self.scope_version, scope.version.as_deref());
         append_opt(&mut self.scope_attributes, scope.attributes_json.as_deref());
-        append_attrs_json(&mut self.log_attributes, &record.attributes)?;
+        append_attrs_json(
+            &mut self.log_attributes,
+            &record.attributes,
+            &mut self.json_scratch,
+        )?;
         Ok(())
     }
 
@@ -456,6 +462,7 @@ struct TraceBuilders {
     dropped_events_count: Int32Builder,
     dropped_links_count: Int32Builder,
     flags: Int32Builder,
+    json_scratch: String,
 }
 
 impl TraceBuilders {
@@ -486,6 +493,7 @@ impl TraceBuilders {
             dropped_events_count: Int32Builder::with_capacity(rows),
             dropped_links_count: Int32Builder::with_capacity(rows),
             flags: Int32Builder::with_capacity(rows),
+            json_scratch: String::new(),
         }
     }
 
@@ -530,9 +538,13 @@ impl TraceBuilders {
         append_opt(&mut self.scope_name, scope.name.as_deref());
         append_opt(&mut self.scope_version, scope.version.as_deref());
         append_opt(&mut self.scope_attributes, scope.attributes_json.as_deref());
-        append_attrs_json(&mut self.span_attributes, &span.attributes)?;
-        append_span_events_json(&mut self.events_json, &span.events)?;
-        append_span_links_json(&mut self.links_json, &span.links)?;
+        append_attrs_json(
+            &mut self.span_attributes,
+            &span.attributes,
+            &mut self.json_scratch,
+        )?;
+        append_span_events_json(&mut self.events_json, &span.events, &mut self.json_scratch)?;
+        append_span_links_json(&mut self.links_json, &span.links, &mut self.json_scratch)?;
         self.dropped_attributes_count
             .append_value(span.dropped_attributes_count as i32);
         self.dropped_events_count
@@ -595,6 +607,7 @@ struct GaugeBuilders {
     metric_attributes: StringBuilder,
     flags: Int32Builder,
     exemplars_json: StringBuilder,
+    json_scratch: String,
 }
 
 impl GaugeBuilders {
@@ -617,6 +630,7 @@ impl GaugeBuilders {
             metric_attributes: string_builder(rows),
             flags: Int32Builder::with_capacity(rows),
             exemplars_json: string_builder(rows),
+            json_scratch: String::new(),
         }
     }
 
@@ -682,6 +696,7 @@ struct SumBuilders {
     exemplars_json: StringBuilder,
     aggregation_temporality: Int32Builder,
     is_monotonic: BooleanBuilder,
+    json_scratch: String,
 }
 
 impl SumBuilders {
@@ -706,6 +721,7 @@ impl SumBuilders {
             exemplars_json: string_builder(rows),
             aggregation_temporality: Int32Builder::with_capacity(rows),
             is_monotonic: BooleanBuilder::with_capacity(rows),
+            json_scratch: String::new(),
         }
     }
 
@@ -773,9 +789,8 @@ trait NumberMetricBuilders {
     fn scope_name(&mut self) -> &mut StringBuilder;
     fn scope_version(&mut self) -> &mut StringBuilder;
     fn scope_attributes(&mut self) -> &mut StringBuilder;
-    fn metric_attributes(&mut self) -> &mut StringBuilder;
     fn flags(&mut self) -> &mut Int32Builder;
-    fn exemplars_json(&mut self) -> &mut StringBuilder;
+    fn json_builders(&mut self) -> (&mut StringBuilder, &mut StringBuilder, &mut String);
 }
 
 impl NumberMetricBuilders for GaugeBuilders {
@@ -818,14 +833,15 @@ impl NumberMetricBuilders for GaugeBuilders {
     fn scope_attributes(&mut self) -> &mut StringBuilder {
         &mut self.scope_attributes
     }
-    fn metric_attributes(&mut self) -> &mut StringBuilder {
-        &mut self.metric_attributes
-    }
     fn flags(&mut self) -> &mut Int32Builder {
         &mut self.flags
     }
-    fn exemplars_json(&mut self) -> &mut StringBuilder {
-        &mut self.exemplars_json
+    fn json_builders(&mut self) -> (&mut StringBuilder, &mut StringBuilder, &mut String) {
+        (
+            &mut self.metric_attributes,
+            &mut self.exemplars_json,
+            &mut self.json_scratch,
+        )
     }
 }
 
@@ -869,14 +885,15 @@ impl NumberMetricBuilders for SumBuilders {
     fn scope_attributes(&mut self) -> &mut StringBuilder {
         &mut self.scope_attributes
     }
-    fn metric_attributes(&mut self) -> &mut StringBuilder {
-        &mut self.metric_attributes
-    }
     fn flags(&mut self) -> &mut Int32Builder {
         &mut self.flags
     }
-    fn exemplars_json(&mut self) -> &mut StringBuilder {
-        &mut self.exemplars_json
+    fn json_builders(&mut self) -> (&mut StringBuilder, &mut StringBuilder, &mut String) {
+        (
+            &mut self.metric_attributes,
+            &mut self.exemplars_json,
+            &mut self.json_scratch,
+        )
     }
 }
 
@@ -917,9 +934,10 @@ fn append_metric_common<B: NumberMetricBuilders>(
         builders.scope_attributes(),
         scope.attributes_json.as_deref(),
     );
-    append_attrs_json(builders.metric_attributes(), &point.attributes)?;
     builders.flags().append_value(point.flags as i32);
-    append_exemplars_json(builders.exemplars_json(), &point.exemplars)?;
+    let (metric_attributes, exemplars_json, json_scratch) = builders.json_builders();
+    append_attrs_json(metric_attributes, &point.attributes, json_scratch)?;
+    append_exemplars_json(exemplars_json, &point.exemplars, json_scratch)?;
     Ok(())
 }
 
@@ -947,6 +965,7 @@ struct HistogramBuilders {
     flags: Int32Builder,
     exemplars_json: StringBuilder,
     aggregation_temporality: Int32Builder,
+    json_scratch: String,
 }
 
 impl HistogramBuilders {
@@ -975,6 +994,7 @@ impl HistogramBuilders {
             flags: Int32Builder::with_capacity(rows),
             exemplars_json: string_builder(rows),
             aggregation_temporality: Int32Builder::with_capacity(rows),
+            json_scratch: String::new(),
         }
     }
 
@@ -998,10 +1018,16 @@ impl HistogramBuilders {
         append_finite_opt(&mut self.sum, point.sum);
         append_finite_opt(&mut self.min, point.min);
         append_finite_opt(&mut self.max, point.max);
-        self.bucket_counts
-            .append_value(json_string_or_empty_array(&point.bucket_counts));
-        self.explicit_bounds
-            .append_value(json_string_or_empty_array(&point.explicit_bounds));
+        append_u64_json_array(
+            &mut self.bucket_counts,
+            &point.bucket_counts,
+            &mut self.json_scratch,
+        )?;
+        append_f64_json_array(
+            &mut self.explicit_bounds,
+            &point.explicit_bounds,
+            &mut self.json_scratch,
+        )?;
         append_metric_resource_scope(
             &mut self.service_name,
             &mut self.service_namespace,
@@ -1013,9 +1039,17 @@ impl HistogramBuilders {
             resource,
             scope,
         );
-        append_attrs_json(&mut self.metric_attributes, &point.attributes)?;
+        append_attrs_json(
+            &mut self.metric_attributes,
+            &point.attributes,
+            &mut self.json_scratch,
+        )?;
         self.flags.append_value(point.flags as i32);
-        append_exemplars_json(&mut self.exemplars_json, &point.exemplars)?;
+        append_exemplars_json(
+            &mut self.exemplars_json,
+            &point.exemplars,
+            &mut self.json_scratch,
+        )?;
         self.aggregation_temporality
             .append_value(aggregation_temporality);
         self.rows += 1;
@@ -1086,6 +1120,7 @@ struct ExpHistogramBuilders {
     flags: Int32Builder,
     exemplars_json: StringBuilder,
     aggregation_temporality: Int32Builder,
+    json_scratch: String,
 }
 
 impl ExpHistogramBuilders {
@@ -1119,6 +1154,7 @@ impl ExpHistogramBuilders {
             flags: Int32Builder::with_capacity(rows),
             exemplars_json: string_builder(rows),
             aggregation_temporality: Int32Builder::with_capacity(rows),
+            json_scratch: String::new(),
         }
     }
 
@@ -1151,16 +1187,22 @@ impl ExpHistogramBuilders {
         append_finite(&mut self.zero_threshold, point.zero_threshold);
         if let Some(positive) = &point.positive {
             self.positive_offset.append_value(positive.offset);
-            self.positive_bucket_counts
-                .append_value(json_string_or_empty_array(&positive.bucket_counts));
+            append_u64_json_array(
+                &mut self.positive_bucket_counts,
+                &positive.bucket_counts,
+                &mut self.json_scratch,
+            )?;
         } else {
             self.positive_offset.append_value(0);
             self.positive_bucket_counts.append_value("[]");
         }
         if let Some(negative) = &point.negative {
             self.negative_offset.append_value(negative.offset);
-            self.negative_bucket_counts
-                .append_value(json_string_or_empty_array(&negative.bucket_counts));
+            append_u64_json_array(
+                &mut self.negative_bucket_counts,
+                &negative.bucket_counts,
+                &mut self.json_scratch,
+            )?;
         } else {
             self.negative_offset.append_value(0);
             self.negative_bucket_counts.append_value("[]");
@@ -1176,9 +1218,17 @@ impl ExpHistogramBuilders {
             resource,
             scope,
         );
-        append_attrs_json(&mut self.metric_attributes, &point.attributes)?;
+        append_attrs_json(
+            &mut self.metric_attributes,
+            &point.attributes,
+            &mut self.json_scratch,
+        )?;
         self.flags.append_value(point.flags as i32);
-        append_exemplars_json(&mut self.exemplars_json, &point.exemplars)?;
+        append_exemplars_json(
+            &mut self.exemplars_json,
+            &point.exemplars,
+            &mut self.json_scratch,
+        )?;
         self.aggregation_temporality
             .append_value(aggregation_temporality);
         self.rows += 1;
@@ -1269,86 +1319,129 @@ fn metric_point_value(
     }
 }
 
-fn append_exemplars_json(builder: &mut StringBuilder, exemplars: &[Exemplar]) -> Result<()> {
+fn append_u64_json_array(
+    builder: &mut StringBuilder,
+    values: &[u64],
+    scratch: &mut String,
+) -> Result<()> {
+    scratch.clear();
+    write_u64_json_array(scratch, values)?;
+    builder.append_value(scratch.as_str());
+    Ok(())
+}
+
+fn append_f64_json_array(
+    builder: &mut StringBuilder,
+    values: &[f64],
+    scratch: &mut String,
+) -> Result<()> {
+    scratch.clear();
+    if write_f64_json_array(scratch, values).is_err() {
+        scratch.clear();
+        scratch.push_str("[]");
+    }
+    builder.append_value(scratch.as_str());
+    Ok(())
+}
+
+fn append_exemplars_json(
+    builder: &mut StringBuilder,
+    exemplars: &[Exemplar],
+    scratch: &mut String,
+) -> Result<()> {
     if exemplars.is_empty() {
         builder.append_null();
         return Ok(());
     }
-    write_str_builder(builder, "[")?;
+
+    scratch.clear();
+    write_str_builder(scratch, "[")?;
     for (idx, exemplar) in exemplars.iter().enumerate() {
         if idx > 0 {
-            write_str_builder(builder, ",")?;
+            write_str_builder(scratch, ",")?;
         }
-        write_str_builder(builder, "{\"filtered_attributes\":")?;
-        write_attrs_object(builder, &exemplar.filtered_attributes)?;
-        write_str_builder(builder, ",\"span_id\":")?;
-        write_hex_json(builder, &exemplar.span_id)?;
-        write_str_builder(builder, ",\"time_unix_nano\":")?;
+        write_str_builder(scratch, "{\"filtered_attributes\":")?;
+        write_attrs_object(scratch, &exemplar.filtered_attributes)?;
+        write_str_builder(scratch, ",\"span_id\":")?;
+        write_hex_json(scratch, &exemplar.span_id)?;
+        write_str_builder(scratch, ",\"time_unix_nano\":")?;
         write_i64_builder(
-            builder,
+            scratch,
             u64_to_i64(exemplar.time_unix_nano, "exemplar.time_unix_nano")?,
         )?;
-        write_str_builder(builder, ",\"trace_id\":")?;
-        write_hex_json(builder, &exemplar.trace_id)?;
+        write_str_builder(scratch, ",\"trace_id\":")?;
+        write_hex_json(scratch, &exemplar.trace_id)?;
         if exemplar_value_is_finite(&exemplar.value) {
-            write_str_builder(builder, ",\"value\":")?;
-            write_exemplar_value_json(builder, &exemplar.value)?;
+            write_str_builder(scratch, ",\"value\":")?;
+            write_exemplar_value_json(scratch, &exemplar.value)?;
         }
-        write_str_builder(builder, "}")?;
+        write_str_builder(scratch, "}")?;
     }
-    write_str_builder(builder, "]")?;
-    builder.append_value("");
+    write_str_builder(scratch, "]")?;
+    builder.append_value(scratch.as_str());
     Ok(())
 }
 
-fn append_span_events_json(builder: &mut StringBuilder, events: &[span::Event]) -> Result<()> {
+fn append_span_events_json(
+    builder: &mut StringBuilder,
+    events: &[span::Event],
+    scratch: &mut String,
+) -> Result<()> {
     if events.is_empty() {
         builder.append_null();
         return Ok(());
     }
-    write_str_builder(builder, "[")?;
+
+    scratch.clear();
+    write_str_builder(scratch, "[")?;
     for (idx, event) in events.iter().enumerate() {
         if idx > 0 {
-            write_str_builder(builder, ",")?;
+            write_str_builder(scratch, ",")?;
         }
-        write_str_builder(builder, "{\"attributes\":")?;
-        write_attrs_object(builder, &event.attributes)?;
-        write_str_builder(builder, ",\"name\":")?;
-        write_json_string(builder, &event.name)?;
-        write_str_builder(builder, ",\"time_unix_nano\":")?;
+        write_str_builder(scratch, "{\"attributes\":")?;
+        write_attrs_object(scratch, &event.attributes)?;
+        write_str_builder(scratch, ",\"name\":")?;
+        write_json_string(scratch, &event.name)?;
+        write_str_builder(scratch, ",\"time_unix_nano\":")?;
         write_i64_builder(
-            builder,
+            scratch,
             u64_to_i64(event.time_unix_nano, "event.time_unix_nano")?,
         )?;
-        write_str_builder(builder, "}")?;
+        write_str_builder(scratch, "}")?;
     }
-    write_str_builder(builder, "]")?;
-    builder.append_value("");
+    write_str_builder(scratch, "]")?;
+    builder.append_value(scratch.as_str());
     Ok(())
 }
 
-fn append_span_links_json(builder: &mut StringBuilder, links: &[span::Link]) -> Result<()> {
+fn append_span_links_json(
+    builder: &mut StringBuilder,
+    links: &[span::Link],
+    scratch: &mut String,
+) -> Result<()> {
     if links.is_empty() {
         builder.append_null();
         return Ok(());
     }
-    write_str_builder(builder, "[")?;
+
+    scratch.clear();
+    write_str_builder(scratch, "[")?;
     for (idx, link) in links.iter().enumerate() {
         if idx > 0 {
-            write_str_builder(builder, ",")?;
+            write_str_builder(scratch, ",")?;
         }
-        write_str_builder(builder, "{\"attributes\":")?;
-        write_attrs_object(builder, &link.attributes)?;
-        write_str_builder(builder, ",\"span_id\":")?;
-        write_hex_json(builder, &link.span_id)?;
-        write_str_builder(builder, ",\"trace_id\":")?;
-        write_hex_json(builder, &link.trace_id)?;
-        write_str_builder(builder, ",\"trace_state\":")?;
-        write_json_string(builder, &link.trace_state)?;
-        write_str_builder(builder, "}")?;
+        write_str_builder(scratch, "{\"attributes\":")?;
+        write_attrs_object(scratch, &link.attributes)?;
+        write_str_builder(scratch, ",\"span_id\":")?;
+        write_hex_json(scratch, &link.span_id)?;
+        write_str_builder(scratch, ",\"trace_id\":")?;
+        write_hex_json(scratch, &link.trace_id)?;
+        write_str_builder(scratch, ",\"trace_state\":")?;
+        write_json_string(scratch, &link.trace_state)?;
+        write_str_builder(scratch, "}")?;
     }
-    write_str_builder(builder, "]")?;
-    builder.append_value("");
+    write_str_builder(scratch, "]")?;
+    builder.append_value(scratch.as_str());
     Ok(())
 }
 
@@ -1371,7 +1464,7 @@ fn append_log_body(builder: &mut StringBuilder, value: Option<&AnyValue>) -> Res
             builder.append_value("");
         }
         any_value::Value::DoubleValue(value) if value.is_finite() => {
-            serde_json::to_writer(BuilderWriter(builder), value)?;
+            serde_json::to_writer(FmtWriter(builder), value)?;
             builder.append_value("");
         }
         any_value::Value::DoubleValue(_) => builder.append_null(),
@@ -1389,13 +1482,19 @@ fn append_log_body(builder: &mut StringBuilder, value: Option<&AnyValue>) -> Res
 }
 
 #[inline]
-fn append_attrs_json(builder: &mut StringBuilder, attrs: &[KeyValue]) -> Result<()> {
+fn append_attrs_json(
+    builder: &mut StringBuilder,
+    attrs: &[KeyValue],
+    scratch: &mut String,
+) -> Result<()> {
     if !attrs.iter().any(|kv| kv.value.is_some()) {
         builder.append_null();
         return Ok(());
     }
-    write_attrs_object(builder, attrs)?;
-    builder.append_value("");
+
+    scratch.clear();
+    write_attrs_object(scratch, attrs)?;
+    builder.append_value(scratch.as_str());
     Ok(())
 }
 
@@ -1439,7 +1538,7 @@ fn any_json_string(value: &any_value::Value) -> String {
 }
 
 #[inline]
-fn write_any_json(builder: &mut StringBuilder, value: &any_value::Value) -> Result<()> {
+fn write_any_json<W: fmt::Write + ?Sized>(builder: &mut W, value: &any_value::Value) -> Result<()> {
     match value {
         any_value::Value::StringValue(value) => write_json_string(builder, value),
         any_value::Value::BoolValue(value) => {
@@ -1447,7 +1546,7 @@ fn write_any_json(builder: &mut StringBuilder, value: &any_value::Value) -> Resu
         }
         any_value::Value::IntValue(value) => write_i64_builder(builder, *value),
         any_value::Value::DoubleValue(value) if value.is_finite() => {
-            serde_json::to_writer(BuilderWriter(builder), value)?;
+            serde_json::to_writer(FmtWriter(builder), value)?;
             Ok(())
         }
         any_value::Value::DoubleValue(_) => write_str_builder(builder, "null"),
@@ -1474,7 +1573,7 @@ fn write_any_json(builder: &mut StringBuilder, value: &any_value::Value) -> Resu
 }
 
 #[inline]
-fn write_attrs_object(builder: &mut StringBuilder, attrs: &[KeyValue]) -> Result<()> {
+fn write_attrs_object<W: fmt::Write + ?Sized>(builder: &mut W, attrs: &[KeyValue]) -> Result<()> {
     if attrs_are_sorted_unique(attrs) {
         write_str_builder(builder, "{")?;
         let mut written = false;
@@ -1533,7 +1632,7 @@ fn write_attrs_object(builder: &mut StringBuilder, attrs: &[KeyValue]) -> Result
 }
 
 #[inline]
-fn write_json_string(builder: &mut StringBuilder, value: &str) -> Result<()> {
+fn write_json_string<W: fmt::Write + ?Sized>(builder: &mut W, value: &str) -> Result<()> {
     if !value
         .as_bytes()
         .iter()
@@ -1545,29 +1644,58 @@ fn write_json_string(builder: &mut StringBuilder, value: &str) -> Result<()> {
         return Ok(());
     }
 
-    serde_json::to_writer(BuilderWriter(builder), value)?;
+    serde_json::to_writer(FmtWriter(builder), value)?;
     Ok(())
 }
 
 #[inline]
-fn write_i64_builder(builder: &mut StringBuilder, value: i64) -> Result<()> {
-    std::fmt::Write::write_fmt(builder, format_args!("{value}")).map_err(|_| {
+fn write_i64_builder<W: fmt::Write + ?Sized>(builder: &mut W, value: i64) -> Result<()> {
+    fmt::Write::write_fmt(builder, format_args!("{value}")).map_err(|_| {
         Error::InvalidInput("failed to write integer to Arrow string builder".to_string())
     })
 }
 
 #[inline]
-fn write_exemplar_value_json(
-    builder: &mut StringBuilder,
+fn write_u64_builder<W: fmt::Write + ?Sized>(builder: &mut W, value: u64) -> Result<()> {
+    fmt::Write::write_fmt(builder, format_args!("{value}")).map_err(|_| {
+        Error::InvalidInput("failed to write integer to Arrow string builder".to_string())
+    })
+}
+
+fn write_u64_json_array<W: fmt::Write + ?Sized>(builder: &mut W, values: &[u64]) -> Result<()> {
+    write_str_builder(builder, "[")?;
+    for (idx, value) in values.iter().enumerate() {
+        if idx > 0 {
+            write_str_builder(builder, ",")?;
+        }
+        write_u64_builder(builder, *value)?;
+    }
+    write_str_builder(builder, "]")
+}
+
+fn write_f64_json_array<W: fmt::Write + ?Sized>(builder: &mut W, values: &[f64]) -> Result<()> {
+    write_str_builder(builder, "[")?;
+    for (idx, value) in values.iter().enumerate() {
+        if idx > 0 {
+            write_str_builder(builder, ",")?;
+        }
+        serde_json::to_writer(FmtWriter(&mut *builder), value)?;
+    }
+    write_str_builder(builder, "]")
+}
+
+#[inline]
+fn write_exemplar_value_json<W: fmt::Write + ?Sized>(
+    builder: &mut W,
     value: &Option<exemplar::Value>,
 ) -> Result<()> {
     match value {
         Some(exemplar::Value::AsInt(value)) => {
-            serde_json::to_writer(BuilderWriter(builder), &(*value as f64))?;
+            serde_json::to_writer(FmtWriter(builder), &(*value as f64))?;
             Ok(())
         }
         Some(exemplar::Value::AsDouble(value)) if value.is_finite() => {
-            serde_json::to_writer(BuilderWriter(builder), value)?;
+            serde_json::to_writer(FmtWriter(builder), value)?;
             Ok(())
         }
         _ => write_str_builder(builder, "null"),
@@ -1575,7 +1703,7 @@ fn write_exemplar_value_json(
 }
 
 #[inline]
-fn write_hex_json(builder: &mut StringBuilder, bytes: &[u8]) -> Result<()> {
+fn write_hex_json<W: fmt::Write + ?Sized>(builder: &mut W, bytes: &[u8]) -> Result<()> {
     write_str_builder(builder, "\"")?;
     if bytes.len() <= 32 {
         let mut buf = [0_u8; 64];
@@ -1589,15 +1717,15 @@ fn write_hex_json(builder: &mut StringBuilder, bytes: &[u8]) -> Result<()> {
 }
 
 #[inline]
-fn write_str_builder(builder: &mut StringBuilder, value: &str) -> Result<()> {
-    std::fmt::Write::write_str(builder, value).map_err(|_| {
+fn write_str_builder<W: fmt::Write + ?Sized>(builder: &mut W, value: &str) -> Result<()> {
+    fmt::Write::write_str(builder, value).map_err(|_| {
         Error::InvalidInput("failed to write string to Arrow string builder".to_string())
     })
 }
 
-struct BuilderWriter<'a>(&'a mut StringBuilder);
+struct FmtWriter<'a, W: fmt::Write + ?Sized>(&'a mut W);
 
-impl io::Write for BuilderWriter<'_> {
+impl<W: fmt::Write + ?Sized> io::Write for FmtWriter<'_, W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let text = std::str::from_utf8(buf).map_err(|err| {
             io::Error::new(
@@ -1605,7 +1733,7 @@ impl io::Write for BuilderWriter<'_> {
                 format!("JSON serializer wrote invalid UTF-8: {err}"),
             )
         })?;
-        std::fmt::Write::write_str(self.0, text).map_err(io::Error::other)?;
+        fmt::Write::write_str(self.0, text).map_err(io::Error::other)?;
         Ok(buf.len())
     }
 
@@ -1780,10 +1908,6 @@ fn append_finite_opt(builder: &mut Float64Builder, value: Option<f64>) {
         Some(value) => append_finite(builder, value),
         None => builder.append_null(),
     }
-}
-
-fn json_string_or_empty_array<T: serde::Serialize>(value: &T) -> String {
-    serde_json::to_string(value).unwrap_or_else(|_| "[]".to_string())
 }
 
 #[inline]

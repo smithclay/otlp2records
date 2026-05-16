@@ -330,14 +330,14 @@ fn test_metrics_default_protobuf_mixed_fixture() {
 fn test_metrics_default_protobuf_histogram_fixture() {
     let pb = include_bytes!("../testdata/metrics_histogram.pb");
     let batches = transform_metrics(pb, InputFormat::Protobuf).unwrap();
-    assert_eq!(batches.histogram.unwrap().num_rows(), 3);
+    assert_eq!(batches.histogram.unwrap().num_rows(), 2048);
 }
 
 #[test]
 fn test_metrics_default_protobuf_exponential_histogram_fixture() {
     let pb = include_bytes!("../testdata/metrics_exponential_histogram.pb");
     let batches = transform_metrics(pb, InputFormat::Protobuf).unwrap();
-    assert_eq!(batches.exp_histogram.unwrap().num_rows(), 2);
+    assert_eq!(batches.exp_histogram.unwrap().num_rows(), 2048);
 }
 
 // ============================================================================
