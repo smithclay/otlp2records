@@ -9,6 +9,7 @@ use serde_json::Value as JsonValue;
 use super::DecodeError;
 
 /// Counts of skipped metric data points by type.
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Default, Clone, Copy)]
 pub struct MetricSkipCounts {
     /// Number of histogram data points skipped
@@ -67,6 +68,7 @@ pub fn normalise_json_value(
 ///
 /// Returns counts of histogram, exponential histogram, and summary data points
 /// that will be skipped during decoding (these types are not currently supported).
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn count_skipped_metric_data_points(value: &JsonValue) -> MetricSkipCounts {
     let mut counts = MetricSkipCounts::default();
     let resource_metrics = value
@@ -109,6 +111,7 @@ pub fn count_skipped_metric_data_points(value: &JsonValue) -> MetricSkipCounts {
     counts
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn count_metric_points(metric: &JsonValue, metric_key: &str, points_key: &str) -> usize {
     metric
         .get(metric_key)

@@ -20,8 +20,8 @@ Currently consumed by [duckdb-otlp](https://github.com/smithclay/duckdb-otlp), [
 - Transform OTLP logs, traces, and metrics to Arrow RecordBatches
 - Support for both Protobuf and JSON input formats
 - Output to NDJSON, Arrow IPC, or Parquet
-- Built-in Rust transformations
-- Efficient memory usage with Arc-shared resource/scope values
+- Direct OTLP-to-Arrow hot path for high-throughput ingestion
+- JSON/JSONL support through OTLP request normalization into the same Arrow builders
 
 ## Installation
 
@@ -84,25 +84,6 @@ let ipc: Vec<u8> = to_ipc(&batch)?;
 let parquet: Vec<u8> = otlp2records::to_parquet(&batch)?;
 ```
 
-#### Lower-level API
-
-For more control over the transformation pipeline:
-
-```rust
-use otlp2records::{
-    decode_logs, apply_log_transform, values_to_arrow, logs_schema, InputFormat
-};
-
-// Step 1: Decode OTLP bytes to record values
-let values = decode_logs(bytes, InputFormat::Protobuf)?;
-
-// Step 2: Apply the built-in transformation
-let transformed = apply_log_transform(values)?;
-
-// Step 3: Convert to Arrow RecordBatch
-let batch = values_to_arrow(&transformed, &logs_schema())?;
-```
-
 ### WASM Usage
 
 Build with the `wasm` feature for browser/Node.js environments:
@@ -129,6 +110,7 @@ const arrowIpc = transform_logs_wasm(otlpBytes, "protobuf");
 |--------|-------------|
 | `InputFormat::Protobuf` | Standard OTLP protobuf encoding |
 | `InputFormat::Json` | OTLP JSON encoding (camelCase field names) |
+| `InputFormat::Jsonl` | Newline-delimited OTLP JSON envelopes |
 | `InputFormat::Auto` | Auto-detect JSON vs protobuf with fallback decoding |
 
 ### High-level Functions
@@ -166,20 +148,25 @@ const arrowIpc = transform_logs_wasm(otlpBytes, "protobuf");
                                         |
                                         v
                               +---------+---------+
-                              |      Decode       |
-                              | (prost / serde)   |
+                              |   Format Dispatch |
+                              | (protobuf/jsonl)  |
                               +---------+---------+
                                         |
                                         v
                               +---------+---------+
-                              | Rust Transform    |
-                              | (field mapping)   |
+                              | OTLP Request      |
+                              | (prost structs)   |
                               +---------+---------+
                                         |
                                         v
                               +---------+---------+
-                              |   Arrow Builder   |
-                              | (RecordBatch)     |
+                              | Arrow Builders    |
+                              | (direct columns)  |
+                              +---------+---------+
+                                        |
+                                        v
+                              +---------+---------+
+                              |   RecordBatch     |
                               +---------+---------+
                                         |
                   +---------------------+---------------------+
@@ -190,12 +177,12 @@ const arrowIpc = transform_logs_wasm(otlpBytes, "protobuf");
           +---------------+     +---------------+     +---------------+
 ```
 
-### Module Structure
+### Public Surface
 
-- **decode**: Parse OTLP protobuf/JSON into record values
-- **transform**: Apply Rust projections to normalize data
-- **arrow**: Convert record values to Arrow RecordBatches
-- **output**: Serialize RecordBatches to various formats
+- **transform functions**: Convert OTLP logs, traces, and metrics to Arrow batches
+- **schema functions**: Return the Arrow schemas used by the transform functions
+- **partition helpers**: Group transformed batches by service
+- **output helpers**: Serialize RecordBatches to NDJSON, Arrow IPC, or Parquet
 - **wasm**: WASM bindings (optional)
 
 ## Output Schemas
@@ -204,7 +191,7 @@ const arrowIpc = transform_logs_wasm(otlpBytes, "protobuf");
 
 | Field | Type | Description |
 |-------|------|-------------|
-| timestamp | TimestampMs | Log record timestamp |
+| timestamp | TimestampMicrosecond | Log record timestamp |
 | observed_timestamp | Int64 | When log was observed (ms) |
 | trace_id | String | Trace correlation ID (hex) |
 | span_id | String | Span correlation ID (hex) |
@@ -224,7 +211,7 @@ const arrowIpc = transform_logs_wasm(otlpBytes, "protobuf");
 
 | Field | Type | Description |
 |-------|------|-------------|
-| timestamp | TimestampMs | Span start time |
+| timestamp | TimestampMicrosecond | Span start time |
 | end_timestamp | Int64 | Span end time (ms) |
 | duration | Int64 | Duration in milliseconds |
 | trace_id | String | Trace ID (hex) |
@@ -254,7 +241,7 @@ const arrowIpc = transform_logs_wasm(otlpBytes, "protobuf");
 
 | Field | Type | Description |
 |-------|------|-------------|
-| timestamp | TimestampMs | Data point timestamp |
+| timestamp | TimestampMicrosecond | Data point timestamp |
 | start_timestamp | Int64 | Start of measurement window (ms) |
 | metric_name | String | Metric name |
 | metric_description | String | Metric description |

@@ -1,6 +1,6 @@
 [package]
 name = "otlp2records"
-version = "0.5.1"
+version = "0.6.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "Transform OTLP telemetry to flattened records"
@@ -30,6 +30,7 @@ arrow-select = "58"
 # Utils
 thiserror = "2"
 const-hex = "1"
+itoa = "1"
 once_cell = "1"
 indexmap = "2"
 
@@ -65,7 +66,7 @@ cpp_compat = true
 include_guard = "OTLP2RECORDS_FFI_H"
 
 [profile.release]
-opt-level = "z"
+opt-level = 3
 lto = true
 codegen-units = 1
 strip = true
