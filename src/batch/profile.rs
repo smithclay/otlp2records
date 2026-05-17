@@ -18,10 +18,22 @@ pub enum TransformPhase {
     JsonlDecode,
     RowCount,
     BuilderInit,
+    /// Broad log resource group build timing. Includes nested narrow timings.
+    ResourceLogsBuild,
+    /// Broad trace resource group build timing. Includes nested narrow timings.
+    ResourceSpansBuild,
     ResourceContextBuild,
     ResourceAttributesJson,
+    /// Broad log scope group build timing. Includes nested narrow timings.
+    ScopeLogsBuild,
+    /// Broad trace scope group build timing. Includes nested narrow timings.
+    ScopeSpansBuild,
     ScopeContextBuild,
     ScopeAttributesJson,
+    /// Broad log record build timing. Includes nested narrow timings.
+    LogRecordBuild,
+    /// Broad trace span build timing. Includes nested narrow timings.
+    SpanBuild,
     ArrowAppend,
     BodyAppend,
     ResourceAttributesAppend,

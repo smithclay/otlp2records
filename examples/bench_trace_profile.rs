@@ -36,10 +36,13 @@ struct PhaseTotals {
     decode: Duration,
     row_count: Duration,
     builder_init: Duration,
+    resource_spans_build: Duration,
     resource_context: Duration,
     resource_attrs_json: Duration,
+    scope_spans_build: Duration,
     scope_context: Duration,
     scope_attrs_json: Duration,
+    span_build: Duration,
     arrow_append: Duration,
     resource_attrs_append: Duration,
     scope_attrs_append: Duration,
@@ -62,10 +65,13 @@ impl TransformObserver for PhaseTotals {
             TransformPhase::ProtobufDecode => self.decode += timing.elapsed,
             TransformPhase::RowCount => self.row_count += timing.elapsed,
             TransformPhase::BuilderInit => self.builder_init += timing.elapsed,
+            TransformPhase::ResourceSpansBuild => self.resource_spans_build += timing.elapsed,
             TransformPhase::ResourceContextBuild => self.resource_context += timing.elapsed,
             TransformPhase::ResourceAttributesJson => self.resource_attrs_json += timing.elapsed,
+            TransformPhase::ScopeSpansBuild => self.scope_spans_build += timing.elapsed,
             TransformPhase::ScopeContextBuild => self.scope_context += timing.elapsed,
             TransformPhase::ScopeAttributesJson => self.scope_attrs_json += timing.elapsed,
+            TransformPhase::SpanBuild => self.span_build += timing.elapsed,
             TransformPhase::ArrowAppend => self.arrow_append += timing.elapsed,
             TransformPhase::ResourceAttributesAppend => {
                 self.resource_attrs_append += timing.elapsed
@@ -129,7 +135,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ];
 
     println!(
-        "profile_header,workload,fixture_bytes,rows_per_iter,iterations,total_ms,ms_per_iter,spans_per_sec,requests_per_sec,mib_per_sec,decode_ms,row_count_ms,builder_init_ms,resource_context_ms,resource_attrs_json_ms,scope_context_ms,scope_attrs_json_ms,arrow_append_ms,resource_attrs_append_ms,scope_attrs_append_ms,span_attrs_json_ms,events_json_ms,links_json_ms,finish_ms,output_rows,resource_context_hits,resource_context_misses,scope_context_hits,scope_context_misses,resource_attr_row_copy_bytes,scope_attr_row_copy_bytes"
+        "profile_header,workload,fixture_bytes,rows_per_iter,iterations,total_ms,ms_per_iter,spans_per_sec,requests_per_sec,mib_per_sec,decode_ms,row_count_ms,builder_init_ms,resource_spans_build_ms,resource_context_ms,resource_attrs_json_ms,scope_spans_build_ms,scope_context_ms,scope_attrs_json_ms,span_build_ms,arrow_append_ms,resource_attrs_append_ms,scope_attrs_append_ms,span_attrs_json_ms,events_json_ms,links_json_ms,finish_ms,output_rows,resource_context_hits,resource_context_misses,scope_context_hits,scope_context_misses,resource_attr_row_copy_bytes,scope_attr_row_copy_bytes"
     );
 
     for workload in workloads {
@@ -178,7 +184,7 @@ fn print_measurement(workload: &Workload, fixture_bytes: usize, measurement: &Me
     let phases = &measurement.phases;
 
     println!(
-        "profile,{},{},{},{},{:.3},{:.3},{:.0},{:.1},{:.1},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{},{},{},{},{},{}",
+        "profile,{},{},{},{},{:.3},{:.3},{:.0},{:.1},{:.1},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{},{},{},{},{},{}",
         workload.name,
         fixture_bytes,
         measurement.rows_per_iter,
@@ -191,10 +197,13 @@ fn print_measurement(workload: &Workload, fixture_bytes: usize, measurement: &Me
         duration_ms(phases.decode),
         duration_ms(phases.row_count),
         duration_ms(phases.builder_init),
+        duration_ms(phases.resource_spans_build),
         duration_ms(phases.resource_context),
         duration_ms(phases.resource_attrs_json),
+        duration_ms(phases.scope_spans_build),
         duration_ms(phases.scope_context),
         duration_ms(phases.scope_attrs_json),
+        duration_ms(phases.span_build),
         duration_ms(phases.arrow_append),
         duration_ms(phases.resource_attrs_append),
         duration_ms(phases.scope_attrs_append),

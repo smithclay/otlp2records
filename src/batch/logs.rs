@@ -1,11 +1,14 @@
 //! Log request-to-RecordBatch conversion.
 
+use std::time::Instant;
+
 use arrow_array::{
     builder::{Int32Builder, Int64Builder, StringBuilder, TimestampMicrosecondBuilder},
     RecordBatch,
 };
 use opentelemetry_proto::tonic::{
-    collector::logs::v1::ExportLogsServiceRequest, logs::v1::LogRecord,
+    collector::logs::v1::ExportLogsServiceRequest,
+    logs::v1::{LogRecord, ResourceLogs, ScopeLogs},
 };
 use prost::Message;
 
@@ -15,8 +18,8 @@ use super::{
     context::{ContextDuplicateTracker, ResourceContext, ScopeContext},
     json::{append_attrs_json, append_log_body},
     profile::{
-        measure_phase, measure_result, observe_counter, TransformCounter, TransformObserver,
-        TransformPhase, TransformSignal,
+        measure_phase, measure_result, observe_counter, observe_phase, TransformCounter,
+        TransformObserver, TransformPhase, TransformSignal,
     },
     util::{
         append_hex_or_null, append_opt, append_required_service_name, array, record_batch,
@@ -87,39 +90,7 @@ pub fn transform_logs_request_observed(
     let mut duplicates = observer.is_some().then(ContextDuplicateTracker::default);
 
     for resource_logs in request.resource_logs {
-        let resource_attrs = resource_logs
-            .resource
-            .as_ref()
-            .map(|r| r.attributes.as_slice())
-            .unwrap_or(&[]);
-        let resource = ResourceContext::from_attrs_observed(
-            resource_attrs,
-            TransformSignal::Logs,
-            observer,
-            duplicates.as_mut(),
-        );
-
-        for scope_logs in resource_logs.scope_logs {
-            let scope_name = scope_logs.scope.as_ref().map(|s| s.name.as_str());
-            let scope_version = scope_logs.scope.as_ref().map(|s| s.version.as_str());
-            let scope_attrs = scope_logs
-                .scope
-                .as_ref()
-                .map(|s| s.attributes.as_slice())
-                .unwrap_or(&[]);
-            let scope = ScopeContext::new_observed(
-                scope_name,
-                scope_version,
-                scope_attrs,
-                TransformSignal::Logs,
-                observer,
-                duplicates.as_mut(),
-            );
-
-            for record in scope_logs.log_records {
-                builders.append_observed(&record, &resource, &scope, observer)?;
-            }
-        }
+        append_resource_logs_observed(resource_logs, &mut builders, observer, duplicates.as_mut())?;
     }
 
     measure_result(
@@ -128,6 +99,120 @@ pub fn transform_logs_request_observed(
         TransformPhase::ArrowFinalize,
         || builders.finish(),
     )
+}
+
+fn append_resource_logs_observed(
+    resource_logs: ResourceLogs,
+    builders: &mut LogBuilders,
+    observer: &mut Option<&mut dyn TransformObserver>,
+    mut duplicates: Option<&mut ContextDuplicateTracker>,
+) -> Result<()> {
+    let phase_start = phase_start(observer);
+    let ResourceLogs {
+        resource,
+        scope_logs,
+        ..
+    } = resource_logs;
+    let resource_attrs = resource
+        .as_ref()
+        .map(|r| r.attributes.as_slice())
+        .unwrap_or(&[]);
+    let resource = ResourceContext::from_attrs_observed(
+        resource_attrs,
+        TransformSignal::Logs,
+        observer,
+        duplicates.as_deref_mut(),
+    );
+
+    for scope_logs in scope_logs {
+        append_scope_logs_observed(
+            scope_logs,
+            builders,
+            &resource,
+            observer,
+            duplicates.as_deref_mut(),
+        )?;
+    }
+
+    finish_phase(
+        observer,
+        TransformSignal::Logs,
+        TransformPhase::ResourceLogsBuild,
+        phase_start,
+    );
+    Ok(())
+}
+
+fn append_scope_logs_observed(
+    scope_logs: ScopeLogs,
+    builders: &mut LogBuilders,
+    resource: &ResourceContext,
+    observer: &mut Option<&mut dyn TransformObserver>,
+    duplicates: Option<&mut ContextDuplicateTracker>,
+) -> Result<()> {
+    let phase_start = phase_start(observer);
+    let ScopeLogs {
+        scope, log_records, ..
+    } = scope_logs;
+    let scope_name = scope.as_ref().map(|s| s.name.as_str());
+    let scope_version = scope.as_ref().map(|s| s.version.as_str());
+    let scope_attrs = scope
+        .as_ref()
+        .map(|s| s.attributes.as_slice())
+        .unwrap_or(&[]);
+    let scope = ScopeContext::new_observed(
+        scope_name,
+        scope_version,
+        scope_attrs,
+        TransformSignal::Logs,
+        observer,
+        duplicates,
+    );
+
+    for record in log_records {
+        append_log_record_observed(record, builders, resource, &scope, observer)?;
+    }
+
+    finish_phase(
+        observer,
+        TransformSignal::Logs,
+        TransformPhase::ScopeLogsBuild,
+        phase_start,
+    );
+    Ok(())
+}
+
+fn append_log_record_observed(
+    record: LogRecord,
+    builders: &mut LogBuilders,
+    resource: &ResourceContext,
+    scope: &ScopeContext,
+    observer: &mut Option<&mut dyn TransformObserver>,
+) -> Result<()> {
+    let phase_start = phase_start(observer);
+    builders.append_observed(&record, resource, scope, observer)?;
+    finish_phase(
+        observer,
+        TransformSignal::Logs,
+        TransformPhase::LogRecordBuild,
+        phase_start,
+    );
+    Ok(())
+}
+
+fn phase_start(observer: &Option<&mut dyn TransformObserver>) -> Option<Instant> {
+    observer.is_some().then(Instant::now)
+}
+
+fn finish_phase(
+    observer: &mut Option<&mut dyn TransformObserver>,
+    signal: TransformSignal,
+    phase: TransformPhase,
+    start: Option<Instant>,
+) {
+    if let Some(start) = start {
+        observe_phase(observer, signal, phase, start.elapsed());
+    }
 }
 
 struct LogBuilders {

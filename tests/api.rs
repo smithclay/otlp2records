@@ -296,10 +296,13 @@ fn test_transform_logs_with_observer_matches_default() {
 
     assert_eq!(observed_batch.num_rows(), default_batch.num_rows());
     assert!(observer.phases.contains(&TransformPhase::ProtobufDecode));
+    assert!(observer.phases.contains(&TransformPhase::ResourceLogsBuild));
     assert!(observer
         .phases
         .contains(&TransformPhase::ResourceContextBuild));
+    assert!(observer.phases.contains(&TransformPhase::ScopeLogsBuild));
     assert!(observer.phases.contains(&TransformPhase::ScopeContextBuild));
+    assert!(observer.phases.contains(&TransformPhase::LogRecordBuild));
     assert!(observer.phases.contains(&TransformPhase::LogAttributesJson));
     assert!(observer.phases.contains(&TransformPhase::ArrowFinalize));
     assert!(observer.counters.contains(&TransformCounter::OutputRows));
@@ -404,8 +407,13 @@ fn test_transform_traces_with_observer_matches_default() {
     assert!(observer.phases.contains(&TransformPhase::ProtobufDecode));
     assert!(observer
         .phases
+        .contains(&TransformPhase::ResourceSpansBuild));
+    assert!(observer
+        .phases
         .contains(&TransformPhase::ResourceContextBuild));
+    assert!(observer.phases.contains(&TransformPhase::ScopeSpansBuild));
     assert!(observer.phases.contains(&TransformPhase::ScopeContextBuild));
+    assert!(observer.phases.contains(&TransformPhase::SpanBuild));
     assert!(observer
         .phases
         .contains(&TransformPhase::SpanAttributesJson));
