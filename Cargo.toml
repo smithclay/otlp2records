@@ -51,13 +51,8 @@ crate-type = ["rlib", "staticlib"]
 name = "pb_to_parquet"
 required-features = ["parquet"]
 
-[[example]]
-name = "bench_transform"
-required-features = ["bench-internals"]
-
 [features]
 default = []
-bench-internals = []
 parquet = ["dep:parquet"]
 wasm = ["getrandom/js", "dep:wasm-bindgen"]
 ffi = ["dep:cbindgen"]  # Enable C FFI bindings with header generation

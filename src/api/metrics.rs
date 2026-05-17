@@ -2,9 +2,6 @@
 
 use std::time::Instant;
 
-#[cfg(feature = "bench-internals")]
-use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
-
 use crate::{
     api::{optional_batch_to_json_values, JsonMetricBatches, MetricBatches},
     batch::{self, TransformObserver, TransformPhase, TransformSignal},
@@ -36,14 +33,6 @@ pub fn transform_metrics_with_observer(
 ) -> Result<MetricBatches> {
     let mut observer = Some(observer);
     transform_metrics_observed(bytes, format, &mut observer)
-}
-
-#[doc(hidden)]
-#[cfg(feature = "bench-internals")]
-pub fn transform_metrics_decoded_for_bench(
-    request: ExportMetricsServiceRequest,
-) -> Result<MetricBatches> {
-    batch::transform_metrics_request(request)
 }
 
 fn transform_metrics_observed(

@@ -47,11 +47,6 @@ pub use api::{
     transform_traces_partitioned, transform_traces_with_observer, JsonMetricBatches, MetricBatches,
     SkippedMetrics,
 };
-#[cfg(feature = "bench-internals")]
-pub use api::{
-    transform_logs_decoded_for_bench, transform_metrics_decoded_for_bench,
-    transform_traces_decoded_for_bench,
-};
 pub use arrow::{
     extract_min_timestamp_micros, extract_service_name, group_batch_by_service, PartitionedBatch,
     PartitionedMetrics, ServiceGroupedBatches,
