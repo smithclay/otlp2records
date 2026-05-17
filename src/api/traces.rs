@@ -3,6 +3,7 @@
 use std::time::Instant;
 
 use arrow_array::RecordBatch;
+#[cfg(feature = "bench-internals")]
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 
 use crate::{
@@ -38,6 +39,7 @@ pub fn transform_traces_with_observer(
 }
 
 #[doc(hidden)]
+#[cfg(feature = "bench-internals")]
 pub fn transform_traces_decoded_for_bench(
     request: ExportTraceServiceRequest,
     input_bytes: usize,
