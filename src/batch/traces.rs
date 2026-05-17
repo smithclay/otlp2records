@@ -22,8 +22,8 @@ use super::{
         TransformObserver, TransformPhase, TransformSignal,
     },
     util::{
-        append_empty_as_null, append_hex_or_null, append_opt, append_required_service_name, array,
-        record_batch, string_builder_bytes, u64_to_i64,
+        append_empty_as_null, append_hex_or_null, append_opt_n, append_required_service_name_n,
+        array, record_batch, string_builder_bytes, u64_to_i64,
     },
 };
 
@@ -112,7 +112,7 @@ fn append_resource_spans_observed(
     observer: &mut Option<&mut dyn TransformObserver>,
     mut duplicates: Option<&mut ContextDuplicateTracker>,
 ) -> Result<()> {
-    let phase_start = phase_start(observer);
+    let resource_phase_start = phase_start(observer);
     let ResourceSpans {
         resource,
         scope_spans,
@@ -143,7 +143,7 @@ fn append_resource_spans_observed(
         observer,
         TransformSignal::Traces,
         TransformPhase::ResourceSpansBuild,
-        phase_start,
+        resource_phase_start,
     );
     Ok(())
 }
@@ -155,7 +155,7 @@ fn append_scope_spans_observed(
     observer: &mut Option<&mut dyn TransformObserver>,
     duplicates: Option<&mut ContextDuplicateTracker>,
 ) -> Result<()> {
-    let phase_start = phase_start(observer);
+    let scope_phase_start = phase_start(observer);
     let ScopeSpans { scope, spans, .. } = scope_spans;
     let scope_name = scope.as_ref().map(|s| s.name.as_str());
     let scope_version = scope.as_ref().map(|s| s.version.as_str());
@@ -171,16 +171,27 @@ fn append_scope_spans_observed(
         observer,
         duplicates,
     );
+    let span_count = spans.len();
+    if span_count > 0 {
+        let context_phase_start = phase_start(observer);
+        builders.append_context_observed(span_count, resource, &scope, observer);
+        finish_phase(
+            observer,
+            TransformSignal::Traces,
+            TransformPhase::SpanBuild,
+            context_phase_start,
+        );
+    }
 
     for span in spans {
-        append_span_observed(span, builders, resource, &scope, observer)?;
+        append_span_observed(span, builders, observer)?;
     }
 
     finish_phase(
         observer,
         TransformSignal::Traces,
         TransformPhase::ScopeSpansBuild,
-        phase_start,
+        scope_phase_start,
     );
     Ok(())
 }
@@ -188,12 +199,10 @@ fn append_scope_spans_observed(
 fn append_span_observed(
     span: Span,
     builders: &mut TraceBuilders,
-    resource: &ResourceContext,
-    scope: &ScopeContext,
     observer: &mut Option<&mut dyn TransformObserver>,
 ) -> Result<()> {
     let phase_start = phase_start(observer);
-    builders.append_observed(&span, resource, scope, observer)?;
+    builders.append_observed(&span, observer)?;
     finish_phase(
         observer,
         TransformSignal::Traces,
@@ -282,8 +291,6 @@ impl TraceBuilders {
     fn append_observed(
         &mut self,
         span: &Span,
-        resource: &ResourceContext,
-        scope: &ScopeContext,
         observer: &mut Option<&mut dyn TransformObserver>,
     ) -> Result<()> {
         measure_result(
@@ -301,18 +308,6 @@ impl TraceBuilders {
                 append_hex_or_null(&mut self.span_id, &span.span_id);
                 append_hex_or_null(&mut self.parent_span_id, &span.parent_span_id);
                 append_empty_as_null(&mut self.trace_state, &span.trace_state);
-                append_required_service_name(
-                    &mut self.service_name,
-                    resource.service_name.as_deref(),
-                );
-                append_opt(
-                    &mut self.service_namespace,
-                    resource.service_namespace.as_deref(),
-                );
-                append_opt(
-                    &mut self.service_instance_id,
-                    resource.service_instance_id.as_deref(),
-                );
                 self.span_name.append_value(&span.name);
                 self.span_kind.append_value(span.kind);
                 let (status_code, status_message) = span
@@ -325,63 +320,6 @@ impl TraceBuilders {
                 Ok::<(), crate::Error>(())
             },
         )?;
-
-        measure_phase(
-            observer,
-            TransformSignal::Traces,
-            TransformPhase::ResourceAttributesAppend,
-            || {
-                append_opt(
-                    &mut self.resource_attributes,
-                    resource.attributes_json.as_deref(),
-                );
-            },
-        );
-        if let Some(json) = resource.attributes_json.as_deref() {
-            observe_counter(
-                observer,
-                TransformSignal::Traces,
-                TransformCounter::ResourceAttributesRowCopies,
-                1,
-            );
-            observe_counter(
-                observer,
-                TransformSignal::Traces,
-                TransformCounter::ResourceAttributesRowCopyBytes,
-                json.len() as u64,
-            );
-        }
-
-        measure_phase(
-            observer,
-            TransformSignal::Traces,
-            TransformPhase::ArrowAppend,
-            || {
-                append_opt(&mut self.scope_name, scope.name.as_deref());
-                append_opt(&mut self.scope_version, scope.version.as_deref());
-            },
-        );
-
-        measure_phase(
-            observer,
-            TransformSignal::Traces,
-            TransformPhase::ScopeAttributesAppend,
-            || append_opt(&mut self.scope_attributes, scope.attributes_json.as_deref()),
-        );
-        if let Some(json) = scope.attributes_json.as_deref() {
-            observe_counter(
-                observer,
-                TransformSignal::Traces,
-                TransformCounter::ScopeAttributesRowCopies,
-                1,
-            );
-            observe_counter(
-                observer,
-                TransformSignal::Traces,
-                TransformCounter::ScopeAttributesRowCopyBytes,
-                json.len() as u64,
-            );
-        }
 
         measure_result(
             observer,
@@ -422,6 +360,105 @@ impl TraceBuilders {
             },
         );
         Ok(())
+    }
+
+    fn append_context_observed(
+        &mut self,
+        rows: usize,
+        resource: &ResourceContext,
+        scope: &ScopeContext,
+        observer: &mut Option<&mut dyn TransformObserver>,
+    ) {
+        if rows == 0 {
+            return;
+        }
+
+        measure_phase(
+            observer,
+            TransformSignal::Traces,
+            TransformPhase::ArrowAppend,
+            || {
+                append_required_service_name_n(
+                    &mut self.service_name,
+                    resource.service_name.as_deref(),
+                    rows,
+                );
+                append_opt_n(
+                    &mut self.service_namespace,
+                    resource.service_namespace.as_deref(),
+                    rows,
+                );
+                append_opt_n(
+                    &mut self.service_instance_id,
+                    resource.service_instance_id.as_deref(),
+                    rows,
+                );
+            },
+        );
+
+        measure_phase(
+            observer,
+            TransformSignal::Traces,
+            TransformPhase::ResourceAttributesAppend,
+            || {
+                append_opt_n(
+                    &mut self.resource_attributes,
+                    resource.attributes_json.as_deref(),
+                    rows,
+                );
+            },
+        );
+        if let Some(json) = resource.attributes_json.as_deref() {
+            observe_counter(
+                observer,
+                TransformSignal::Traces,
+                TransformCounter::ResourceAttributesRowCopies,
+                rows as u64,
+            );
+            observe_counter(
+                observer,
+                TransformSignal::Traces,
+                TransformCounter::ResourceAttributesRowCopyBytes,
+                (json.len() as u64).saturating_mul(rows as u64),
+            );
+        }
+
+        measure_phase(
+            observer,
+            TransformSignal::Traces,
+            TransformPhase::ArrowAppend,
+            || {
+                append_opt_n(&mut self.scope_name, scope.name.as_deref(), rows);
+                append_opt_n(&mut self.scope_version, scope.version.as_deref(), rows);
+            },
+        );
+
+        measure_phase(
+            observer,
+            TransformSignal::Traces,
+            TransformPhase::ScopeAttributesAppend,
+            || {
+                append_opt_n(
+                    &mut self.scope_attributes,
+                    scope.attributes_json.as_deref(),
+                    rows,
+                )
+            },
+        );
+        if let Some(json) = scope.attributes_json.as_deref() {
+            observe_counter(
+                observer,
+                TransformSignal::Traces,
+                TransformCounter::ScopeAttributesRowCopies,
+                rows as u64,
+            );
+            observe_counter(
+                observer,
+                TransformSignal::Traces,
+                TransformCounter::ScopeAttributesRowCopyBytes,
+                (json.len() as u64).saturating_mul(rows as u64),
+            );
+        }
     }
 
     fn finish(mut self) -> Result<RecordBatch> {

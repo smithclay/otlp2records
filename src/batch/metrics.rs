@@ -32,7 +32,7 @@ use super::{
         TransformPhase, TransformSignal,
     },
     util::{
-        append_finite, append_finite_opt, append_opt, append_required_service_name, array,
+        append_finite, append_finite_opt, append_opt_n, append_required_service_name_n, array,
         record_batch, string_builder, u64_to_i64,
     },
 };
@@ -150,6 +150,7 @@ pub fn transform_metrics_request_observed(
 
                 match metric.data {
                     Some(Data::Gauge(data)) => {
+                        let rows_before = gauge.rows;
                         for point in data.data_points {
                             if let Some(value) = metric_point_value(&point.value, &mut skipped) {
                                 measure_result(
@@ -165,15 +166,27 @@ pub fn transform_metrics_request_observed(
                                                 description: metric_description,
                                                 unit: metric_unit,
                                             },
-                                            &resource,
-                                            &scope,
                                         )
                                     },
                                 )?;
                             }
                         }
+                        let appended = gauge.rows - rows_before;
+                        if appended > 0 {
+                            measure_phase(
+                                observer,
+                                TransformSignal::Metrics,
+                                TransformPhase::ArrowAppend,
+                                || {
+                                    append_number_metric_context(
+                                        &mut gauge, appended, &resource, &scope,
+                                    );
+                                },
+                            );
+                        }
                     }
                     Some(Data::Sum(data)) => {
+                        let rows_before = sum.rows;
                         for point in data.data_points {
                             if let Some(value) = metric_point_value(&point.value, &mut skipped) {
                                 measure_result(
@@ -191,15 +204,27 @@ pub fn transform_metrics_request_observed(
                                                 description: metric_description,
                                                 unit: metric_unit,
                                             },
-                                            &resource,
-                                            &scope,
                                         )
                                     },
                                 )?;
                             }
                         }
+                        let appended = sum.rows - rows_before;
+                        if appended > 0 {
+                            measure_phase(
+                                observer,
+                                TransformSignal::Metrics,
+                                TransformPhase::ArrowAppend,
+                                || {
+                                    append_number_metric_context(
+                                        &mut sum, appended, &resource, &scope,
+                                    );
+                                },
+                            );
+                        }
                     }
                     Some(Data::Histogram(data)) => {
+                        let rows_before = histogram.rows;
                         for point in data.data_points {
                             measure_result(
                                 observer,
@@ -214,14 +239,24 @@ pub fn transform_metrics_request_observed(
                                             description: metric_description,
                                             unit: metric_unit,
                                         },
-                                        &resource,
-                                        &scope,
                                     )
                                 },
                             )?;
                         }
+                        let appended = histogram.rows - rows_before;
+                        if appended > 0 {
+                            measure_phase(
+                                observer,
+                                TransformSignal::Metrics,
+                                TransformPhase::ArrowAppend,
+                                || {
+                                    histogram.append_context(appended, &resource, &scope);
+                                },
+                            );
+                        }
                     }
                     Some(Data::ExponentialHistogram(data)) => {
+                        let rows_before = exp_histogram.rows;
                         for point in data.data_points {
                             measure_result(
                                 observer,
@@ -236,11 +271,20 @@ pub fn transform_metrics_request_observed(
                                             description: metric_description,
                                             unit: metric_unit,
                                         },
-                                        &resource,
-                                        &scope,
                                     )
                                 },
                             )?;
+                        }
+                        let appended = exp_histogram.rows - rows_before;
+                        if appended > 0 {
+                            measure_phase(
+                                observer,
+                                TransformSignal::Metrics,
+                                TransformPhase::ArrowAppend,
+                                || {
+                                    exp_histogram.append_context(appended, &resource, &scope);
+                                },
+                            );
                         }
                     }
                     Some(Data::Summary(summary)) => {
@@ -321,15 +365,8 @@ impl GaugeBuilders {
         }
     }
 
-    fn append(
-        &mut self,
-        point: &NumberDataPoint,
-        value: f64,
-        meta: MetricMeta<'_>,
-        resource: &ResourceContext,
-        scope: &ScopeContext,
-    ) -> Result<()> {
-        append_metric_common(self, point, value, meta, resource, scope)?;
+    fn append(&mut self, point: &NumberDataPoint, value: f64, meta: MetricMeta<'_>) -> Result<()> {
+        append_metric_common(self, point, value, meta)?;
         self.rows += 1;
         Ok(())
     }
@@ -420,10 +457,8 @@ impl SumBuilders {
         aggregation_temporality: i32,
         is_monotonic: bool,
         meta: MetricMeta<'_>,
-        resource: &ResourceContext,
-        scope: &ScopeContext,
     ) -> Result<()> {
-        append_metric_common(self, point, value, meta, resource, scope)?;
+        append_metric_common(self, point, value, meta)?;
         self.aggregation_temporality
             .append_value(aggregation_temporality);
         self.is_monotonic.append_value(is_monotonic);
@@ -589,8 +624,6 @@ fn append_metric_common<B: NumberMetricBuilders>(
     point: &NumberDataPoint,
     value: f64,
     meta: MetricMeta<'_>,
-    resource: &ResourceContext,
-    scope: &ScopeContext,
 ) -> Result<()> {
     builders
         .timestamp()
@@ -602,30 +635,46 @@ fn append_metric_common<B: NumberMetricBuilders>(
     builders.metric_description().append_value(meta.description);
     builders.metric_unit().append_value(meta.unit);
     builders.value().append_value(value);
-    append_required_service_name(builders.service_name(), resource.service_name.as_deref());
-    append_opt(
-        builders.service_namespace(),
-        resource.service_namespace.as_deref(),
-    );
-    append_opt(
-        builders.service_instance_id(),
-        resource.service_instance_id.as_deref(),
-    );
-    append_opt(
-        builders.resource_attributes(),
-        resource.attributes_json.as_deref(),
-    );
-    append_opt(builders.scope_name(), scope.name.as_deref());
-    append_opt(builders.scope_version(), scope.version.as_deref());
-    append_opt(
-        builders.scope_attributes(),
-        scope.attributes_json.as_deref(),
-    );
     builders.flags().append_value(point.flags as i32);
     let (metric_attributes, exemplars_json, json_scratch) = builders.json_builders();
     append_attrs_json(metric_attributes, &point.attributes, json_scratch)?;
     append_exemplars_json(exemplars_json, &point.exemplars, json_scratch)?;
     Ok(())
+}
+
+fn append_number_metric_context<B: NumberMetricBuilders>(
+    builders: &mut B,
+    rows: usize,
+    resource: &ResourceContext,
+    scope: &ScopeContext,
+) {
+    append_required_service_name_n(
+        builders.service_name(),
+        resource.service_name.as_deref(),
+        rows,
+    );
+    append_opt_n(
+        builders.service_namespace(),
+        resource.service_namespace.as_deref(),
+        rows,
+    );
+    append_opt_n(
+        builders.service_instance_id(),
+        resource.service_instance_id.as_deref(),
+        rows,
+    );
+    append_opt_n(
+        builders.resource_attributes(),
+        resource.attributes_json.as_deref(),
+        rows,
+    );
+    append_opt_n(builders.scope_name(), scope.name.as_deref(), rows);
+    append_opt_n(builders.scope_version(), scope.version.as_deref(), rows);
+    append_opt_n(
+        builders.scope_attributes(),
+        scope.attributes_json.as_deref(),
+        rows,
+    );
 }
 
 struct HistogramBuilders {
@@ -690,8 +739,6 @@ impl HistogramBuilders {
         point: &HistogramDataPoint,
         aggregation_temporality: i32,
         meta: MetricMeta<'_>,
-        resource: &ResourceContext,
-        scope: &ScopeContext,
     ) -> Result<()> {
         self.timestamp
             .append_value(u64_to_i64(point.time_unix_nano, "histogram.time_unix_nano")? / 1_000);
@@ -715,17 +762,6 @@ impl HistogramBuilders {
             &point.explicit_bounds,
             &mut self.json_scratch,
         )?;
-        append_metric_resource_scope(
-            &mut self.service_name,
-            &mut self.service_namespace,
-            &mut self.service_instance_id,
-            &mut self.resource_attributes,
-            &mut self.scope_name,
-            &mut self.scope_version,
-            &mut self.scope_attributes,
-            resource,
-            scope,
-        );
         append_attrs_json(
             &mut self.metric_attributes,
             &point.attributes,
@@ -741,6 +777,21 @@ impl HistogramBuilders {
             .append_value(aggregation_temporality);
         self.rows += 1;
         Ok(())
+    }
+
+    fn append_context(&mut self, rows: usize, resource: &ResourceContext, scope: &ScopeContext) {
+        append_metric_resource_scope_n(
+            &mut self.service_name,
+            &mut self.service_namespace,
+            &mut self.service_instance_id,
+            &mut self.resource_attributes,
+            &mut self.scope_name,
+            &mut self.scope_version,
+            &mut self.scope_attributes,
+            rows,
+            resource,
+            scope,
+        );
     }
 
     fn finish_if_non_empty(mut self) -> Result<Option<RecordBatch>> {
@@ -850,8 +901,6 @@ impl ExpHistogramBuilders {
         point: &ExponentialHistogramDataPoint,
         aggregation_temporality: i32,
         meta: MetricMeta<'_>,
-        resource: &ResourceContext,
-        scope: &ScopeContext,
     ) -> Result<()> {
         self.timestamp.append_value(
             u64_to_i64(point.time_unix_nano, "exp_histogram.time_unix_nano")? / 1_000,
@@ -894,17 +943,6 @@ impl ExpHistogramBuilders {
             self.negative_offset.append_value(0);
             self.negative_bucket_counts.append_value("[]");
         }
-        append_metric_resource_scope(
-            &mut self.service_name,
-            &mut self.service_namespace,
-            &mut self.service_instance_id,
-            &mut self.resource_attributes,
-            &mut self.scope_name,
-            &mut self.scope_version,
-            &mut self.scope_attributes,
-            resource,
-            scope,
-        );
         append_attrs_json(
             &mut self.metric_attributes,
             &point.attributes,
@@ -920,6 +958,21 @@ impl ExpHistogramBuilders {
             .append_value(aggregation_temporality);
         self.rows += 1;
         Ok(())
+    }
+
+    fn append_context(&mut self, rows: usize, resource: &ResourceContext, scope: &ScopeContext) {
+        append_metric_resource_scope_n(
+            &mut self.service_name,
+            &mut self.service_namespace,
+            &mut self.service_instance_id,
+            &mut self.resource_attributes,
+            &mut self.scope_name,
+            &mut self.scope_version,
+            &mut self.scope_attributes,
+            rows,
+            resource,
+            scope,
+        );
     }
 
     fn finish_if_non_empty(mut self) -> Result<Option<RecordBatch>> {
@@ -963,7 +1016,7 @@ impl ExpHistogramBuilders {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn append_metric_resource_scope(
+fn append_metric_resource_scope_n(
     service_name: &mut StringBuilder,
     service_namespace: &mut StringBuilder,
     service_instance_id: &mut StringBuilder,
@@ -971,16 +1024,29 @@ fn append_metric_resource_scope(
     scope_name: &mut StringBuilder,
     scope_version: &mut StringBuilder,
     scope_attributes: &mut StringBuilder,
+    rows: usize,
     resource: &ResourceContext,
     scope: &ScopeContext,
 ) {
-    append_required_service_name(service_name, resource.service_name.as_deref());
-    append_opt(service_namespace, resource.service_namespace.as_deref());
-    append_opt(service_instance_id, resource.service_instance_id.as_deref());
-    append_opt(resource_attributes, resource.attributes_json.as_deref());
-    append_opt(scope_name, scope.name.as_deref());
-    append_opt(scope_version, scope.version.as_deref());
-    append_opt(scope_attributes, scope.attributes_json.as_deref());
+    append_required_service_name_n(service_name, resource.service_name.as_deref(), rows);
+    append_opt_n(
+        service_namespace,
+        resource.service_namespace.as_deref(),
+        rows,
+    );
+    append_opt_n(
+        service_instance_id,
+        resource.service_instance_id.as_deref(),
+        rows,
+    );
+    append_opt_n(
+        resource_attributes,
+        resource.attributes_json.as_deref(),
+        rows,
+    );
+    append_opt_n(scope_name, scope.name.as_deref(), rows);
+    append_opt_n(scope_version, scope.version.as_deref(), rows);
+    append_opt_n(scope_attributes, scope.attributes_json.as_deref(), rows);
 }
 
 #[inline]
