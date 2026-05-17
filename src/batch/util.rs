@@ -18,16 +18,27 @@ pub(super) fn non_empty_str(value: Option<&str>) -> Option<String> {
 }
 
 #[inline]
-pub(super) fn append_opt(builder: &mut StringBuilder, value: Option<&str>) {
+pub(super) fn append_opt_n(builder: &mut StringBuilder, value: Option<&str>, n: usize) {
     match value {
-        Some(value) => builder.append_value(value),
-        None => builder.append_null(),
+        Some(value) => {
+            for _ in 0..n {
+                builder.append_value(value);
+            }
+        }
+        None => builder.append_nulls(n),
     }
 }
 
 #[inline]
-pub(super) fn append_required_service_name(builder: &mut StringBuilder, value: Option<&str>) {
-    builder.append_value(value.unwrap_or("unknown"));
+pub(super) fn append_required_service_name_n(
+    builder: &mut StringBuilder,
+    value: Option<&str>,
+    n: usize,
+) {
+    let value = value.unwrap_or("unknown");
+    for _ in 0..n {
+        builder.append_value(value);
+    }
 }
 
 #[inline]

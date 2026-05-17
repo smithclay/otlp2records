@@ -1,5 +1,6 @@
 //! Public API behavior tests moved out of the crate facade.
 
+use arrow_array::{Array, StringArray};
 use opentelemetry_proto::tonic::{
     collector::logs::v1::ExportLogsServiceRequest,
     collector::metrics::v1::ExportMetricsServiceRequest,
@@ -18,6 +19,33 @@ use prost::Message;
 // ========================================================================
 // Helper functions for creating test data
 // ========================================================================
+
+fn string_attr(key: &str, value: &str) -> KeyValue {
+    KeyValue {
+        key: key.to_string(),
+        value: Some(AnyValue {
+            value: Some(any_value::Value::StringValue(value.to_string())),
+        }),
+    }
+}
+
+fn string_column(batch: &arrow_array::RecordBatch, name: &str) -> Vec<Option<String>> {
+    let column = batch
+        .column_by_name(name)
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    (0..column.len())
+        .map(|idx| {
+            if column.is_null(idx) {
+                None
+            } else {
+                Some(column.value(idx).to_string())
+            }
+        })
+        .collect()
+}
 
 fn create_test_log_request() -> ExportLogsServiceRequest {
     ExportLogsServiceRequest {
@@ -251,6 +279,22 @@ fn create_sum_only_metrics_request() -> ExportMetricsServiceRequest {
 // High-level API tests
 // ========================================================================
 
+#[derive(Default)]
+struct TestObserver {
+    phases: Vec<TransformPhase>,
+    counters: Vec<TransformCounter>,
+}
+
+impl TransformObserver for TestObserver {
+    fn on_phase(&mut self, timing: TransformPhaseTiming) {
+        self.phases.push(timing.phase);
+    }
+
+    fn on_counter(&mut self, counter: TransformCounterValue) {
+        self.counters.push(counter.counter);
+    }
+}
+
 #[test]
 fn test_transform_logs_protobuf() {
     let request = create_test_log_request();
@@ -266,6 +310,164 @@ fn test_transform_logs_protobuf() {
     assert!(schema.field_with_name("timestamp").is_ok());
     assert!(schema.field_with_name("service_name").is_ok());
     assert!(schema.field_with_name("severity_number").is_ok());
+}
+
+#[test]
+fn test_transform_logs_context_columns_align_across_scope_groups() {
+    fn log_record(body: &str, trace_byte: u8) -> LogRecord {
+        LogRecord {
+            time_unix_nano: 1_700_000_000_000_000_000 + u64::from(trace_byte),
+            observed_time_unix_nano: 1_700_000_000_100_000_000 + u64::from(trace_byte),
+            severity_number: 9,
+            severity_text: "INFO".to_string(),
+            body: Some(AnyValue {
+                value: Some(any_value::Value::StringValue(body.to_string())),
+            }),
+            trace_id: vec![trace_byte; 16],
+            span_id: vec![trace_byte; 8],
+            ..Default::default()
+        }
+    }
+
+    let request = ExportLogsServiceRequest {
+        resource_logs: vec![
+            ResourceLogs {
+                resource: Some(Resource {
+                    attributes: vec![string_attr("service.name", "svc-a")],
+                    ..Default::default()
+                }),
+                scope_logs: vec![
+                    ScopeLogs {
+                        scope: Some(InstrumentationScope {
+                            name: "lib-a".to_string(),
+                            ..Default::default()
+                        }),
+                        log_records: vec![log_record("a-1", 1), log_record("a-2", 2)],
+                        ..Default::default()
+                    },
+                    ScopeLogs {
+                        scope: Some(InstrumentationScope {
+                            name: "lib-b".to_string(),
+                            ..Default::default()
+                        }),
+                        log_records: vec![log_record("b-1", 3)],
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            },
+            ResourceLogs {
+                resource: Some(Resource {
+                    attributes: vec![string_attr("service.name", "svc-b")],
+                    ..Default::default()
+                }),
+                scope_logs: vec![ScopeLogs {
+                    scope: Some(InstrumentationScope {
+                        name: "lib-c".to_string(),
+                        ..Default::default()
+                    }),
+                    log_records: vec![log_record("c-1", 4)],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        ],
+    };
+    let batch = transform_logs(&request.encode_to_vec(), InputFormat::Protobuf).unwrap();
+
+    assert_eq!(
+        string_column(&batch, "body"),
+        vec![
+            Some("a-1".to_string()),
+            Some("a-2".to_string()),
+            Some("b-1".to_string()),
+            Some("c-1".to_string()),
+        ]
+    );
+    assert_eq!(
+        string_column(&batch, "service_name"),
+        vec![
+            Some("svc-a".to_string()),
+            Some("svc-a".to_string()),
+            Some("svc-a".to_string()),
+            Some("svc-b".to_string()),
+        ]
+    );
+    assert_eq!(
+        string_column(&batch, "scope_name"),
+        vec![
+            Some("lib-a".to_string()),
+            Some("lib-a".to_string()),
+            Some("lib-b".to_string()),
+            Some("lib-c".to_string()),
+        ]
+    );
+    assert_eq!(
+        string_column(&batch, "resource_attributes"),
+        vec![
+            Some(r#"{"service.name":"svc-a"}"#.to_string()),
+            Some(r#"{"service.name":"svc-a"}"#.to_string()),
+            Some(r#"{"service.name":"svc-a"}"#.to_string()),
+            Some(r#"{"service.name":"svc-b"}"#.to_string()),
+        ]
+    );
+}
+
+#[test]
+fn test_transform_logs_with_observer_matches_default() {
+    let request = create_test_log_request();
+    let bytes = request.encode_to_vec();
+
+    let default_batch = transform_logs(&bytes, InputFormat::Protobuf).unwrap();
+    let mut observer = TestObserver::default();
+    let observed_batch =
+        transform_logs_with_observer(&bytes, InputFormat::Protobuf, &mut observer).unwrap();
+
+    assert_eq!(observed_batch.num_rows(), default_batch.num_rows());
+    assert!(observer.phases.contains(&TransformPhase::ProtobufDecode));
+    assert!(observer.phases.contains(&TransformPhase::ResourceLogsBuild));
+    assert!(observer
+        .phases
+        .contains(&TransformPhase::ResourceContextBuild));
+    assert!(observer.phases.contains(&TransformPhase::ScopeLogsBuild));
+    assert!(observer.phases.contains(&TransformPhase::ScopeContextBuild));
+    assert!(observer.phases.contains(&TransformPhase::LogRecordBuild));
+    assert!(observer.phases.contains(&TransformPhase::LogAttributesJson));
+    assert!(observer.phases.contains(&TransformPhase::ArrowFinalize));
+    assert!(observer.counters.contains(&TransformCounter::OutputRows));
+    assert!(observer
+        .counters
+        .contains(&TransformCounter::ResourceContextDuplicateMiss));
+    assert!(observer
+        .counters
+        .contains(&TransformCounter::ScopeContextDuplicateMiss));
+    assert!(observer
+        .counters
+        .contains(&TransformCounter::ResourceAttributesRowCopies));
+}
+
+#[test]
+fn test_transform_observer_reports_duplicate_context_hits() {
+    let mut request = create_test_log_request();
+    request.resource_logs.push(request.resource_logs[0].clone());
+    let bytes = request.encode_to_vec();
+
+    let mut observer = TestObserver::default();
+    let batch = transform_logs_with_observer(&bytes, InputFormat::Protobuf, &mut observer).unwrap();
+
+    assert_eq!(batch.num_rows(), 2);
+    assert!(observer
+        .counters
+        .contains(&TransformCounter::ResourceContextDuplicateMiss));
+    assert!(observer
+        .counters
+        .contains(&TransformCounter::ResourceContextDuplicateHit));
+    assert!(observer
+        .counters
+        .contains(&TransformCounter::ScopeContextDuplicateMiss));
+    assert!(observer
+        .counters
+        .contains(&TransformCounter::ScopeContextDuplicateHit));
 }
 
 #[test]
@@ -318,6 +520,141 @@ fn test_transform_traces_protobuf() {
     assert!(schema.field_with_name("trace_id").is_ok());
     assert!(schema.field_with_name("span_id").is_ok());
     assert!(schema.field_with_name("span_name").is_ok());
+}
+
+#[test]
+fn test_transform_traces_context_columns_align_across_scope_groups() {
+    fn span(name: &str, id: u8) -> Span {
+        Span {
+            trace_id: vec![id; 16],
+            span_id: vec![id; 8],
+            name: name.to_string(),
+            kind: 1,
+            start_time_unix_nano: 1_700_000_000_000_000_000 + u64::from(id),
+            end_time_unix_nano: 1_700_000_000_100_000_000 + u64::from(id),
+            ..Default::default()
+        }
+    }
+
+    let request = ExportTraceServiceRequest {
+        resource_spans: vec![
+            ResourceSpans {
+                resource: Some(Resource {
+                    attributes: vec![string_attr("service.name", "svc-a")],
+                    ..Default::default()
+                }),
+                scope_spans: vec![
+                    ScopeSpans {
+                        scope: Some(InstrumentationScope {
+                            name: "lib-a".to_string(),
+                            ..Default::default()
+                        }),
+                        spans: vec![span("a-1", 1), span("a-2", 2)],
+                        ..Default::default()
+                    },
+                    ScopeSpans {
+                        scope: Some(InstrumentationScope {
+                            name: "lib-b".to_string(),
+                            ..Default::default()
+                        }),
+                        spans: vec![span("b-1", 3)],
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            },
+            ResourceSpans {
+                resource: Some(Resource {
+                    attributes: vec![string_attr("service.name", "svc-b")],
+                    ..Default::default()
+                }),
+                scope_spans: vec![ScopeSpans {
+                    scope: Some(InstrumentationScope {
+                        name: "lib-c".to_string(),
+                        ..Default::default()
+                    }),
+                    spans: vec![span("c-1", 4)],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        ],
+    };
+    let batch = transform_traces(&request.encode_to_vec(), InputFormat::Protobuf).unwrap();
+
+    assert_eq!(
+        string_column(&batch, "span_name"),
+        vec![
+            Some("a-1".to_string()),
+            Some("a-2".to_string()),
+            Some("b-1".to_string()),
+            Some("c-1".to_string()),
+        ]
+    );
+    assert_eq!(
+        string_column(&batch, "service_name"),
+        vec![
+            Some("svc-a".to_string()),
+            Some("svc-a".to_string()),
+            Some("svc-a".to_string()),
+            Some("svc-b".to_string()),
+        ]
+    );
+    assert_eq!(
+        string_column(&batch, "scope_name"),
+        vec![
+            Some("lib-a".to_string()),
+            Some("lib-a".to_string()),
+            Some("lib-b".to_string()),
+            Some("lib-c".to_string()),
+        ]
+    );
+    assert_eq!(
+        string_column(&batch, "resource_attributes"),
+        vec![
+            Some(r#"{"service.name":"svc-a"}"#.to_string()),
+            Some(r#"{"service.name":"svc-a"}"#.to_string()),
+            Some(r#"{"service.name":"svc-a"}"#.to_string()),
+            Some(r#"{"service.name":"svc-b"}"#.to_string()),
+        ]
+    );
+}
+
+#[test]
+fn test_transform_traces_with_observer_matches_default() {
+    let request = create_test_trace_request();
+    let bytes = request.encode_to_vec();
+
+    let default_batch = transform_traces(&bytes, InputFormat::Protobuf).unwrap();
+    let mut observer = TestObserver::default();
+    let observed_batch =
+        transform_traces_with_observer(&bytes, InputFormat::Protobuf, &mut observer).unwrap();
+
+    assert_eq!(observed_batch.num_rows(), default_batch.num_rows());
+    assert!(observer.phases.contains(&TransformPhase::ProtobufDecode));
+    assert!(observer
+        .phases
+        .contains(&TransformPhase::ResourceSpansBuild));
+    assert!(observer
+        .phases
+        .contains(&TransformPhase::ResourceContextBuild));
+    assert!(observer.phases.contains(&TransformPhase::ScopeSpansBuild));
+    assert!(observer.phases.contains(&TransformPhase::ScopeContextBuild));
+    assert!(observer.phases.contains(&TransformPhase::SpanBuild));
+    assert!(observer
+        .phases
+        .contains(&TransformPhase::SpanAttributesJson));
+    assert!(observer.phases.contains(&TransformPhase::ArrowFinalize));
+    assert!(observer.counters.contains(&TransformCounter::OutputRows));
+    assert!(observer
+        .counters
+        .contains(&TransformCounter::ResourceContextDuplicateMiss));
+    assert!(observer
+        .counters
+        .contains(&TransformCounter::ScopeContextDuplicateMiss));
+    assert!(observer
+        .counters
+        .contains(&TransformCounter::ResourceAttributesRowCopies));
 }
 
 #[test]
@@ -384,6 +721,156 @@ fn test_transform_metrics_protobuf() {
         .field_with_name("aggregation_temporality")
         .is_ok());
     assert!(sum_schema.field_with_name("is_monotonic").is_ok());
+}
+
+#[test]
+fn test_transform_metrics_context_columns_align_after_skipped_points() {
+    fn gauge_point(value: f64, time_offset: u64) -> NumberDataPoint {
+        NumberDataPoint {
+            time_unix_nano: 1_700_000_000_000_000_000 + time_offset,
+            value: Some(
+                opentelemetry_proto::tonic::metrics::v1::number_data_point::Value::AsDouble(value),
+            ),
+            ..Default::default()
+        }
+    }
+
+    let request = ExportMetricsServiceRequest {
+        resource_metrics: vec![
+            ResourceMetrics {
+                resource: Some(Resource {
+                    attributes: vec![string_attr("service.name", "svc-a")],
+                    ..Default::default()
+                }),
+                scope_metrics: vec![
+                    ScopeMetrics {
+                        scope: Some(InstrumentationScope {
+                            name: "lib-a".to_string(),
+                            ..Default::default()
+                        }),
+                        metrics: vec![Metric {
+                            name: "gauge-a".to_string(),
+                            data: Some(Data::Gauge(Gauge {
+                                data_points: vec![gauge_point(1.0, 1), gauge_point(f64::NAN, 2)],
+                            })),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    },
+                    ScopeMetrics {
+                        scope: Some(InstrumentationScope {
+                            name: "lib-b".to_string(),
+                            ..Default::default()
+                        }),
+                        metrics: vec![Metric {
+                            name: "gauge-b".to_string(),
+                            data: Some(Data::Gauge(Gauge {
+                                data_points: vec![gauge_point(2.0, 3)],
+                            })),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            },
+            ResourceMetrics {
+                resource: Some(Resource {
+                    attributes: vec![string_attr("service.name", "svc-b")],
+                    ..Default::default()
+                }),
+                scope_metrics: vec![ScopeMetrics {
+                    scope: Some(InstrumentationScope {
+                        name: "lib-c".to_string(),
+                        ..Default::default()
+                    }),
+                    metrics: vec![Metric {
+                        name: "gauge-c".to_string(),
+                        data: Some(Data::Gauge(Gauge {
+                            data_points: vec![gauge_point(3.0, 4)],
+                        })),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        ],
+    };
+    let batches = transform_metrics(&request.encode_to_vec(), InputFormat::Protobuf).unwrap();
+    let gauge = batches.gauge.unwrap();
+
+    assert_eq!(gauge.num_rows(), 3);
+    assert_eq!(
+        string_column(&gauge, "metric_name"),
+        vec![
+            Some("gauge-a".to_string()),
+            Some("gauge-b".to_string()),
+            Some("gauge-c".to_string()),
+        ]
+    );
+    assert_eq!(
+        string_column(&gauge, "service_name"),
+        vec![
+            Some("svc-a".to_string()),
+            Some("svc-a".to_string()),
+            Some("svc-b".to_string()),
+        ]
+    );
+    assert_eq!(
+        string_column(&gauge, "scope_name"),
+        vec![
+            Some("lib-a".to_string()),
+            Some("lib-b".to_string()),
+            Some("lib-c".to_string()),
+        ]
+    );
+    assert_eq!(
+        string_column(&gauge, "resource_attributes"),
+        vec![
+            Some(r#"{"service.name":"svc-a"}"#.to_string()),
+            Some(r#"{"service.name":"svc-a"}"#.to_string()),
+            Some(r#"{"service.name":"svc-b"}"#.to_string()),
+        ]
+    );
+}
+
+#[test]
+fn test_transform_metrics_with_observer_matches_default() {
+    let request = create_test_metrics_request();
+    let bytes = request.encode_to_vec();
+
+    let default_batches = transform_metrics(&bytes, InputFormat::Protobuf).unwrap();
+    let mut observer = TestObserver::default();
+    let observed_batches =
+        transform_metrics_with_observer(&bytes, InputFormat::Protobuf, &mut observer).unwrap();
+
+    assert_eq!(
+        observed_batches
+            .gauge
+            .as_ref()
+            .map(|batch| batch.num_rows()),
+        default_batches.gauge.as_ref().map(|batch| batch.num_rows())
+    );
+    assert_eq!(
+        observed_batches.sum.as_ref().map(|batch| batch.num_rows()),
+        default_batches.sum.as_ref().map(|batch| batch.num_rows())
+    );
+    assert!(observer.phases.contains(&TransformPhase::ProtobufDecode));
+    assert!(observer.phases.contains(&TransformPhase::MetricsCapacity));
+    assert!(observer
+        .phases
+        .contains(&TransformPhase::ResourceContextBuild));
+    assert!(observer.phases.contains(&TransformPhase::ScopeContextBuild));
+    assert!(observer.phases.contains(&TransformPhase::ArrowAppend));
+    assert!(observer.phases.contains(&TransformPhase::ArrowFinalize));
+    assert!(observer.counters.contains(&TransformCounter::OutputRows));
+    assert!(observer
+        .counters
+        .contains(&TransformCounter::ResourceContextDuplicateMiss));
+    assert!(observer
+        .counters
+        .contains(&TransformCounter::ScopeContextDuplicateMiss));
 }
 
 #[test]

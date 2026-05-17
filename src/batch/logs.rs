@@ -1,21 +1,28 @@
 //! Log request-to-RecordBatch conversion.
 
+use std::time::Instant;
+
 use arrow_array::{
     builder::{Int32Builder, Int64Builder, StringBuilder, TimestampMicrosecondBuilder},
     RecordBatch,
 };
 use opentelemetry_proto::tonic::{
-    collector::logs::v1::ExportLogsServiceRequest, logs::v1::LogRecord,
+    collector::logs::v1::ExportLogsServiceRequest,
+    logs::v1::{LogRecord, ResourceLogs, ScopeLogs},
 };
 use prost::Message;
 
 use crate::{schema::logs_schema, Result};
 
 use super::{
-    context::{ResourceContext, ScopeContext},
+    context::{ContextDuplicateTracker, ResourceContext, ScopeContext},
     json::{append_attrs_json, append_log_body},
+    profile::{
+        measure_phase, measure_result, observe_counter, observe_phase, TransformCounter,
+        TransformObserver, TransformPhase, TransformSignal,
+    },
     util::{
-        append_hex_or_null, append_opt, append_required_service_name, array, record_batch,
+        append_hex_or_null, append_opt_n, append_required_service_name_n, array, record_batch,
         string_builder_bytes, u64_to_i64,
     },
 };
@@ -25,49 +32,196 @@ pub fn transform_logs_protobuf(bytes: &[u8]) -> Result<RecordBatch> {
     transform_logs_request(request, bytes.len())
 }
 
+pub fn transform_logs_protobuf_observed(
+    bytes: &[u8],
+    observer: &mut Option<&mut dyn TransformObserver>,
+) -> Result<RecordBatch> {
+    let request = measure_result(
+        observer,
+        TransformSignal::Logs,
+        TransformPhase::ProtobufDecode,
+        || ExportLogsServiceRequest::decode(bytes),
+    )?;
+    transform_logs_request_observed(request, bytes.len(), observer)
+}
+
 pub fn transform_logs_request(
     request: ExportLogsServiceRequest,
     input_bytes: usize,
 ) -> Result<RecordBatch> {
-    let rows = request
-        .resource_logs
-        .iter()
-        .map(|rl| {
-            rl.scope_logs
+    let mut observer = None;
+    transform_logs_request_observed(request, input_bytes, &mut observer)
+}
+
+pub fn transform_logs_request_observed(
+    request: ExportLogsServiceRequest,
+    input_bytes: usize,
+    observer: &mut Option<&mut dyn TransformObserver>,
+) -> Result<RecordBatch> {
+    let rows = measure_phase(
+        observer,
+        TransformSignal::Logs,
+        TransformPhase::RowCount,
+        || {
+            request
+                .resource_logs
                 .iter()
-                .map(|sl| sl.log_records.len())
-                .sum::<usize>()
-        })
-        .sum();
-    let mut builders = LogBuilders::with_capacity(rows, input_bytes);
+                .map(|rl| {
+                    rl.scope_logs
+                        .iter()
+                        .map(|sl| sl.log_records.len())
+                        .sum::<usize>()
+                })
+                .sum()
+        },
+    );
+    observe_counter(
+        observer,
+        TransformSignal::Logs,
+        TransformCounter::OutputRows,
+        rows as u64,
+    );
+    let mut builders = measure_phase(
+        observer,
+        TransformSignal::Logs,
+        TransformPhase::BuilderInit,
+        || LogBuilders::with_capacity(rows, input_bytes),
+    );
+    let mut duplicates = observer.is_some().then(ContextDuplicateTracker::default);
 
     for resource_logs in request.resource_logs {
-        let resource = ResourceContext::from_attrs(
-            resource_logs
-                .resource
-                .as_ref()
-                .map(|r| r.attributes.as_slice())
-                .unwrap_or(&[]),
-        );
-
-        for scope_logs in resource_logs.scope_logs {
-            let scope = ScopeContext::new(
-                scope_logs.scope.as_ref().map(|s| s.name.as_str()),
-                scope_logs.scope.as_ref().map(|s| s.version.as_str()),
-                scope_logs
-                    .scope
-                    .as_ref()
-                    .map(|s| s.attributes.as_slice())
-                    .unwrap_or(&[]),
-            );
-
-            for record in scope_logs.log_records {
-                builders.append(&record, &resource, &scope)?;
-            }
-        }
+        append_resource_logs_observed(resource_logs, &mut builders, observer, duplicates.as_mut())?;
     }
 
-    builders.finish()
+    measure_result(
+        observer,
+        TransformSignal::Logs,
+        TransformPhase::ArrowFinalize,
+        || builders.finish(),
+    )
+}
+
+fn append_resource_logs_observed(
+    resource_logs: ResourceLogs,
+    builders: &mut LogBuilders,
+    observer: &mut Option<&mut dyn TransformObserver>,
+    mut duplicates: Option<&mut ContextDuplicateTracker>,
+) -> Result<()> {
+    let resource_phase_start = phase_start(observer);
+    let ResourceLogs {
+        resource,
+        scope_logs,
+        ..
+    } = resource_logs;
+    let resource_attrs = resource
+        .as_ref()
+        .map(|r| r.attributes.as_slice())
+        .unwrap_or(&[]);
+    let resource = ResourceContext::from_attrs_observed(
+        resource_attrs,
+        TransformSignal::Logs,
+        observer,
+        duplicates.as_deref_mut(),
+    );
+
+    for scope_logs in scope_logs {
+        append_scope_logs_observed(
+            scope_logs,
+            builders,
+            &resource,
+            observer,
+            duplicates.as_deref_mut(),
+        )?;
+    }
+
+    finish_phase(
+        observer,
+        TransformSignal::Logs,
+        TransformPhase::ResourceLogsBuild,
+        resource_phase_start,
+    );
+    Ok(())
+}
+
+fn append_scope_logs_observed(
+    scope_logs: ScopeLogs,
+    builders: &mut LogBuilders,
+    resource: &ResourceContext,
+    observer: &mut Option<&mut dyn TransformObserver>,
+    duplicates: Option<&mut ContextDuplicateTracker>,
+) -> Result<()> {
+    let scope_phase_start = phase_start(observer);
+    let ScopeLogs {
+        scope, log_records, ..
+    } = scope_logs;
+    let scope_name = scope.as_ref().map(|s| s.name.as_str());
+    let scope_version = scope.as_ref().map(|s| s.version.as_str());
+    let scope_attrs = scope
+        .as_ref()
+        .map(|s| s.attributes.as_slice())
+        .unwrap_or(&[]);
+    let scope = ScopeContext::new_observed(
+        scope_name,
+        scope_version,
+        scope_attrs,
+        TransformSignal::Logs,
+        observer,
+        duplicates,
+    );
+    let record_count = log_records.len();
+    if record_count > 0 {
+        let context_phase_start = phase_start(observer);
+        builders.append_context_observed(record_count, resource, &scope, observer);
+        finish_phase(
+            observer,
+            TransformSignal::Logs,
+            TransformPhase::LogRecordBuild,
+            context_phase_start,
+        );
+    }
+
+    for record in log_records {
+        append_log_record_observed(record, builders, observer)?;
+    }
+
+    finish_phase(
+        observer,
+        TransformSignal::Logs,
+        TransformPhase::ScopeLogsBuild,
+        scope_phase_start,
+    );
+    Ok(())
+}
+
+fn append_log_record_observed(
+    record: LogRecord,
+    builders: &mut LogBuilders,
+    observer: &mut Option<&mut dyn TransformObserver>,
+) -> Result<()> {
+    let phase_start = phase_start(observer);
+    builders.append_observed(&record, observer)?;
+    finish_phase(
+        observer,
+        TransformSignal::Logs,
+        TransformPhase::LogRecordBuild,
+        phase_start,
+    );
+    Ok(())
+}
+
+fn phase_start(observer: &Option<&mut dyn TransformObserver>) -> Option<Instant> {
+    observer.is_some().then(Instant::now)
+}
+
+fn finish_phase(
+    observer: &mut Option<&mut dyn TransformObserver>,
+    signal: TransformSignal,
+    phase: TransformPhase,
+    start: Option<Instant>,
+) {
+    if let Some(start) = start {
+        observe_phase(observer, signal, phase, start.elapsed());
+    }
 }
 
 struct LogBuilders {
@@ -111,47 +265,151 @@ impl LogBuilders {
         }
     }
 
-    fn append(
+    fn append_observed(
         &mut self,
         record: &LogRecord,
-        resource: &ResourceContext,
-        scope: &ScopeContext,
+        observer: &mut Option<&mut dyn TransformObserver>,
     ) -> Result<()> {
-        self.timestamp
-            .append_value(u64_to_i64(record.time_unix_nano, "log.time_unix_nano")? / 1_000);
-        self.observed_timestamp.append_value(
-            u64_to_i64(
-                record.observed_time_unix_nano,
-                "log.observed_time_unix_nano",
-            )? / 1_000,
-        );
-        append_hex_or_null(&mut self.trace_id, &record.trace_id);
-        append_hex_or_null(&mut self.span_id, &record.span_id);
-        append_required_service_name(&mut self.service_name, resource.service_name.as_deref());
-        append_opt(
-            &mut self.service_namespace,
-            resource.service_namespace.as_deref(),
-        );
-        append_opt(
-            &mut self.service_instance_id,
-            resource.service_instance_id.as_deref(),
-        );
-        self.severity_number.append_value(record.severity_number);
-        self.severity_text.append_value(&record.severity_text);
-        append_log_body(&mut self.body, record.body.as_ref())?;
-        append_opt(
-            &mut self.resource_attributes,
-            resource.attributes_json.as_deref(),
-        );
-        append_opt(&mut self.scope_name, scope.name.as_deref());
-        append_opt(&mut self.scope_version, scope.version.as_deref());
-        append_opt(&mut self.scope_attributes, scope.attributes_json.as_deref());
-        append_attrs_json(
-            &mut self.log_attributes,
-            &record.attributes,
-            &mut self.json_scratch,
+        measure_result(
+            observer,
+            TransformSignal::Logs,
+            TransformPhase::ArrowAppend,
+            || {
+                self.timestamp
+                    .append_value(u64_to_i64(record.time_unix_nano, "log.time_unix_nano")? / 1_000);
+                self.observed_timestamp.append_value(
+                    u64_to_i64(
+                        record.observed_time_unix_nano,
+                        "log.observed_time_unix_nano",
+                    )? / 1_000,
+                );
+                append_hex_or_null(&mut self.trace_id, &record.trace_id);
+                append_hex_or_null(&mut self.span_id, &record.span_id);
+                self.severity_number.append_value(record.severity_number);
+                self.severity_text.append_value(&record.severity_text);
+                Ok::<(), crate::Error>(())
+            },
+        )?;
+
+        measure_result(
+            observer,
+            TransformSignal::Logs,
+            TransformPhase::BodyAppend,
+            || append_log_body(&mut self.body, record.body.as_ref()),
+        )?;
+
+        measure_result(
+            observer,
+            TransformSignal::Logs,
+            TransformPhase::LogAttributesJson,
+            || {
+                append_attrs_json(
+                    &mut self.log_attributes,
+                    &record.attributes,
+                    &mut self.json_scratch,
+                )
+            },
         )?;
         Ok(())
+    }
+
+    fn append_context_observed(
+        &mut self,
+        rows: usize,
+        resource: &ResourceContext,
+        scope: &ScopeContext,
+        observer: &mut Option<&mut dyn TransformObserver>,
+    ) {
+        if rows == 0 {
+            return;
+        }
+
+        measure_phase(
+            observer,
+            TransformSignal::Logs,
+            TransformPhase::ArrowAppend,
+            || {
+                append_required_service_name_n(
+                    &mut self.service_name,
+                    resource.service_name.as_deref(),
+                    rows,
+                );
+                append_opt_n(
+                    &mut self.service_namespace,
+                    resource.service_namespace.as_deref(),
+                    rows,
+                );
+                append_opt_n(
+                    &mut self.service_instance_id,
+                    resource.service_instance_id.as_deref(),
+                    rows,
+                );
+            },
+        );
+
+        measure_phase(
+            observer,
+            TransformSignal::Logs,
+            TransformPhase::ResourceAttributesAppend,
+            || {
+                append_opt_n(
+                    &mut self.resource_attributes,
+                    resource.attributes_json.as_deref(),
+                    rows,
+                );
+            },
+        );
+        if let Some(json) = resource.attributes_json.as_deref() {
+            observe_counter(
+                observer,
+                TransformSignal::Logs,
+                TransformCounter::ResourceAttributesRowCopies,
+                rows as u64,
+            );
+            observe_counter(
+                observer,
+                TransformSignal::Logs,
+                TransformCounter::ResourceAttributesRowCopyBytes,
+                (json.len() as u64).saturating_mul(rows as u64),
+            );
+        }
+
+        measure_phase(
+            observer,
+            TransformSignal::Logs,
+            TransformPhase::ArrowAppend,
+            || {
+                append_opt_n(&mut self.scope_name, scope.name.as_deref(), rows);
+                append_opt_n(&mut self.scope_version, scope.version.as_deref(), rows);
+            },
+        );
+
+        measure_phase(
+            observer,
+            TransformSignal::Logs,
+            TransformPhase::ScopeAttributesAppend,
+            || {
+                append_opt_n(
+                    &mut self.scope_attributes,
+                    scope.attributes_json.as_deref(),
+                    rows,
+                )
+            },
+        );
+        if let Some(json) = scope.attributes_json.as_deref() {
+            observe_counter(
+                observer,
+                TransformSignal::Logs,
+                TransformCounter::ScopeAttributesRowCopies,
+                rows as u64,
+            );
+            observe_counter(
+                observer,
+                TransformSignal::Logs,
+                TransformCounter::ScopeAttributesRowCopyBytes,
+                (json.len() as u64).saturating_mul(rows as u64),
+            );
+        }
     }
 
     fn finish(mut self) -> Result<RecordBatch> {

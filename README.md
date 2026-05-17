@@ -29,13 +29,13 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-otlp2records = "0.5"
+otlp2records = "0.7"
 
 # Optional: Enable Parquet output
-otlp2records = { version = "0.5", features = ["parquet"] }
+otlp2records = { version = "0.7", features = ["parquet"] }
 
 # Optional: Enable WASM bindings
-otlp2records = { version = "0.5", features = ["wasm"] }
+otlp2records = { version = "0.7", features = ["wasm"] }
 ```
 
 ## Usage
@@ -120,6 +120,20 @@ const arrowIpc = transform_logs_wasm(otlpBytes, "protobuf");
 | `transform_logs(bytes, format)` | Transform OTLP logs to Arrow RecordBatch |
 | `transform_traces(bytes, format)` | Transform OTLP traces to Arrow RecordBatch |
 | `transform_metrics(bytes, format)` | Transform OTLP metrics to MetricBatches |
+
+### Transform Observation
+
+Production callers can opt into phase timings and counters without changing output semantics:
+
+| Function | Description |
+|----------|-------------|
+| `transform_logs_with_observer(bytes, format, observer)` | Transform logs and report decode/build/append/finalize phases |
+| `transform_traces_with_observer(bytes, format, observer)` | Transform traces and report decode/build/attribute JSON/append/finalize phases |
+| `transform_metrics_with_observer(bytes, format, observer)` | Transform metrics and report decode/capacity/context/append/finalize phases |
+
+Implement `TransformObserver` to receive `TransformPhaseTiming` and `TransformCounterValue`
+events. Counters include duplicate resource/scope context hits and misses plus repeated
+resource/scope attribute row-copy counts and bytes.
 
 ### Output Functions
 

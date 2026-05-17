@@ -11,11 +11,7 @@ use opentelemetry_proto::tonic::{
     common::v1::KeyValue,
     metrics::v1::{metric::Data, number_data_point},
 };
-use otlp2records::{
-    transform_logs, transform_logs_decoded_for_bench, transform_metrics,
-    transform_metrics_decoded_for_bench, transform_traces, transform_traces_decoded_for_bench,
-    InputFormat,
-};
+use otlp2records::{transform_logs, transform_metrics, transform_traces, InputFormat};
 use prost::Message;
 
 const WARMUP_ITERS: usize = 5;
@@ -100,7 +96,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let decode = measure(workload.kind, PathKind::Decode, &bytes)?;
         let decoded = decode_for_measurement(workload.kind, &bytes)?;
         let clone_only = measure_decoded_clone(&decoded)?;
-        let decoded_transform = measure_decoded_transform(&decoded)?;
 
         for (table, rows) in &default.rows {
             let measurement = Measurement {
@@ -129,8 +124,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             print_measurement(measurement, decode_speedup);
         }
 
-        let decoded_transform_speedup =
-            default.total.as_secs_f64() / decoded_transform.total.as_secs_f64();
         let clone_only_speedup = default.total.as_secs_f64() / clone_only.total.as_secs_f64();
         for (table, rows) in &clone_only.rows {
             let measurement = Measurement {
@@ -145,37 +138,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             print_measurement(measurement, clone_only_speedup);
         }
 
-        for (table, rows) in &decoded_transform.rows {
-            let measurement = Measurement {
-                workload: workload.name,
-                path: "decoded_transform",
-                table,
-                fixture_bytes: bytes.len(),
-                rows_per_iter: *rows,
-                iterations: MEASURE_ITERS,
-                total: decoded_transform.total,
-            };
-            print_measurement(measurement, decoded_transform_speedup);
-        }
-
         if let DecodedRequest::Metrics(request) = &decoded {
             print_metric_shape(workload.name, &metric_shape(request));
-
-            let transform_only = measure_metrics_transform_only(request)?;
-            let transform_only_speedup =
-                default.total.as_secs_f64() / transform_only.total.as_secs_f64();
-            for (table, rows) in &transform_only.rows {
-                let measurement = Measurement {
-                    workload: workload.name,
-                    path: "transform_only",
-                    table,
-                    fixture_bytes: bytes.len(),
-                    rows_per_iter: *rows,
-                    iterations: MEASURE_ITERS,
-                    total: transform_only.total,
-                };
-                print_measurement(measurement, transform_only_speedup);
-            }
         }
     }
 
@@ -183,8 +147,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 enum DecodedRequest {
-    Logs(ExportLogsServiceRequest, usize),
-    Traces(ExportTraceServiceRequest, usize),
+    Logs(ExportLogsServiceRequest),
+    Traces(ExportTraceServiceRequest),
     Metrics(ExportMetricsServiceRequest),
 }
 
@@ -223,33 +187,12 @@ fn decode_for_measurement(
     bytes: &[u8],
 ) -> Result<DecodedRequest, Box<dyn std::error::Error>> {
     Ok(match kind {
-        WorkloadKind::Logs => {
-            DecodedRequest::Logs(ExportLogsServiceRequest::decode(bytes)?, bytes.len())
-        }
-        WorkloadKind::Traces => {
-            DecodedRequest::Traces(ExportTraceServiceRequest::decode(bytes)?, bytes.len())
-        }
+        WorkloadKind::Logs => DecodedRequest::Logs(ExportLogsServiceRequest::decode(bytes)?),
+        WorkloadKind::Traces => DecodedRequest::Traces(ExportTraceServiceRequest::decode(bytes)?),
         WorkloadKind::Metrics => {
             DecodedRequest::Metrics(ExportMetricsServiceRequest::decode(bytes)?)
         }
     })
-}
-
-fn measure_decoded_transform(
-    decoded: &DecodedRequest,
-) -> Result<RunMeasurement, Box<dyn std::error::Error>> {
-    for _ in 0..WARMUP_ITERS {
-        run_decoded_transform_once(decoded)?;
-    }
-
-    let mut rows = Vec::new();
-    let start = Instant::now();
-    for _ in 0..MEASURE_ITERS {
-        rows = run_decoded_transform_once(decoded)?;
-    }
-    let total = start.elapsed();
-
-    Ok(RunMeasurement { rows, total })
 }
 
 fn measure_decoded_clone(
@@ -269,57 +212,16 @@ fn measure_decoded_clone(
     Ok(RunMeasurement { rows, total })
 }
 
-fn measure_metrics_transform_only(
-    request: &ExportMetricsServiceRequest,
-) -> Result<RunMeasurement, Box<dyn std::error::Error>> {
-    for _ in 0..WARMUP_ITERS {
-        let request = request.clone();
-        let batches = transform_metrics_decoded_for_bench(request)?;
-        black_box(metric_batch_rows(batches));
-    }
-
-    let mut rows = Vec::new();
-    let mut total = Duration::ZERO;
-    for _ in 0..MEASURE_ITERS {
-        let request = request.clone();
-        let start = Instant::now();
-        let batches = transform_metrics_decoded_for_bench(request)?;
-        total += start.elapsed();
-        rows = metric_batch_rows(batches);
-    }
-
-    Ok(RunMeasurement { rows, total })
-}
-
 fn run_decoded_clone_once(decoded: &DecodedRequest) {
     match decoded {
-        DecodedRequest::Logs(request, _) => {
+        DecodedRequest::Logs(request) => {
             black_box(request.clone());
         }
-        DecodedRequest::Traces(request, _) => {
+        DecodedRequest::Traces(request) => {
             black_box(request.clone());
         }
         DecodedRequest::Metrics(request) => {
             black_box(request.clone());
-        }
-    }
-}
-
-fn run_decoded_transform_once(
-    decoded: &DecodedRequest,
-) -> Result<Vec<(&'static str, usize)>, Box<dyn std::error::Error>> {
-    match decoded {
-        DecodedRequest::Logs(request, input_bytes) => {
-            let batch = transform_logs_decoded_for_bench(request.clone(), *input_bytes)?;
-            Ok(vec![("logs", batch.num_rows())])
-        }
-        DecodedRequest::Traces(request, input_bytes) => {
-            let batch = transform_traces_decoded_for_bench(request.clone(), *input_bytes)?;
-            Ok(vec![("traces", batch.num_rows())])
-        }
-        DecodedRequest::Metrics(request) => {
-            let batches = transform_metrics_decoded_for_bench(request.clone())?;
-            Ok(metric_batch_rows(batches))
         }
     }
 }
@@ -327,7 +229,7 @@ fn run_decoded_transform_once(
 impl DecodedRequest {
     fn rows(&self) -> Vec<(&'static str, usize)> {
         match self {
-            DecodedRequest::Logs(request, _) => {
+            DecodedRequest::Logs(request) => {
                 let rows = request
                     .resource_logs
                     .iter()
@@ -341,7 +243,7 @@ impl DecodedRequest {
                     .sum();
                 vec![("logs", rows)]
             }
-            DecodedRequest::Traces(request, _) => {
+            DecodedRequest::Traces(request) => {
                 let rows = request
                     .resource_spans
                     .iter()
