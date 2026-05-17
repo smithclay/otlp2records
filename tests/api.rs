@@ -251,6 +251,22 @@ fn create_sum_only_metrics_request() -> ExportMetricsServiceRequest {
 // High-level API tests
 // ========================================================================
 
+#[derive(Default)]
+struct TestObserver {
+    phases: Vec<TransformPhase>,
+    counters: Vec<TransformCounter>,
+}
+
+impl TransformObserver for TestObserver {
+    fn on_phase(&mut self, timing: TransformPhaseTiming) {
+        self.phases.push(timing.phase);
+    }
+
+    fn on_counter(&mut self, counter: TransformCounterValue) {
+        self.counters.push(counter.counter);
+    }
+}
+
 #[test]
 fn test_transform_logs_protobuf() {
     let request = create_test_log_request();
@@ -266,6 +282,60 @@ fn test_transform_logs_protobuf() {
     assert!(schema.field_with_name("timestamp").is_ok());
     assert!(schema.field_with_name("service_name").is_ok());
     assert!(schema.field_with_name("severity_number").is_ok());
+}
+
+#[test]
+fn test_transform_logs_with_observer_matches_default() {
+    let request = create_test_log_request();
+    let bytes = request.encode_to_vec();
+
+    let default_batch = transform_logs(&bytes, InputFormat::Protobuf).unwrap();
+    let mut observer = TestObserver::default();
+    let observed_batch =
+        transform_logs_with_observer(&bytes, InputFormat::Protobuf, &mut observer).unwrap();
+
+    assert_eq!(observed_batch.num_rows(), default_batch.num_rows());
+    assert!(observer.phases.contains(&TransformPhase::ProtobufDecode));
+    assert!(observer
+        .phases
+        .contains(&TransformPhase::ResourceContextBuild));
+    assert!(observer.phases.contains(&TransformPhase::ScopeContextBuild));
+    assert!(observer.phases.contains(&TransformPhase::LogAttributesJson));
+    assert!(observer.phases.contains(&TransformPhase::ArrowFinalize));
+    assert!(observer.counters.contains(&TransformCounter::OutputRows));
+    assert!(observer
+        .counters
+        .contains(&TransformCounter::ResourceContextDuplicateMiss));
+    assert!(observer
+        .counters
+        .contains(&TransformCounter::ScopeContextDuplicateMiss));
+    assert!(observer
+        .counters
+        .contains(&TransformCounter::ResourceAttributesRowCopies));
+}
+
+#[test]
+fn test_transform_observer_reports_duplicate_context_hits() {
+    let mut request = create_test_log_request();
+    request.resource_logs.push(request.resource_logs[0].clone());
+    let bytes = request.encode_to_vec();
+
+    let mut observer = TestObserver::default();
+    let batch = transform_logs_with_observer(&bytes, InputFormat::Protobuf, &mut observer).unwrap();
+
+    assert_eq!(batch.num_rows(), 2);
+    assert!(observer
+        .counters
+        .contains(&TransformCounter::ResourceContextDuplicateMiss));
+    assert!(observer
+        .counters
+        .contains(&TransformCounter::ResourceContextDuplicateHit));
+    assert!(observer
+        .counters
+        .contains(&TransformCounter::ScopeContextDuplicateMiss));
+    assert!(observer
+        .counters
+        .contains(&TransformCounter::ScopeContextDuplicateHit));
 }
 
 #[test]
@@ -318,6 +388,38 @@ fn test_transform_traces_protobuf() {
     assert!(schema.field_with_name("trace_id").is_ok());
     assert!(schema.field_with_name("span_id").is_ok());
     assert!(schema.field_with_name("span_name").is_ok());
+}
+
+#[test]
+fn test_transform_traces_with_observer_matches_default() {
+    let request = create_test_trace_request();
+    let bytes = request.encode_to_vec();
+
+    let default_batch = transform_traces(&bytes, InputFormat::Protobuf).unwrap();
+    let mut observer = TestObserver::default();
+    let observed_batch =
+        transform_traces_with_observer(&bytes, InputFormat::Protobuf, &mut observer).unwrap();
+
+    assert_eq!(observed_batch.num_rows(), default_batch.num_rows());
+    assert!(observer.phases.contains(&TransformPhase::ProtobufDecode));
+    assert!(observer
+        .phases
+        .contains(&TransformPhase::ResourceContextBuild));
+    assert!(observer.phases.contains(&TransformPhase::ScopeContextBuild));
+    assert!(observer
+        .phases
+        .contains(&TransformPhase::SpanAttributesJson));
+    assert!(observer.phases.contains(&TransformPhase::ArrowFinalize));
+    assert!(observer.counters.contains(&TransformCounter::OutputRows));
+    assert!(observer
+        .counters
+        .contains(&TransformCounter::ResourceContextDuplicateMiss));
+    assert!(observer
+        .counters
+        .contains(&TransformCounter::ScopeContextDuplicateMiss));
+    assert!(observer
+        .counters
+        .contains(&TransformCounter::ResourceAttributesRowCopies));
 }
 
 #[test]
@@ -384,6 +486,44 @@ fn test_transform_metrics_protobuf() {
         .field_with_name("aggregation_temporality")
         .is_ok());
     assert!(sum_schema.field_with_name("is_monotonic").is_ok());
+}
+
+#[test]
+fn test_transform_metrics_with_observer_matches_default() {
+    let request = create_test_metrics_request();
+    let bytes = request.encode_to_vec();
+
+    let default_batches = transform_metrics(&bytes, InputFormat::Protobuf).unwrap();
+    let mut observer = TestObserver::default();
+    let observed_batches =
+        transform_metrics_with_observer(&bytes, InputFormat::Protobuf, &mut observer).unwrap();
+
+    assert_eq!(
+        observed_batches
+            .gauge
+            .as_ref()
+            .map(|batch| batch.num_rows()),
+        default_batches.gauge.as_ref().map(|batch| batch.num_rows())
+    );
+    assert_eq!(
+        observed_batches.sum.as_ref().map(|batch| batch.num_rows()),
+        default_batches.sum.as_ref().map(|batch| batch.num_rows())
+    );
+    assert!(observer.phases.contains(&TransformPhase::ProtobufDecode));
+    assert!(observer.phases.contains(&TransformPhase::MetricsCapacity));
+    assert!(observer
+        .phases
+        .contains(&TransformPhase::ResourceContextBuild));
+    assert!(observer.phases.contains(&TransformPhase::ScopeContextBuild));
+    assert!(observer.phases.contains(&TransformPhase::ArrowAppend));
+    assert!(observer.phases.contains(&TransformPhase::ArrowFinalize));
+    assert!(observer.counters.contains(&TransformCounter::OutputRows));
+    assert!(observer
+        .counters
+        .contains(&TransformCounter::ResourceContextDuplicateMiss));
+    assert!(observer
+        .counters
+        .contains(&TransformCounter::ScopeContextDuplicateMiss));
 }
 
 #[test]
