@@ -27,7 +27,9 @@ mod arrow;
 mod batch;
 mod decode;
 mod error;
+pub mod fixtures;
 mod output;
+pub mod proto_output;
 mod schema;
 
 #[cfg(feature = "ffi")]
