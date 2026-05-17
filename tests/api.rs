@@ -20,6 +20,33 @@ use prost::Message;
 // Helper functions for creating test data
 // ========================================================================
 
+fn string_attr(key: &str, value: &str) -> KeyValue {
+    KeyValue {
+        key: key.to_string(),
+        value: Some(AnyValue {
+            value: Some(any_value::Value::StringValue(value.to_string())),
+        }),
+    }
+}
+
+fn string_column(batch: &arrow_array::RecordBatch, name: &str) -> Vec<Option<String>> {
+    let column = batch
+        .column_by_name(name)
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    (0..column.len())
+        .map(|idx| {
+            if column.is_null(idx) {
+                None
+            } else {
+                Some(column.value(idx).to_string())
+            }
+        })
+        .collect()
+}
+
 fn create_test_log_request() -> ExportLogsServiceRequest {
     ExportLogsServiceRequest {
         resource_logs: vec![ResourceLogs {
@@ -287,15 +314,6 @@ fn test_transform_logs_protobuf() {
 
 #[test]
 fn test_transform_logs_context_columns_align_across_scope_groups() {
-    fn string_attr(key: &str, value: &str) -> KeyValue {
-        KeyValue {
-            key: key.to_string(),
-            value: Some(AnyValue {
-                value: Some(any_value::Value::StringValue(value.to_string())),
-            }),
-        }
-    }
-
     fn log_record(body: &str, trace_byte: u8) -> LogRecord {
         LogRecord {
             time_unix_nano: 1_700_000_000_000_000_000 + u64::from(trace_byte),
@@ -309,24 +327,6 @@ fn test_transform_logs_context_columns_align_across_scope_groups() {
             span_id: vec![trace_byte; 8],
             ..Default::default()
         }
-    }
-
-    fn string_column(batch: &arrow_array::RecordBatch, name: &str) -> Vec<Option<String>> {
-        let column = batch
-            .column_by_name(name)
-            .unwrap()
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        (0..column.len())
-            .map(|idx| {
-                if column.is_null(idx) {
-                    None
-                } else {
-                    Some(column.value(idx).to_string())
-                }
-            })
-            .collect()
     }
 
     let request = ExportLogsServiceRequest {
@@ -524,15 +524,6 @@ fn test_transform_traces_protobuf() {
 
 #[test]
 fn test_transform_traces_context_columns_align_across_scope_groups() {
-    fn string_attr(key: &str, value: &str) -> KeyValue {
-        KeyValue {
-            key: key.to_string(),
-            value: Some(AnyValue {
-                value: Some(any_value::Value::StringValue(value.to_string())),
-            }),
-        }
-    }
-
     fn span(name: &str, id: u8) -> Span {
         Span {
             trace_id: vec![id; 16],
@@ -543,24 +534,6 @@ fn test_transform_traces_context_columns_align_across_scope_groups() {
             end_time_unix_nano: 1_700_000_000_100_000_000 + u64::from(id),
             ..Default::default()
         }
-    }
-
-    fn string_column(batch: &arrow_array::RecordBatch, name: &str) -> Vec<Option<String>> {
-        let column = batch
-            .column_by_name(name)
-            .unwrap()
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        (0..column.len())
-            .map(|idx| {
-                if column.is_null(idx) {
-                    None
-                } else {
-                    Some(column.value(idx).to_string())
-                }
-            })
-            .collect()
     }
 
     let request = ExportTraceServiceRequest {
@@ -752,15 +725,6 @@ fn test_transform_metrics_protobuf() {
 
 #[test]
 fn test_transform_metrics_context_columns_align_after_skipped_points() {
-    fn string_attr(key: &str, value: &str) -> KeyValue {
-        KeyValue {
-            key: key.to_string(),
-            value: Some(AnyValue {
-                value: Some(any_value::Value::StringValue(value.to_string())),
-            }),
-        }
-    }
-
     fn gauge_point(value: f64, time_offset: u64) -> NumberDataPoint {
         NumberDataPoint {
             time_unix_nano: 1_700_000_000_000_000_000 + time_offset,
@@ -769,24 +733,6 @@ fn test_transform_metrics_context_columns_align_after_skipped_points() {
             ),
             ..Default::default()
         }
-    }
-
-    fn string_column(batch: &arrow_array::RecordBatch, name: &str) -> Vec<Option<String>> {
-        let column = batch
-            .column_by_name(name)
-            .unwrap()
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        (0..column.len())
-            .map(|idx| {
-                if column.is_null(idx) {
-                    None
-                } else {
-                    Some(column.value(idx).to_string())
-                }
-            })
-            .collect()
     }
 
     let request = ExportMetricsServiceRequest {
