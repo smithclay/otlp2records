@@ -3,7 +3,10 @@
 use std::time::Instant;
 
 use crate::{
-    api::{optional_batch_to_json_values, JsonMetricBatches, MetricBatches},
+    api::{
+        optional_batch_to_json_values, JsonMetricBatches, MetricBatches, MetricsOutput,
+        SchemaOutput,
+    },
     batch::{self, TransformObserver, TransformPhase, TransformSignal},
     decode::{
         decode_metrics_json_request, decode_metrics_jsonl_request, looks_like_json, DecodeError,
@@ -22,6 +25,20 @@ pub fn transform_metrics(bytes: &[u8], format: InputFormat) -> Result<MetricBatc
         InputFormat::Protobuf => batch::transform_metrics_protobuf(bytes),
         InputFormat::Auto => transform_metrics_auto(bytes),
         InputFormat::Json | InputFormat::Jsonl => transform_metrics_json_arrow(bytes, format),
+    }
+}
+
+/// Transform OTLP metrics using an explicit schema output.
+pub fn transform_metrics_with_schema(
+    bytes: &[u8],
+    format: InputFormat,
+    schema_output: SchemaOutput,
+) -> Result<MetricsOutput> {
+    match schema_output {
+        SchemaOutput::Normalized => transform_metrics(bytes, format).map(MetricsOutput::Normalized),
+        SchemaOutput::OtapStar => {
+            transform_metrics_otap(bytes, format).map(MetricsOutput::OtapStar)
+        }
     }
 }
 
@@ -52,6 +69,49 @@ fn transform_metrics_observed(
 fn transform_metrics_json_arrow(bytes: &[u8], format: InputFormat) -> Result<MetricBatches> {
     let mut observer = None;
     transform_metrics_json_arrow_observed(bytes, format, &mut observer)
+}
+
+fn transform_metrics_otap(
+    bytes: &[u8],
+    format: InputFormat,
+) -> Result<crate::api::OtapMetricsBatches> {
+    match format {
+        InputFormat::Protobuf => batch::transform_metrics_protobuf_otap(bytes),
+        InputFormat::Auto => transform_metrics_otap_auto(bytes),
+        InputFormat::Json => {
+            batch::transform_metrics_request_otap(decode_metrics_json_request(bytes)?)
+        }
+        InputFormat::Jsonl => {
+            batch::transform_metrics_request_otap(decode_metrics_jsonl_request(bytes)?)
+        }
+    }
+}
+
+fn transform_metrics_otap_auto(bytes: &[u8]) -> Result<crate::api::OtapMetricsBatches> {
+    if looks_like_json(bytes) {
+        match transform_metrics_otap(bytes, InputFormat::Json) {
+            Ok(batches) => Ok(batches),
+            Err(json_err) => match transform_metrics_otap(bytes, InputFormat::Jsonl) {
+                Ok(batches) => Ok(batches),
+                Err(_) => batch::transform_metrics_protobuf_otap(bytes).map_err(|proto_err| {
+                    Error::Decode(DecodeError::Unsupported(format!(
+                        "json decode failed: {json_err}; protobuf fallback failed: {proto_err}"
+                    )))
+                }),
+            },
+        }
+    } else {
+        match batch::transform_metrics_protobuf_otap(bytes) {
+            Ok(batches) => Ok(batches),
+            Err(proto_err) => {
+                transform_metrics_otap(bytes, InputFormat::Json).map_err(|json_err| {
+                    Error::Decode(DecodeError::Unsupported(format!(
+                        "protobuf decode failed: {proto_err}; json fallback failed: {json_err}"
+                    )))
+                })
+            }
+        }
+    }
 }
 
 fn transform_metrics_json_arrow_observed(

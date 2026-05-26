@@ -11,7 +11,11 @@ use opentelemetry_proto::tonic::{
     common::v1::KeyValue,
     metrics::v1::{metric::Data, number_data_point},
 };
-use otlp2records::{transform_logs, transform_metrics, transform_traces, InputFormat};
+use otlp2records::{
+    transform_logs, transform_logs_with_schema, transform_metrics, transform_metrics_with_schema,
+    transform_traces, transform_traces_with_schema, InputFormat, LogsOutput, MetricsOutput,
+    SchemaOutput, TracesOutput,
+};
 use prost::Message;
 
 const WARMUP_ITERS: usize = 5;
@@ -93,6 +97,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let bytes = fs::read(workload.fixture)?;
         let default = measure(workload.kind, PathKind::Default, &bytes)?;
+        let otap_star = measure(workload.kind, PathKind::OtapStar, &bytes)?;
         let decode = measure(workload.kind, PathKind::Decode, &bytes)?;
         let decoded = decode_for_measurement(workload.kind, &bytes)?;
         let clone_only = measure_decoded_clone(&decoded)?;
@@ -108,6 +113,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 total: default.total,
             };
             print_measurement(measurement, 1.0);
+        }
+
+        let otap_star_speedup = default.total.as_secs_f64() / otap_star.total.as_secs_f64();
+        for (table, rows) in &otap_star.rows {
+            let measurement = Measurement {
+                workload: workload.name,
+                path: "otap_star",
+                table,
+                fixture_bytes: bytes.len(),
+                rows_per_iter: *rows,
+                iterations: MEASURE_ITERS,
+                total: otap_star.total,
+            };
+            print_measurement(measurement, otap_star_speedup);
         }
 
         let decode_speedup = default.total.as_secs_f64() / decode.total.as_secs_f64();
@@ -155,6 +174,7 @@ enum DecodedRequest {
 #[derive(Clone, Copy)]
 enum PathKind {
     Default,
+    OtapStar,
     Decode,
 }
 
@@ -271,6 +291,20 @@ fn run_once(
         WorkloadKind::Logs => {
             let batch = match path {
                 PathKind::Default => transform_logs(bytes, InputFormat::Protobuf)?,
+                PathKind::OtapStar => {
+                    let LogsOutput::OtapStar(batches) = transform_logs_with_schema(
+                        bytes,
+                        InputFormat::Protobuf,
+                        SchemaOutput::OtapStar,
+                    )?
+                    else {
+                        unreachable!("requested otap-star logs output")
+                    };
+                    return Ok(batches
+                        .iter_named_batches()
+                        .map(|(name, batch)| (name, batch.num_rows()))
+                        .collect());
+                }
                 PathKind::Decode => return decode_only_logs(bytes),
             };
             Ok(vec![("logs", batch.num_rows())])
@@ -278,6 +312,20 @@ fn run_once(
         WorkloadKind::Traces => {
             let batch = match path {
                 PathKind::Default => transform_traces(bytes, InputFormat::Protobuf)?,
+                PathKind::OtapStar => {
+                    let TracesOutput::OtapStar(batches) = transform_traces_with_schema(
+                        bytes,
+                        InputFormat::Protobuf,
+                        SchemaOutput::OtapStar,
+                    )?
+                    else {
+                        unreachable!("requested otap-star traces output")
+                    };
+                    return Ok(batches
+                        .iter_named_batches()
+                        .map(|(name, batch)| (name, batch.num_rows()))
+                        .collect());
+                }
                 PathKind::Decode => return decode_only_traces(bytes),
             };
             Ok(vec![("traces", batch.num_rows())])
@@ -285,6 +333,20 @@ fn run_once(
         WorkloadKind::Metrics => {
             let batches = match path {
                 PathKind::Default => transform_metrics(bytes, InputFormat::Protobuf)?,
+                PathKind::OtapStar => {
+                    let MetricsOutput::OtapStar(batches) = transform_metrics_with_schema(
+                        bytes,
+                        InputFormat::Protobuf,
+                        SchemaOutput::OtapStar,
+                    )?
+                    else {
+                        unreachable!("requested otap-star metrics output")
+                    };
+                    return Ok(batches
+                        .iter_named_batches()
+                        .map(|(name, batch)| (name, batch.num_rows()))
+                        .collect());
+                }
                 PathKind::Decode => return decode_only_metrics(bytes),
             };
             Ok(metric_batch_rows(batches))

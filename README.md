@@ -29,13 +29,13 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-otlp2records = "0.7"
+otlp2records = "0.8"
 
 # Optional: Enable Parquet output
-otlp2records = { version = "0.7", features = ["parquet"] }
+otlp2records = { version = "0.8", features = ["parquet"] }
 
 # Optional: Enable WASM bindings
-otlp2records = { version = "0.7", features = ["wasm"] }
+otlp2records = { version = "0.8", features = ["wasm"] }
 ```
 
 ## Usage
@@ -121,6 +121,31 @@ const arrowIpc = transform_logs_wasm(otlpBytes, "protobuf");
 | `transform_traces(bytes, format)` | Transform OTLP traces to Arrow RecordBatch |
 | `transform_metrics(bytes, format)` | Transform OTLP metrics to MetricBatches |
 
+### Schema Output Selection
+
+The default output is `SchemaOutput::Normalized`, the flattened ClickStack-compatible
+schema used by the existing `transform_logs`, `transform_traces`, and
+`transform_metrics` APIs. The aliases `"normalized"`, `"clickstack"`,
+`"clickstack-mode"`, `""`, and `"default"` all parse to this default.
+
+Rust callers can opt into `SchemaOutput::OtapStar` with explicit APIs:
+
+| Function | Description |
+|----------|-------------|
+| `transform_logs_with_schema(bytes, format, schema_output)` | Transform logs to `LogsOutput::Normalized` or `LogsOutput::OtapStar` |
+| `transform_traces_with_schema(bytes, format, schema_output)` | Transform traces to `TracesOutput::Normalized` or `TracesOutput::OtapStar` |
+| `transform_metrics_with_schema(bytes, format, schema_output)` | Transform metrics to `MetricsOutput::Normalized` or `MetricsOutput::OtapStar` |
+
+`otap-star` / `otap_star` emits multi-table Arrow batches modeled after the
+OpenTelemetry otel-arrow data model. Instead of flattened JSON columns such as
+`events_json`, `links_json`, `metric_attributes`, or `exemplars_json`, child
+entities are emitted as separate tables keyed by deterministic `id` and
+`parent_id` columns. Use `iter_named_batches()` on `OtapLogsBatches`,
+`OtapTracesBatches`, or `OtapMetricsBatches` to serialize each named table.
+
+The FFI and WASM bindings continue to expose the normalized single-batch shape in
+this release. `otap-star` is Rust API only to avoid changing those ABIs.
+
 ### Transform Observation
 
 Production callers can opt into phase timings and counters without changing output semantics:
@@ -142,6 +167,9 @@ resource/scope attribute row-copy counts and bytes.
 | `to_json(&batch)` | Convert RecordBatch to NDJSON bytes |
 | `to_ipc(&batch)` | Convert RecordBatch to Arrow IPC format |
 | `to_parquet(&batch)` | Convert RecordBatch to Parquet (requires feature) |
+
+These serializers operate on one `RecordBatch` at a time. For `otap-star`, call
+them per table by iterating named batches.
 
 ### Schemas
 
