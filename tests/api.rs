@@ -307,7 +307,7 @@ fn test_transform_logs_protobuf() {
 
     // Verify some expected columns exist
     let schema = batch.schema();
-    assert!(schema.field_with_name("timestamp").is_ok());
+    assert!(schema.field_with_name("time_unix_nano").is_ok());
     assert!(schema.field_with_name("service_name").is_ok());
     assert!(schema.field_with_name("severity_number").is_ok());
 }
@@ -516,10 +516,10 @@ fn test_transform_traces_protobuf() {
 
     // Verify some expected columns exist
     let schema = batch.schema();
-    assert!(schema.field_with_name("timestamp").is_ok());
+    assert!(schema.field_with_name("start_time_unix_nano").is_ok());
     assert!(schema.field_with_name("trace_id").is_ok());
     assert!(schema.field_with_name("span_id").is_ok());
-    assert!(schema.field_with_name("span_name").is_ok());
+    assert!(schema.field_with_name("name").is_ok());
 }
 
 #[test]
@@ -583,7 +583,7 @@ fn test_transform_traces_context_columns_align_across_scope_groups() {
     let batch = transform_traces(&request.encode_to_vec(), InputFormat::Protobuf).unwrap();
 
     assert_eq!(
-        string_column(&batch, "span_name"),
+        string_column(&batch, "name"),
         vec![
             Some("a-1".to_string()),
             Some("a-2".to_string()),
@@ -712,8 +712,8 @@ fn test_transform_metrics_protobuf() {
 
     // Verify gauge schema
     let gauge_schema = gauge.schema();
-    assert!(gauge_schema.field_with_name("metric_name").is_ok());
-    assert!(gauge_schema.field_with_name("value").is_ok());
+    assert!(gauge_schema.field_with_name("name").is_ok());
+    assert!(gauge_schema.field_with_name("double_value").is_ok());
 
     // Verify sum schema has extra fields
     let sum_schema = sum.schema();
@@ -802,7 +802,7 @@ fn test_transform_metrics_context_columns_align_after_skipped_points() {
 
     assert_eq!(gauge.num_rows(), 3);
     assert_eq!(
-        string_column(&gauge, "metric_name"),
+        string_column(&gauge, "name"),
         vec![
             Some("gauge-a".to_string()),
             Some("gauge-b".to_string()),
@@ -1044,24 +1044,23 @@ fn test_timestamp_not_epoch_traces() {
 
     // Get the timestamp column and verify it's not 0 (epoch)
     let schema = batch.schema();
-    let ts_idx = schema.index_of("timestamp").unwrap();
+    let ts_idx = schema.index_of("start_time_unix_nano").unwrap();
     let ts_column = batch
         .column(ts_idx)
         .as_any()
-        .downcast_ref::<::arrow_array::TimestampMicrosecondArray>()
-        .expect("timestamp should be TimestampMicrosecondArray");
+        .downcast_ref::<::arrow_array::TimestampNanosecondArray>()
+        .expect("start_time_unix_nano should be TimestampNanosecondArray");
 
     let ts_value = ts_column.value(0);
-    // Expected: 1703265600000000000 ns / 1000 = 1703265600000000 microseconds
-    let expected_micros: i64 = 1_703_265_600_000_000;
+    let expected_nanos: i64 = 1_703_265_600_000_000_000;
 
     assert_eq!(
-        ts_value, expected_micros,
+        ts_value, expected_nanos,
         "Timestamp should be Dec 22, 2023, not epoch (1970)"
     );
     // Sanity check: value should be much greater than 0 (year 2023 >> year 1970)
     assert!(
-        ts_value > 1_600_000_000_000_000,
+        ts_value > 1_600_000_000_000_000_000,
         "Timestamp {ts_value} appears to be too small, possibly 1970 date"
     );
 }
@@ -1104,24 +1103,23 @@ fn test_timestamp_not_epoch_logs() {
 
     // Get the timestamp column and verify it's not 0 (epoch)
     let schema = batch.schema();
-    let ts_idx = schema.index_of("timestamp").unwrap();
+    let ts_idx = schema.index_of("time_unix_nano").unwrap();
     let ts_column = batch
         .column(ts_idx)
         .as_any()
-        .downcast_ref::<::arrow_array::TimestampMicrosecondArray>()
-        .expect("timestamp should be TimestampMicrosecondArray");
+        .downcast_ref::<::arrow_array::TimestampNanosecondArray>()
+        .expect("time_unix_nano should be TimestampNanosecondArray");
 
     let ts_value = ts_column.value(0);
-    // Expected: 1703265600000000000 ns / 1000 = 1703265600000000 microseconds
-    let expected_micros: i64 = 1_703_265_600_000_000;
+    let expected_nanos: i64 = 1_703_265_600_000_000_000;
 
     assert_eq!(
-        ts_value, expected_micros,
+        ts_value, expected_nanos,
         "Timestamp should be Dec 22, 2023, not epoch (1970)"
     );
     // Sanity check: value should be much greater than 0 (year 2023 >> year 1970)
     assert!(
-        ts_value > 1_600_000_000_000_000,
+        ts_value > 1_600_000_000_000_000_000,
         "Timestamp {ts_value} appears to be too small, possibly 1970 date"
     );
 }
@@ -1168,24 +1166,23 @@ fn test_timestamp_not_epoch_metrics() {
 
     // Get the timestamp column and verify it's not 0 (epoch)
     let schema = gauge.schema();
-    let ts_idx = schema.index_of("timestamp").unwrap();
+    let ts_idx = schema.index_of("time_unix_nano").unwrap();
     let ts_column = gauge
         .column(ts_idx)
         .as_any()
-        .downcast_ref::<::arrow_array::TimestampMicrosecondArray>()
-        .expect("timestamp should be TimestampMicrosecondArray");
+        .downcast_ref::<::arrow_array::TimestampNanosecondArray>()
+        .expect("time_unix_nano should be TimestampNanosecondArray");
 
     let ts_value = ts_column.value(0);
-    // Expected: 1703265600000000000 ns / 1000 = 1703265600000000 microseconds
-    let expected_micros: i64 = 1_703_265_600_000_000;
+    let expected_nanos: i64 = 1_703_265_600_000_000_000;
 
     assert_eq!(
-        ts_value, expected_micros,
+        ts_value, expected_nanos,
         "Timestamp should be Dec 22, 2023, not epoch (1970)"
     );
     // Sanity check: value should be much greater than 0 (year 2023 >> year 1970)
     assert!(
-        ts_value > 1_600_000_000_000_000,
+        ts_value > 1_600_000_000_000_000_000,
         "Timestamp {ts_value} appears to be too small, possibly 1970 date"
     );
 }

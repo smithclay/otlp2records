@@ -287,7 +287,7 @@ fn point_attrs(idx: usize, seed: usize) -> Vec<KeyValue> {
 }
 
 fn exemplars(idx: usize) -> Vec<Exemplar> {
-    if idx % 16 != 0 {
+    if !idx.is_multiple_of(16) {
         return Vec::new();
     }
 

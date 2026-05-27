@@ -666,7 +666,7 @@ mod tests {
 
             // Verify schema has columns (logs schema has 14+ columns)
             assert!(!schema.fields().is_empty());
-            assert!(schema.field_with_name("timestamp").is_ok());
+            assert!(schema.field_with_name("time_unix_nano").is_ok());
             assert!(schema.field_with_name("service_name").is_ok());
 
             // Schema is automatically released when dropped via try_from

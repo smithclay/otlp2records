@@ -45,7 +45,7 @@ fn export_logs_json_to_request(
                     flags: 0,
                     trace_id: decode_bytes_field(&record.trace_id),
                     span_id: decode_bytes_field(&record.span_id),
-                    event_name: String::new(),
+                    event_name: record.event_name,
                 });
             }
             scope_logs.push(ScopeLogs {
@@ -108,6 +108,8 @@ struct JsonLogRecord {
     trace_id: String,
     #[serde(default)]
     span_id: String,
+    #[serde(default)]
+    event_name: String,
 }
 
 #[cfg(test)]
@@ -129,7 +131,8 @@ mod tests {
                         "body": { "stringValue": "hello" },
                         "attributes": [{ "key": "k", "value": { "stringValue": "v" } }],
                         "traceId": "0af7651916cd43dd8448eb211c80319c",
-                        "spanId": "b7ad6b7169203331"
+                        "spanId": "b7ad6b7169203331",
+                        "eventName": "login"
                     }]
                 }]
             }]
@@ -139,5 +142,6 @@ mod tests {
         let record = &request.resource_logs[0].scope_logs[0].log_records[0];
         assert_eq!(record.severity_number, 9);
         assert_eq!(record.trace_id.len(), 16);
+        assert_eq!(record.event_name, "login");
     }
 }

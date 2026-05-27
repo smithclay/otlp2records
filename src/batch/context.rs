@@ -153,7 +153,7 @@ fn scope_fingerprint(name: Option<&str>, version: Option<&str>, attrs: &[KeyValu
     hasher.finish()
 }
 
-fn hash_attrs(attrs: &[KeyValue], hasher: &mut impl Hasher) {
+pub(super) fn hash_attrs(attrs: &[KeyValue], hasher: &mut impl Hasher) {
     attrs.len().hash(hasher);
     for attr in attrs {
         attr.key.hash(hasher);
@@ -161,7 +161,7 @@ fn hash_attrs(attrs: &[KeyValue], hasher: &mut impl Hasher) {
     }
 }
 
-fn hash_any_value(value: Option<&AnyValue>, hasher: &mut impl Hasher) {
+pub(super) fn hash_any_value(value: Option<&AnyValue>, hasher: &mut impl Hasher) {
     match value.and_then(|value| value.value.as_ref()) {
         Some(any_value::Value::StringValue(value)) => {
             1_u8.hash(hasher);

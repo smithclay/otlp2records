@@ -1,9 +1,10 @@
 //! Trace request-to-RecordBatch conversion.
 
-use std::time::Instant;
-
 use arrow_array::{
-    builder::{Int32Builder, Int64Builder, StringBuilder, TimestampMicrosecondBuilder},
+    builder::{
+        DurationNanosecondBuilder, FixedSizeBinaryBuilder, Int32Builder, StringBuilder,
+        TimestampNanosecondBuilder, UInt32Builder,
+    },
     RecordBatch,
 };
 use opentelemetry_proto::tonic::{
@@ -12,18 +13,19 @@ use opentelemetry_proto::tonic::{
 };
 use prost::Message;
 
-use crate::{schema::traces_schema, Result};
+use crate::{schema::traces_schema_arc, Result};
 
 use super::{
     context::{ContextDuplicateTracker, ResourceContext, ScopeContext},
     json::{append_attrs_json, append_span_events_json, append_span_links_json},
     profile::{
-        measure_phase, measure_result, observe_counter, observe_phase, TransformCounter,
-        TransformObserver, TransformPhase, TransformSignal,
+        finish_phase, measure_phase, measure_result, observe_counter, phase_start,
+        TransformCounter, TransformObserver, TransformPhase, TransformSignal,
     },
     util::{
-        append_empty_as_null, append_hex_or_null, append_opt_n, append_required_service_name_n,
-        array, record_batch, string_builder_bytes, u64_to_i64,
+        append_empty_as_null, append_fixed_or_null, append_fixed_required, append_opt_n,
+        append_required_service_name_n, append_required_ts_ns, array, record_batch,
+        string_builder_bytes, u64_to_i64,
     },
 };
 
@@ -212,36 +214,20 @@ fn append_span_observed(
     Ok(())
 }
 
-fn phase_start(observer: &Option<&mut dyn TransformObserver>) -> Option<Instant> {
-    observer.is_some().then(Instant::now)
-}
-
-fn finish_phase(
-    observer: &mut Option<&mut dyn TransformObserver>,
-    signal: TransformSignal,
-    phase: TransformPhase,
-    start: Option<Instant>,
-) {
-    if let Some(start) = start {
-        observe_phase(observer, signal, phase, start.elapsed());
-    }
-}
-
 struct TraceBuilders {
-    timestamp: TimestampMicrosecondBuilder,
-    end_timestamp: Int64Builder,
-    duration: Int64Builder,
-    trace_id: StringBuilder,
-    span_id: StringBuilder,
-    parent_span_id: StringBuilder,
+    start_time_unix_nano: TimestampNanosecondBuilder,
+    duration_time_unix_nano: DurationNanosecondBuilder,
+    trace_id: FixedSizeBinaryBuilder,
+    span_id: FixedSizeBinaryBuilder,
+    parent_span_id: FixedSizeBinaryBuilder,
     trace_state: StringBuilder,
     service_name: StringBuilder,
     service_namespace: StringBuilder,
     service_instance_id: StringBuilder,
-    span_name: StringBuilder,
-    span_kind: Int32Builder,
+    name: StringBuilder,
+    kind: Int32Builder,
     status_code: Int32Builder,
-    status_message: StringBuilder,
+    status_status_message: StringBuilder,
     resource_attributes: StringBuilder,
     scope_name: StringBuilder,
     scope_version: StringBuilder,
@@ -249,30 +235,29 @@ struct TraceBuilders {
     span_attributes: StringBuilder,
     events_json: StringBuilder,
     links_json: StringBuilder,
-    dropped_attributes_count: Int32Builder,
-    dropped_events_count: Int32Builder,
-    dropped_links_count: Int32Builder,
-    flags: Int32Builder,
+    dropped_attributes_count: UInt32Builder,
+    dropped_events_count: UInt32Builder,
+    dropped_links_count: UInt32Builder,
+    flags: UInt32Builder,
     json_scratch: String,
 }
 
 impl TraceBuilders {
     fn with_capacity(rows: usize, input_bytes: usize) -> Self {
         Self {
-            timestamp: TimestampMicrosecondBuilder::with_capacity(rows),
-            end_timestamp: Int64Builder::with_capacity(rows),
-            duration: Int64Builder::with_capacity(rows),
-            trace_id: string_builder_bytes(rows, rows.saturating_mul(32)),
-            span_id: string_builder_bytes(rows, rows.saturating_mul(16)),
-            parent_span_id: string_builder_bytes(rows, rows.saturating_mul(16)),
+            start_time_unix_nano: TimestampNanosecondBuilder::with_capacity(rows),
+            duration_time_unix_nano: DurationNanosecondBuilder::with_capacity(rows),
+            trace_id: FixedSizeBinaryBuilder::new(16),
+            span_id: FixedSizeBinaryBuilder::new(8),
+            parent_span_id: FixedSizeBinaryBuilder::new(8),
             trace_state: string_builder_bytes(rows, rows.saturating_mul(16)),
             service_name: string_builder_bytes(rows, rows.saturating_mul(24)),
             service_namespace: string_builder_bytes(rows, rows.saturating_mul(16)),
             service_instance_id: string_builder_bytes(rows, rows.saturating_mul(32)),
-            span_name: string_builder_bytes(rows, rows.saturating_mul(48)),
-            span_kind: Int32Builder::with_capacity(rows),
+            name: string_builder_bytes(rows, rows.saturating_mul(48)),
+            kind: Int32Builder::with_capacity(rows),
             status_code: Int32Builder::with_capacity(rows),
-            status_message: string_builder_bytes(rows, rows.saturating_mul(16)),
+            status_status_message: string_builder_bytes(rows, rows.saturating_mul(16)),
             resource_attributes: string_builder_bytes(rows, input_bytes),
             scope_name: string_builder_bytes(rows, rows.saturating_mul(16)),
             scope_version: string_builder_bytes(rows, rows.saturating_mul(8)),
@@ -280,10 +265,10 @@ impl TraceBuilders {
             span_attributes: string_builder_bytes(rows, input_bytes),
             events_json: string_builder_bytes(rows, input_bytes),
             links_json: string_builder_bytes(rows, input_bytes / 2),
-            dropped_attributes_count: Int32Builder::with_capacity(rows),
-            dropped_events_count: Int32Builder::with_capacity(rows),
-            dropped_links_count: Int32Builder::with_capacity(rows),
-            flags: Int32Builder::with_capacity(rows),
+            dropped_attributes_count: UInt32Builder::with_capacity(rows),
+            dropped_events_count: UInt32Builder::with_capacity(rows),
+            dropped_links_count: UInt32Builder::with_capacity(rows),
+            flags: UInt32Builder::with_capacity(rows),
             json_scratch: String::new(),
         }
     }
@@ -298,25 +283,33 @@ impl TraceBuilders {
             TransformSignal::Traces,
             TransformPhase::ArrowAppend,
             || {
-                let start = u64_to_i64(span.start_time_unix_nano, "span.start_time_unix_nano")?;
-                let end = u64_to_i64(span.end_time_unix_nano, "span.end_time_unix_nano")?;
-                self.timestamp.append_value(start / 1_000);
-                self.end_timestamp.append_value(end / 1_000_000);
-                self.duration
-                    .append_value(end.saturating_sub(start) / 1_000_000);
-                append_hex_or_null(&mut self.trace_id, &span.trace_id);
-                append_hex_or_null(&mut self.span_id, &span.span_id);
-                append_hex_or_null(&mut self.parent_span_id, &span.parent_span_id);
+                append_required_ts_ns(
+                    &mut self.start_time_unix_nano,
+                    span.start_time_unix_nano,
+                    "span.start_time_unix_nano",
+                )?;
+                let duration = span
+                    .end_time_unix_nano
+                    .saturating_sub(span.start_time_unix_nano);
+                self.duration_time_unix_nano
+                    .append_value(u64_to_i64(duration, "span.duration_time_unix_nano")?);
+                append_fixed_required(&mut self.trace_id, &span.trace_id, 16, "span.trace_id")?;
+                append_fixed_required(&mut self.span_id, &span.span_id, 8, "span.span_id")?;
+                append_fixed_or_null(&mut self.parent_span_id, &span.parent_span_id, 8)?;
                 append_empty_as_null(&mut self.trace_state, &span.trace_state);
-                self.span_name.append_value(&span.name);
-                self.span_kind.append_value(span.kind);
-                let (status_code, status_message) = span
-                    .status
-                    .as_ref()
-                    .map(|status| (status.code, status.message.as_str()))
-                    .unwrap_or((0, ""));
-                self.status_code.append_value(status_code);
-                append_empty_as_null(&mut self.status_message, status_message);
+                self.name.append_value(&span.name);
+                if span.kind == 0 {
+                    self.kind.append_null();
+                } else {
+                    self.kind.append_value(span.kind);
+                }
+                if let Some(status) = span.status.as_ref() {
+                    self.status_code.append_value(status.code);
+                    append_empty_as_null(&mut self.status_status_message, &status.message);
+                } else {
+                    self.status_code.append_null();
+                    self.status_status_message.append_null();
+                }
                 Ok::<(), crate::Error>(())
             },
         )?;
@@ -351,12 +344,12 @@ impl TraceBuilders {
             TransformPhase::ArrowAppend,
             || {
                 self.dropped_attributes_count
-                    .append_value(span.dropped_attributes_count as i32);
+                    .append_value(span.dropped_attributes_count);
                 self.dropped_events_count
-                    .append_value(span.dropped_events_count as i32);
+                    .append_value(span.dropped_events_count);
                 self.dropped_links_count
-                    .append_value(span.dropped_links_count as i32);
-                self.flags.append_value(span.flags as i32);
+                    .append_value(span.dropped_links_count);
+                self.flags.append_value(span.flags);
             },
         );
         Ok(())
@@ -463,11 +456,10 @@ impl TraceBuilders {
 
     fn finish(mut self) -> Result<RecordBatch> {
         record_batch(
-            traces_schema(),
+            traces_schema_arc(),
             vec![
-                array(self.timestamp.finish()),
-                array(self.end_timestamp.finish()),
-                array(self.duration.finish()),
+                array(self.start_time_unix_nano.finish()),
+                array(self.duration_time_unix_nano.finish()),
                 array(self.trace_id.finish()),
                 array(self.span_id.finish()),
                 array(self.parent_span_id.finish()),
@@ -475,10 +467,10 @@ impl TraceBuilders {
                 array(self.service_name.finish()),
                 array(self.service_namespace.finish()),
                 array(self.service_instance_id.finish()),
-                array(self.span_name.finish()),
-                array(self.span_kind.finish()),
+                array(self.name.finish()),
+                array(self.kind.finish()),
                 array(self.status_code.finish()),
-                array(self.status_message.finish()),
+                array(self.status_status_message.finish()),
                 array(self.resource_attributes.finish()),
                 array(self.scope_name.finish()),
                 array(self.scope_version.finish()),

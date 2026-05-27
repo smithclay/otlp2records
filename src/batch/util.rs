@@ -3,10 +3,12 @@
 use std::sync::Arc;
 
 use arrow_array::{
-    builder::{Float64Builder, StringBuilder},
+    builder::{
+        FixedSizeBinaryBuilder, Float64Builder, ListBuilder, StringBuilder,
+        TimestampNanosecondBuilder, UInt64Builder,
+    },
     Array, ArrayRef, RecordBatch,
 };
-use const_hex::{encode as hex_encode, encode_to_str};
 
 use crate::{DecodeError, Error, Result};
 
@@ -51,20 +53,6 @@ pub(super) fn append_empty_as_null(builder: &mut StringBuilder, value: &str) {
 }
 
 #[inline]
-pub(super) fn append_hex_or_null(builder: &mut StringBuilder, bytes: &[u8]) {
-    if bytes.is_empty() {
-        builder.append_null();
-    } else if bytes.len() <= 32 {
-        let mut buf = [0_u8; 64];
-        let hex = encode_to_str(bytes, &mut buf[..bytes.len() * 2])
-            .expect("hex buffer length is exactly input length * 2");
-        builder.append_value(hex);
-    } else {
-        builder.append_value(hex_encode(bytes));
-    }
-}
-
-#[inline]
 pub(super) fn append_finite(builder: &mut Float64Builder, value: f64) {
     if value.is_finite() {
         builder.append_value(value);
@@ -79,6 +67,87 @@ pub(super) fn append_finite_opt(builder: &mut Float64Builder, value: Option<f64>
         Some(value) => append_finite(builder, value),
         None => builder.append_null(),
     }
+}
+
+#[inline]
+pub(super) fn append_opt_ts_ns(
+    builder: &mut TimestampNanosecondBuilder,
+    value: u64,
+    field: &str,
+) -> Result<()> {
+    if value == 0 {
+        builder.append_null();
+    } else {
+        builder.append_value(u64_to_i64(value, field)?);
+    }
+    Ok(())
+}
+
+#[inline]
+pub(super) fn append_required_ts_ns(
+    builder: &mut TimestampNanosecondBuilder,
+    value: u64,
+    field: &str,
+) -> Result<()> {
+    builder.append_value(u64_to_i64(value, field)?);
+    Ok(())
+}
+
+#[inline]
+pub(super) fn append_fixed_or_null(
+    builder: &mut FixedSizeBinaryBuilder,
+    value: &[u8],
+    len: usize,
+) -> Result<()> {
+    if value.is_empty() {
+        builder.append_null();
+        return Ok(());
+    }
+    if value.len() != len {
+        return Err(Error::Decode(DecodeError::Unsupported(format!(
+            "fixed binary length mismatch: expected {len}, got {}",
+            value.len()
+        ))));
+    }
+    builder.append_value(value)?;
+    Ok(())
+}
+
+#[inline]
+pub(super) fn append_fixed_required(
+    builder: &mut FixedSizeBinaryBuilder,
+    value: &[u8],
+    len: usize,
+    field: &str,
+) -> Result<()> {
+    if value.len() != len {
+        return Err(Error::Decode(DecodeError::Unsupported(format!(
+            "{field} fixed binary length mismatch: expected {len}, got {}",
+            value.len()
+        ))));
+    }
+    builder.append_value(value)?;
+    Ok(())
+}
+
+#[inline]
+pub(super) fn append_u64_list(builder: &mut ListBuilder<UInt64Builder>, values: &[u64]) {
+    for value in values {
+        builder.values().append_value(*value);
+    }
+    builder.append(true);
+}
+
+#[inline]
+pub(super) fn append_f64_list(builder: &mut ListBuilder<Float64Builder>, values: &[f64]) {
+    for value in values {
+        if value.is_finite() {
+            builder.values().append_value(*value);
+        } else {
+            builder.values().append_null();
+        }
+    }
+    builder.append(true);
 }
 
 #[inline]
@@ -98,10 +167,10 @@ pub(super) fn array<A: Array + 'static>(array: A) -> ArrayRef {
 
 #[inline]
 pub(super) fn record_batch(
-    schema: arrow_schema::Schema,
+    schema: Arc<arrow_schema::Schema>,
     arrays: Vec<ArrayRef>,
 ) -> Result<RecordBatch> {
-    Ok(RecordBatch::try_new(Arc::new(schema), arrays)?)
+    Ok(RecordBatch::try_new(schema, arrays)?)
 }
 
 #[inline]
