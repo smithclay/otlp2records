@@ -2,7 +2,7 @@
 //!
 //! These tests use real OTLP fixtures to verify the complete transformation pipeline.
 
-use arrow_array::{Array, TimestampMicrosecondArray};
+use arrow_array::{Array, TimestampNanosecondArray};
 use otlp2records::{
     to_ipc, to_json, transform_logs, transform_metrics, transform_traces, InputFormat,
 };
@@ -21,7 +21,7 @@ fn test_full_pipeline_logs_json() {
 
     // Verify schema has expected fields
     let schema = batch.schema();
-    assert!(schema.field_with_name("timestamp").is_ok());
+    assert!(schema.field_with_name("time_unix_nano").is_ok());
     assert!(schema.field_with_name("service_name").is_ok());
     assert!(schema.field_with_name("severity_number").is_ok());
     assert!(schema.field_with_name("body").is_ok());
@@ -163,10 +163,10 @@ fn test_full_pipeline_traces_json() {
 
     // Verify schema has expected fields
     let schema = batch.schema();
-    assert!(schema.field_with_name("timestamp").is_ok());
+    assert!(schema.field_with_name("start_time_unix_nano").is_ok());
     assert!(schema.field_with_name("trace_id").is_ok());
     assert!(schema.field_with_name("span_id").is_ok());
-    assert!(schema.field_with_name("span_name").is_ok());
+    assert!(schema.field_with_name("name").is_ok());
     assert!(schema.field_with_name("service_name").is_ok());
 
     // Verify NDJSON output
@@ -217,9 +217,9 @@ fn test_full_pipeline_metrics_json() {
         assert!(gauge.num_rows() > 0, "Expected at least one gauge metric");
 
         let schema = gauge.schema();
-        assert!(schema.field_with_name("metric_name").is_ok());
-        assert!(schema.field_with_name("value").is_ok());
-        assert!(schema.field_with_name("timestamp").is_ok());
+        assert!(schema.field_with_name("name").is_ok());
+        assert!(schema.field_with_name("double_value").is_ok());
+        assert!(schema.field_with_name("time_unix_nano").is_ok());
 
         let ndjson = to_json(gauge).unwrap();
         let ndjson_str = String::from_utf8(ndjson).unwrap();
@@ -231,8 +231,8 @@ fn test_full_pipeline_metrics_json() {
         assert!(sum.num_rows() > 0, "Expected at least one sum metric");
 
         let schema = sum.schema();
-        assert!(schema.field_with_name("metric_name").is_ok());
-        assert!(schema.field_with_name("value").is_ok());
+        assert!(schema.field_with_name("name").is_ok());
+        assert!(schema.field_with_name("double_value").is_ok());
         assert!(schema.field_with_name("aggregation_temporality").is_ok());
         assert!(schema.field_with_name("is_monotonic").is_ok());
 
@@ -358,10 +358,11 @@ fn test_logs_schema_consistency() {
 
     // Required fields in logs schema
     let required_fields = [
-        "timestamp",
-        "observed_timestamp",
+        "time_unix_nano",
+        "observed_time_unix_nano",
         "severity_number",
         "severity_text",
+        "event_name",
         "body",
         "trace_id",
         "span_id",
@@ -389,15 +390,15 @@ fn test_traces_schema_consistency() {
 
     // Required fields in traces schema
     let required_fields = [
-        "timestamp",
+        "start_time_unix_nano",
         "trace_id",
         "span_id",
         "parent_span_id",
-        "span_name",
-        "span_kind",
+        "name",
+        "kind",
         "service_name",
         "scope_name",
-        "duration",
+        "duration_time_unix_nano",
     ];
 
     for field in required_fields {
@@ -419,7 +420,13 @@ fn test_metrics_schema_consistency() {
     // Gauge schema
     if let Some(gauge) = &json_batches.gauge {
         let schema = gauge.schema();
-        let required_fields = ["timestamp", "metric_name", "value", "service_name"];
+        let required_fields = [
+            "time_unix_nano",
+            "name",
+            "int_value",
+            "double_value",
+            "service_name",
+        ];
         for field in required_fields {
             assert!(
                 schema.field_with_name(field).is_ok(),
@@ -432,9 +439,10 @@ fn test_metrics_schema_consistency() {
     if let Some(sum) = &json_batches.sum {
         let schema = sum.schema();
         let required_fields = [
-            "timestamp",
-            "metric_name",
-            "value",
+            "time_unix_nano",
+            "name",
+            "int_value",
+            "double_value",
             "service_name",
             "aggregation_temporality",
             "is_monotonic",
@@ -496,9 +504,9 @@ fn test_traces_to_json_is_valid_ndjson() {
 // Timestamp validation tests - verify timestamps from real .pb files are not 1970
 // ============================================================================
 
-/// Minimum valid timestamp in microseconds (year 2020)
+/// Minimum valid timestamp in nanoseconds (year 2020)
 /// Any timestamp before this is likely a bug (1970 epoch date)
-const MIN_VALID_TIMESTAMP_MICROS: i64 = 1_577_836_800_000_000; // Jan 1, 2020
+const MIN_VALID_TIMESTAMP_NANOS: i64 = 1_577_836_800_000_000_000; // Jan 1, 2020
 
 #[test]
 fn test_traces_large_pb_timestamps_not_epoch() {
@@ -509,20 +517,20 @@ fn test_traces_large_pb_timestamps_not_epoch() {
 
     // Get the timestamp column
     let schema = batch.schema();
-    let ts_idx = schema.index_of("timestamp").unwrap();
+    let ts_idx = schema.index_of("start_time_unix_nano").unwrap();
     let ts_column = batch
         .column(ts_idx)
         .as_any()
-        .downcast_ref::<TimestampMicrosecondArray>()
-        .expect("timestamp should be TimestampMicrosecondArray");
+        .downcast_ref::<TimestampNanosecondArray>()
+        .expect("start_time_unix_nano should be TimestampNanosecondArray");
 
     // Check all timestamps are valid (not 1970 epoch)
     for i in 0..ts_column.len() {
         if !ts_column.is_null(i) {
             let ts_value = ts_column.value(i);
             assert!(
-                ts_value > MIN_VALID_TIMESTAMP_MICROS,
-                "Row {i}: timestamp {ts_value} appears to be 1970 epoch date (expected > {MIN_VALID_TIMESTAMP_MICROS})"
+                ts_value > MIN_VALID_TIMESTAMP_NANOS,
+                "Row {i}: timestamp {ts_value} appears to be 1970 epoch date (expected > {MIN_VALID_TIMESTAMP_NANOS})"
             );
         }
     }
@@ -542,20 +550,20 @@ fn test_logs_large_pb_timestamps_not_epoch() {
 
     // Get the timestamp column
     let schema = batch.schema();
-    let ts_idx = schema.index_of("timestamp").unwrap();
+    let ts_idx = schema.index_of("time_unix_nano").unwrap();
     let ts_column = batch
         .column(ts_idx)
         .as_any()
-        .downcast_ref::<TimestampMicrosecondArray>()
-        .expect("timestamp should be TimestampMicrosecondArray");
+        .downcast_ref::<TimestampNanosecondArray>()
+        .expect("time_unix_nano should be TimestampNanosecondArray");
 
     // Check all timestamps are valid (not 1970 epoch)
     for i in 0..ts_column.len() {
         if !ts_column.is_null(i) {
             let ts_value = ts_column.value(i);
             assert!(
-                ts_value > MIN_VALID_TIMESTAMP_MICROS,
-                "Row {i}: timestamp {ts_value} appears to be 1970 epoch date (expected > {MIN_VALID_TIMESTAMP_MICROS})"
+                ts_value > MIN_VALID_TIMESTAMP_NANOS,
+                "Row {i}: timestamp {ts_value} appears to be 1970 epoch date (expected > {MIN_VALID_TIMESTAMP_NANOS})"
             );
         }
     }
@@ -614,18 +622,18 @@ fn verify_metric_timestamps(batch: &arrow_array::RecordBatch, context: &str) {
     }
 
     let schema = batch.schema();
-    let ts_idx = schema.index_of("timestamp").unwrap();
+    let ts_idx = schema.index_of("time_unix_nano").unwrap();
     let ts_column = batch
         .column(ts_idx)
         .as_any()
-        .downcast_ref::<TimestampMicrosecondArray>()
-        .expect("timestamp should be TimestampMicrosecondArray");
+        .downcast_ref::<TimestampNanosecondArray>()
+        .expect("time_unix_nano should be TimestampNanosecondArray");
 
     for i in 0..ts_column.len() {
         if !ts_column.is_null(i) {
             let ts_value = ts_column.value(i);
             assert!(
-                ts_value > MIN_VALID_TIMESTAMP_MICROS,
+                ts_value > MIN_VALID_TIMESTAMP_NANOS,
                 "{context} row {i}: timestamp {ts_value} appears to be 1970 epoch date"
             );
         }

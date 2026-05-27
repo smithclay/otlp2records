@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use arrow_array::cast::AsArray;
-use arrow_array::types::{Int64Type, TimestampMicrosecondType};
+use arrow_array::types::{Int64Type, TimestampMicrosecondType, TimestampNanosecondType};
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_select::take::take;
 use indexmap::IndexMap;
@@ -144,19 +144,25 @@ pub fn group_batch_by_service(batch: RecordBatch) -> ServiceGroupedBatches {
 
 /// Extract the minimum timestamp from a RecordBatch.
 ///
-/// Looks for a "timestamp" column and returns the minimum value in microseconds.
+/// Looks for a normalized timestamp column and returns the minimum value in microseconds.
 /// Returns 0 if no valid timestamps found.
 pub fn extract_min_timestamp_micros(batch: &RecordBatch) -> i64 {
     if batch.num_rows() == 0 {
         return 0;
     }
 
-    let ts_col = match batch.column_by_name("timestamp") {
+    let ts_col = match batch
+        .column_by_name("time_unix_nano")
+        .or_else(|| batch.column_by_name("start_time_unix_nano"))
+        .or_else(|| batch.column_by_name("timestamp"))
+    {
         Some(col) => col,
         None => return 0,
     };
 
-    if let Some(ts_array) = ts_col.as_primitive_opt::<TimestampMicrosecondType>() {
+    if let Some(ts_array) = ts_col.as_primitive_opt::<TimestampNanosecondType>() {
+        ts_array.iter().flatten().min().unwrap_or(0) / 1_000
+    } else if let Some(ts_array) = ts_col.as_primitive_opt::<TimestampMicrosecondType>() {
         ts_array.iter().flatten().min().unwrap_or(0)
     } else if let Some(ts_array) = ts_col.as_primitive_opt::<Int64Type>() {
         // Fallback for an Int64 timestamp column, assumed to be milliseconds.

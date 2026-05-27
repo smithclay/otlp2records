@@ -80,19 +80,19 @@ fn existing_transform_apis_stay_normalized() {
     assert!(transform_logs(&logs, InputFormat::Protobuf)
         .unwrap()
         .schema()
-        .field_with_name("service_name")
+        .field_with_name("time_unix_nano")
         .is_ok());
     assert!(transform_traces(&traces, InputFormat::Protobuf)
         .unwrap()
         .schema()
-        .field_with_name("events_json")
+        .field_with_name("start_time_unix_nano")
         .is_ok());
     assert!(transform_metrics(&metrics, InputFormat::Protobuf)
         .unwrap()
         .gauge
         .unwrap()
         .schema()
-        .field_with_name("metric_attributes")
+        .field_with_name("double_value")
         .is_ok());
 }
 

@@ -3,7 +3,10 @@
 use std::time::Instant;
 
 use arrow_array::{
-    builder::{Int32Builder, Int64Builder, StringBuilder, TimestampMicrosecondBuilder},
+    builder::{
+        FixedSizeBinaryBuilder, Int32Builder, StringBuilder, TimestampNanosecondBuilder,
+        UInt32Builder,
+    },
     RecordBatch,
 };
 use opentelemetry_proto::tonic::{
@@ -22,8 +25,8 @@ use super::{
         TransformObserver, TransformPhase, TransformSignal,
     },
     util::{
-        append_hex_or_null, append_opt_n, append_required_service_name_n, array, record_batch,
-        string_builder_bytes, u64_to_i64,
+        append_empty_as_null, append_fixed_or_null, append_opt_n, append_opt_ts_ns,
+        append_required_service_name_n, array, record_batch, string_builder_bytes,
     },
 };
 
@@ -225,42 +228,48 @@ fn finish_phase(
 }
 
 struct LogBuilders {
-    timestamp: TimestampMicrosecondBuilder,
-    observed_timestamp: Int64Builder,
-    trace_id: StringBuilder,
-    span_id: StringBuilder,
+    time_unix_nano: TimestampNanosecondBuilder,
+    observed_time_unix_nano: TimestampNanosecondBuilder,
+    trace_id: FixedSizeBinaryBuilder,
+    span_id: FixedSizeBinaryBuilder,
     service_name: StringBuilder,
     service_namespace: StringBuilder,
     service_instance_id: StringBuilder,
     severity_number: Int32Builder,
     severity_text: StringBuilder,
+    event_name: StringBuilder,
     body: StringBuilder,
     resource_attributes: StringBuilder,
     scope_name: StringBuilder,
     scope_version: StringBuilder,
     scope_attributes: StringBuilder,
     log_attributes: StringBuilder,
+    dropped_attributes_count: UInt32Builder,
+    flags: UInt32Builder,
     json_scratch: String,
 }
 
 impl LogBuilders {
     fn with_capacity(rows: usize, input_bytes: usize) -> Self {
         Self {
-            timestamp: TimestampMicrosecondBuilder::with_capacity(rows),
-            observed_timestamp: Int64Builder::with_capacity(rows),
-            trace_id: string_builder_bytes(rows, rows.saturating_mul(32)),
-            span_id: string_builder_bytes(rows, rows.saturating_mul(16)),
+            time_unix_nano: TimestampNanosecondBuilder::with_capacity(rows),
+            observed_time_unix_nano: TimestampNanosecondBuilder::with_capacity(rows),
+            trace_id: FixedSizeBinaryBuilder::new(16),
+            span_id: FixedSizeBinaryBuilder::new(8),
             service_name: string_builder_bytes(rows, rows.saturating_mul(24)),
             service_namespace: string_builder_bytes(rows, rows.saturating_mul(16)),
             service_instance_id: string_builder_bytes(rows, rows.saturating_mul(32)),
             severity_number: Int32Builder::with_capacity(rows),
             severity_text: string_builder_bytes(rows, rows.saturating_mul(8)),
+            event_name: string_builder_bytes(rows, rows.saturating_mul(16)),
             body: string_builder_bytes(rows, input_bytes),
             resource_attributes: string_builder_bytes(rows, input_bytes),
             scope_name: string_builder_bytes(rows, rows.saturating_mul(16)),
             scope_version: string_builder_bytes(rows, rows.saturating_mul(8)),
             scope_attributes: string_builder_bytes(rows, input_bytes / 4),
             log_attributes: string_builder_bytes(rows, input_bytes),
+            dropped_attributes_count: UInt32Builder::with_capacity(rows),
+            flags: UInt32Builder::with_capacity(rows),
             json_scratch: String::new(),
         }
     }
@@ -275,18 +284,28 @@ impl LogBuilders {
             TransformSignal::Logs,
             TransformPhase::ArrowAppend,
             || {
-                self.timestamp
-                    .append_value(u64_to_i64(record.time_unix_nano, "log.time_unix_nano")? / 1_000);
-                self.observed_timestamp.append_value(
-                    u64_to_i64(
-                        record.observed_time_unix_nano,
-                        "log.observed_time_unix_nano",
-                    )? / 1_000,
-                );
-                append_hex_or_null(&mut self.trace_id, &record.trace_id);
-                append_hex_or_null(&mut self.span_id, &record.span_id);
-                self.severity_number.append_value(record.severity_number);
-                self.severity_text.append_value(&record.severity_text);
+                append_opt_ts_ns(
+                    &mut self.time_unix_nano,
+                    record.time_unix_nano,
+                    "log.time_unix_nano",
+                )?;
+                append_opt_ts_ns(
+                    &mut self.observed_time_unix_nano,
+                    record.observed_time_unix_nano,
+                    "log.observed_time_unix_nano",
+                )?;
+                append_fixed_or_null(&mut self.trace_id, &record.trace_id, 16)?;
+                append_fixed_or_null(&mut self.span_id, &record.span_id, 8)?;
+                if record.severity_number == 0 {
+                    self.severity_number.append_null();
+                } else {
+                    self.severity_number.append_value(record.severity_number);
+                }
+                append_empty_as_null(&mut self.severity_text, &record.severity_text);
+                append_empty_as_null(&mut self.event_name, &record.event_name);
+                self.dropped_attributes_count
+                    .append_value(record.dropped_attributes_count);
+                self.flags.append_value(record.flags);
                 Ok::<(), crate::Error>(())
             },
         )?;
@@ -416,8 +435,8 @@ impl LogBuilders {
         record_batch(
             logs_schema(),
             vec![
-                array(self.timestamp.finish()),
-                array(self.observed_timestamp.finish()),
+                array(self.time_unix_nano.finish()),
+                array(self.observed_time_unix_nano.finish()),
                 array(self.trace_id.finish()),
                 array(self.span_id.finish()),
                 array(self.service_name.finish()),
@@ -425,12 +444,15 @@ impl LogBuilders {
                 array(self.service_instance_id.finish()),
                 array(self.severity_number.finish()),
                 array(self.severity_text.finish()),
+                array(self.event_name.finish()),
                 array(self.body.finish()),
                 array(self.resource_attributes.finish()),
                 array(self.scope_name.finish()),
                 array(self.scope_version.finish()),
                 array(self.scope_attributes.finish()),
                 array(self.log_attributes.finish()),
+                array(self.dropped_attributes_count.finish()),
+                array(self.flags.finish()),
             ],
         )
     }

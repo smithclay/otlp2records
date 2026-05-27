@@ -146,6 +146,36 @@ entities are emitted as separate tables keyed by deterministic `id` and
 The FFI and WASM bindings continue to expose the normalized single-batch shape in
 this release. `otap-star` is Rust API only to avoid changing those ABIs.
 
+### Breaking Changes In 0.8.0
+
+The 0.7 to 0.8 release intentionally changes the default normalized schema. The
+existing `transform_logs`, `transform_traces`, and `transform_metrics` APIs still
+return flattened batches by default, but downstream code that selects columns by
+name or expects specific Arrow physical types must be updated.
+
+Key normalized-schema changes:
+
+- OTLP/OTAP field names replace older ClickStack-style names: for example,
+  `timestamp` becomes `time_unix_nano` for logs and metrics,
+  trace `timestamp` becomes `start_time_unix_nano`, `span_name` becomes `name`,
+  `span_kind` becomes `kind`, and metric `metric_name`/`metric_description`/
+  `metric_unit` become `name`/`description`/`unit`.
+- Timestamps now use Arrow `Timestamp(Nanosecond)` instead of microsecond or
+  millisecond-scaled integer columns. Span duration is
+  `duration_time_unix_nano` with Arrow `Duration(Nanosecond)`.
+- Trace and span identifiers are Arrow `FixedSizeBinary(16)` and
+  `FixedSizeBinary(8)` instead of hex strings.
+- Metric number values are split into nullable `int_value` and `double_value`
+  columns instead of a single `Float64` `value` column.
+- Histogram bucket columns now use typed Arrow list columns instead of JSON
+  strings, and dropped counts/flags/count fields use unsigned Arrow integer
+  types where OTAP does.
+
+The flattened JSON convenience columns remain for now: `resource_attributes`,
+`scope_attributes`, signal attribute JSON columns, `events_json`, `links_json`,
+and `exemplars_json`. The new `otap-star` output is the more relational
+multi-table shape for callers that want child tables instead of flattened JSON.
+
 ### Transform Observation
 
 Production callers can opt into phase timings and counters without changing output semantics:
@@ -229,41 +259,48 @@ them per table by iterating named batches.
 
 ## Output Schemas
 
+`SchemaOutput::Normalized` is the default flattened schema. In 0.8.0 it uses
+OTAP-compatible field names and high-value Arrow physical types while keeping
+the flattened resource/scope/attribute convenience columns. The `clickstack`
+and `clickstack-mode` schema aliases still select this normalized output.
+
 ### Logs Schema
 
 | Field | Type | Description |
 |-------|------|-------------|
-| timestamp | TimestampMicrosecond | Log record timestamp |
-| observed_timestamp | Int64 | When log was observed (ms) |
-| trace_id | String | Trace correlation ID (hex) |
-| span_id | String | Span correlation ID (hex) |
+| time_unix_nano | TimestampNanosecond | Log record timestamp |
+| observed_time_unix_nano | TimestampNanosecond | When log was observed |
+| trace_id | FixedSizeBinary(16) | Trace correlation ID |
+| span_id | FixedSizeBinary(8) | Span correlation ID |
 | service_name | String | Service name from resource |
 | service_namespace | String | Service namespace |
 | service_instance_id | String | Service instance ID |
 | severity_number | Int32 | Numeric severity (1-24) |
 | severity_text | String | Severity string (DEBUG, INFO, etc.) |
+| event_name | String | Log event name |
 | body | String | Log message body |
 | resource_attributes | String | JSON-encoded resource attributes |
 | scope_name | String | Instrumentation scope name |
 | scope_version | String | Instrumentation scope version |
 | scope_attributes | String | JSON-encoded scope attributes |
 | log_attributes | String | JSON-encoded log attributes |
+| dropped_attributes_count | UInt32 | Dropped log attributes |
+| flags | UInt32 | Log flags |
 
 ### Traces Schema
 
 | Field | Type | Description |
 |-------|------|-------------|
-| timestamp | TimestampMicrosecond | Span start time |
-| end_timestamp | Int64 | Span end time (ms) |
-| duration | Int64 | Duration in milliseconds |
-| trace_id | String | Trace ID (hex) |
-| span_id | String | Span ID (hex) |
-| parent_span_id | String | Parent span ID (hex) |
+| start_time_unix_nano | TimestampNanosecond | Span start time |
+| duration_time_unix_nano | DurationNanosecond | Span duration |
+| trace_id | FixedSizeBinary(16) | Trace ID |
+| span_id | FixedSizeBinary(8) | Span ID |
+| parent_span_id | FixedSizeBinary(8) | Parent span ID |
 | trace_state | String | W3C trace state |
-| span_name | String | Operation name |
-| span_kind | Int32 | Span kind enum |
+| name | String | Operation name |
+| kind | Int32 | Span kind enum |
 | status_code | Int32 | Status code |
-| status_message | String | Status message |
+| status_status_message | String | Status message |
 | service_name | String | Service name from resource |
 | service_namespace | String | Service namespace |
 | service_instance_id | String | Service instance ID |
@@ -274,21 +311,22 @@ them per table by iterating named batches.
 | resource_attributes | String | JSON-encoded resource attributes |
 | events_json | String | JSON-encoded span events |
 | links_json | String | JSON-encoded span links |
-| dropped_attributes_count | Int32 | Dropped attributes count |
-| dropped_events_count | Int32 | Dropped events count |
-| dropped_links_count | Int32 | Dropped links count |
-| flags | Int32 | Span flags |
+| dropped_attributes_count | UInt32 | Dropped attributes count |
+| dropped_events_count | UInt32 | Dropped events count |
+| dropped_links_count | UInt32 | Dropped links count |
+| flags | UInt32 | Span flags |
 
 ### Gauge Metrics Schema
 
 | Field | Type | Description |
 |-------|------|-------------|
-| timestamp | TimestampMicrosecond | Data point timestamp |
-| start_timestamp | Int64 | Start of measurement window (ms) |
-| metric_name | String | Metric name |
-| metric_description | String | Metric description |
-| metric_unit | String | Unit of measurement |
-| value | Float64 | Metric value |
+| time_unix_nano | TimestampNanosecond | Data point timestamp |
+| start_time_unix_nano | TimestampNanosecond | Start of measurement window |
+| name | String | Metric name |
+| description | String | Metric description |
+| unit | String | Unit of measurement |
+| int_value | Int64 | Integer metric value |
+| double_value | Float64 | Floating-point metric value |
 | service_name | String | Service name from resource |
 | service_namespace | String | Service namespace |
 | service_instance_id | String | Service instance ID |
@@ -297,7 +335,7 @@ them per table by iterating named batches.
 | scope_version | String | Instrumentation scope version |
 | scope_attributes | String | JSON-encoded scope attributes |
 | metric_attributes | String | JSON-encoded metric attributes |
-| flags | Int32 | Data point flags |
+| flags | UInt32 | Data point flags |
 | exemplars_json | String | JSON-encoded exemplars |
 
 ### Sum Metrics Schema
@@ -308,6 +346,20 @@ Includes all gauge fields plus:
 |-------|------|-------------|
 | aggregation_temporality | Int32 | 1=Delta, 2=Cumulative |
 | is_monotonic | Boolean | Whether sum is monotonic |
+
+### Histogram Metrics Schema
+
+Histogram metrics use the common metric context fields above, plus `count`
+(`UInt64`), `sum`, `min`, `max`, typed `bucket_counts` (`List<UInt64>`),
+typed `explicit_bounds` (`List<Float64>`), `flags`, `exemplars_json`, and
+`aggregation_temporality`.
+
+### Exponential Histogram Metrics Schema
+
+Exponential histograms use the common metric context fields above, plus
+`count` (`UInt64`), `sum`, `min`, `max`, `scale`, `zero_count` (`UInt64`),
+`zero_threshold`, typed positive/negative bucket-count lists, `flags`,
+`exemplars_json`, and `aggregation_temporality`.
 
 ## Cargo Features
 

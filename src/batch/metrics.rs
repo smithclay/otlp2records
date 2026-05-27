@@ -2,8 +2,8 @@
 
 use arrow_array::{
     builder::{
-        BooleanBuilder, Float64Builder, Int32Builder, Int64Builder, StringBuilder,
-        TimestampMicrosecondBuilder,
+        BooleanBuilder, Float64Builder, Int32Builder, Int64Builder, ListBuilder, StringBuilder,
+        TimestampNanosecondBuilder, UInt32Builder, UInt64Builder,
     },
     RecordBatch,
 };
@@ -24,16 +24,15 @@ use crate::{
 
 use super::{
     context::{ContextDuplicateTracker, MetricMeta, ResourceContext, ScopeContext},
-    json::{
-        append_attrs_json, append_exemplars_json, append_f64_json_array, append_u64_json_array,
-    },
+    json::{append_attrs_json, append_exemplars_json},
     profile::{
         measure_phase, measure_result, observe_counter, TransformCounter, TransformObserver,
         TransformPhase, TransformSignal,
     },
     util::{
-        append_finite, append_finite_opt, append_opt_n, append_required_service_name_n, array,
-        record_batch, string_builder, u64_to_i64,
+        append_f64_list, append_finite, append_finite_opt, append_opt_n, append_opt_ts_ns,
+        append_required_service_name_n, append_required_ts_ns, append_u64_list, array,
+        record_batch, string_builder,
     },
 };
 
@@ -320,14 +319,20 @@ struct MetricCapacities {
     exp_histogram: usize,
 }
 
+enum NumberPointValue {
+    Int(i64),
+    Double(f64),
+}
+
 struct GaugeBuilders {
     rows: usize,
-    timestamp: TimestampMicrosecondBuilder,
-    start_timestamp: Int64Builder,
-    metric_name: StringBuilder,
-    metric_description: StringBuilder,
-    metric_unit: StringBuilder,
-    value: Float64Builder,
+    time_unix_nano: TimestampNanosecondBuilder,
+    start_time_unix_nano: TimestampNanosecondBuilder,
+    name: StringBuilder,
+    description: StringBuilder,
+    unit: StringBuilder,
+    int_value: Int64Builder,
+    double_value: Float64Builder,
     service_name: StringBuilder,
     service_namespace: StringBuilder,
     service_instance_id: StringBuilder,
@@ -336,7 +341,7 @@ struct GaugeBuilders {
     scope_version: StringBuilder,
     scope_attributes: StringBuilder,
     metric_attributes: StringBuilder,
-    flags: Int32Builder,
+    flags: UInt32Builder,
     exemplars_json: StringBuilder,
     json_scratch: String,
 }
@@ -345,12 +350,13 @@ impl GaugeBuilders {
     fn with_capacity(rows: usize) -> Self {
         Self {
             rows: 0,
-            timestamp: TimestampMicrosecondBuilder::with_capacity(rows),
-            start_timestamp: Int64Builder::with_capacity(rows),
-            metric_name: string_builder(rows),
-            metric_description: string_builder(rows),
-            metric_unit: string_builder(rows),
-            value: Float64Builder::with_capacity(rows),
+            time_unix_nano: TimestampNanosecondBuilder::with_capacity(rows),
+            start_time_unix_nano: TimestampNanosecondBuilder::with_capacity(rows),
+            name: string_builder(rows),
+            description: string_builder(rows),
+            unit: string_builder(rows),
+            int_value: Int64Builder::with_capacity(rows),
+            double_value: Float64Builder::with_capacity(rows),
             service_name: string_builder(rows),
             service_namespace: string_builder(rows),
             service_instance_id: string_builder(rows),
@@ -359,13 +365,18 @@ impl GaugeBuilders {
             scope_version: string_builder(rows),
             scope_attributes: string_builder(rows),
             metric_attributes: string_builder(rows),
-            flags: Int32Builder::with_capacity(rows),
+            flags: UInt32Builder::with_capacity(rows),
             exemplars_json: string_builder(rows),
             json_scratch: String::new(),
         }
     }
 
-    fn append(&mut self, point: &NumberDataPoint, value: f64, meta: MetricMeta<'_>) -> Result<()> {
+    fn append(
+        &mut self,
+        point: &NumberDataPoint,
+        value: NumberPointValue,
+        meta: MetricMeta<'_>,
+    ) -> Result<()> {
         append_metric_common(self, point, value, meta)?;
         self.rows += 1;
         Ok(())
@@ -378,12 +389,13 @@ impl GaugeBuilders {
         record_batch(
             gauge_schema(),
             vec![
-                array(self.timestamp.finish()),
-                array(self.start_timestamp.finish()),
-                array(self.metric_name.finish()),
-                array(self.metric_description.finish()),
-                array(self.metric_unit.finish()),
-                array(self.value.finish()),
+                array(self.time_unix_nano.finish()),
+                array(self.start_time_unix_nano.finish()),
+                array(self.name.finish()),
+                array(self.description.finish()),
+                array(self.unit.finish()),
+                array(self.int_value.finish()),
+                array(self.double_value.finish()),
                 array(self.service_name.finish()),
                 array(self.service_namespace.finish()),
                 array(self.service_instance_id.finish()),
@@ -402,12 +414,13 @@ impl GaugeBuilders {
 
 struct SumBuilders {
     rows: usize,
-    timestamp: TimestampMicrosecondBuilder,
-    start_timestamp: Int64Builder,
-    metric_name: StringBuilder,
-    metric_description: StringBuilder,
-    metric_unit: StringBuilder,
-    value: Float64Builder,
+    time_unix_nano: TimestampNanosecondBuilder,
+    start_time_unix_nano: TimestampNanosecondBuilder,
+    name: StringBuilder,
+    description: StringBuilder,
+    unit: StringBuilder,
+    int_value: Int64Builder,
+    double_value: Float64Builder,
     service_name: StringBuilder,
     service_namespace: StringBuilder,
     service_instance_id: StringBuilder,
@@ -416,7 +429,7 @@ struct SumBuilders {
     scope_version: StringBuilder,
     scope_attributes: StringBuilder,
     metric_attributes: StringBuilder,
-    flags: Int32Builder,
+    flags: UInt32Builder,
     exemplars_json: StringBuilder,
     aggregation_temporality: Int32Builder,
     is_monotonic: BooleanBuilder,
@@ -427,12 +440,13 @@ impl SumBuilders {
     fn with_capacity(rows: usize) -> Self {
         Self {
             rows: 0,
-            timestamp: TimestampMicrosecondBuilder::with_capacity(rows),
-            start_timestamp: Int64Builder::with_capacity(rows),
-            metric_name: string_builder(rows),
-            metric_description: string_builder(rows),
-            metric_unit: string_builder(rows),
-            value: Float64Builder::with_capacity(rows),
+            time_unix_nano: TimestampNanosecondBuilder::with_capacity(rows),
+            start_time_unix_nano: TimestampNanosecondBuilder::with_capacity(rows),
+            name: string_builder(rows),
+            description: string_builder(rows),
+            unit: string_builder(rows),
+            int_value: Int64Builder::with_capacity(rows),
+            double_value: Float64Builder::with_capacity(rows),
             service_name: string_builder(rows),
             service_namespace: string_builder(rows),
             service_instance_id: string_builder(rows),
@@ -441,7 +455,7 @@ impl SumBuilders {
             scope_version: string_builder(rows),
             scope_attributes: string_builder(rows),
             metric_attributes: string_builder(rows),
-            flags: Int32Builder::with_capacity(rows),
+            flags: UInt32Builder::with_capacity(rows),
             exemplars_json: string_builder(rows),
             aggregation_temporality: Int32Builder::with_capacity(rows),
             is_monotonic: BooleanBuilder::with_capacity(rows),
@@ -453,7 +467,7 @@ impl SumBuilders {
     fn append(
         &mut self,
         point: &NumberDataPoint,
-        value: f64,
+        value: NumberPointValue,
         aggregation_temporality: i32,
         is_monotonic: bool,
         meta: MetricMeta<'_>,
@@ -473,12 +487,13 @@ impl SumBuilders {
         record_batch(
             sum_schema(),
             vec![
-                array(self.timestamp.finish()),
-                array(self.start_timestamp.finish()),
-                array(self.metric_name.finish()),
-                array(self.metric_description.finish()),
-                array(self.metric_unit.finish()),
-                array(self.value.finish()),
+                array(self.time_unix_nano.finish()),
+                array(self.start_time_unix_nano.finish()),
+                array(self.name.finish()),
+                array(self.description.finish()),
+                array(self.unit.finish()),
+                array(self.int_value.finish()),
+                array(self.double_value.finish()),
                 array(self.service_name.finish()),
                 array(self.service_namespace.finish()),
                 array(self.service_instance_id.finish()),
@@ -498,12 +513,13 @@ impl SumBuilders {
 }
 
 trait NumberMetricBuilders {
-    fn timestamp(&mut self) -> &mut TimestampMicrosecondBuilder;
-    fn start_timestamp(&mut self) -> &mut Int64Builder;
-    fn metric_name(&mut self) -> &mut StringBuilder;
-    fn metric_description(&mut self) -> &mut StringBuilder;
-    fn metric_unit(&mut self) -> &mut StringBuilder;
-    fn value(&mut self) -> &mut Float64Builder;
+    fn time_unix_nano(&mut self) -> &mut TimestampNanosecondBuilder;
+    fn start_time_unix_nano(&mut self) -> &mut TimestampNanosecondBuilder;
+    fn name(&mut self) -> &mut StringBuilder;
+    fn description(&mut self) -> &mut StringBuilder;
+    fn unit(&mut self) -> &mut StringBuilder;
+    fn int_value(&mut self) -> &mut Int64Builder;
+    fn double_value(&mut self) -> &mut Float64Builder;
     fn service_name(&mut self) -> &mut StringBuilder;
     fn service_namespace(&mut self) -> &mut StringBuilder;
     fn service_instance_id(&mut self) -> &mut StringBuilder;
@@ -511,28 +527,31 @@ trait NumberMetricBuilders {
     fn scope_name(&mut self) -> &mut StringBuilder;
     fn scope_version(&mut self) -> &mut StringBuilder;
     fn scope_attributes(&mut self) -> &mut StringBuilder;
-    fn flags(&mut self) -> &mut Int32Builder;
+    fn flags(&mut self) -> &mut UInt32Builder;
     fn json_builders(&mut self) -> (&mut StringBuilder, &mut StringBuilder, &mut String);
 }
 
 impl NumberMetricBuilders for GaugeBuilders {
-    fn timestamp(&mut self) -> &mut TimestampMicrosecondBuilder {
-        &mut self.timestamp
+    fn time_unix_nano(&mut self) -> &mut TimestampNanosecondBuilder {
+        &mut self.time_unix_nano
     }
-    fn start_timestamp(&mut self) -> &mut Int64Builder {
-        &mut self.start_timestamp
+    fn start_time_unix_nano(&mut self) -> &mut TimestampNanosecondBuilder {
+        &mut self.start_time_unix_nano
     }
-    fn metric_name(&mut self) -> &mut StringBuilder {
-        &mut self.metric_name
+    fn name(&mut self) -> &mut StringBuilder {
+        &mut self.name
     }
-    fn metric_description(&mut self) -> &mut StringBuilder {
-        &mut self.metric_description
+    fn description(&mut self) -> &mut StringBuilder {
+        &mut self.description
     }
-    fn metric_unit(&mut self) -> &mut StringBuilder {
-        &mut self.metric_unit
+    fn unit(&mut self) -> &mut StringBuilder {
+        &mut self.unit
     }
-    fn value(&mut self) -> &mut Float64Builder {
-        &mut self.value
+    fn int_value(&mut self) -> &mut Int64Builder {
+        &mut self.int_value
+    }
+    fn double_value(&mut self) -> &mut Float64Builder {
+        &mut self.double_value
     }
     fn service_name(&mut self) -> &mut StringBuilder {
         &mut self.service_name
@@ -555,7 +574,7 @@ impl NumberMetricBuilders for GaugeBuilders {
     fn scope_attributes(&mut self) -> &mut StringBuilder {
         &mut self.scope_attributes
     }
-    fn flags(&mut self) -> &mut Int32Builder {
+    fn flags(&mut self) -> &mut UInt32Builder {
         &mut self.flags
     }
     fn json_builders(&mut self) -> (&mut StringBuilder, &mut StringBuilder, &mut String) {
@@ -568,23 +587,26 @@ impl NumberMetricBuilders for GaugeBuilders {
 }
 
 impl NumberMetricBuilders for SumBuilders {
-    fn timestamp(&mut self) -> &mut TimestampMicrosecondBuilder {
-        &mut self.timestamp
+    fn time_unix_nano(&mut self) -> &mut TimestampNanosecondBuilder {
+        &mut self.time_unix_nano
     }
-    fn start_timestamp(&mut self) -> &mut Int64Builder {
-        &mut self.start_timestamp
+    fn start_time_unix_nano(&mut self) -> &mut TimestampNanosecondBuilder {
+        &mut self.start_time_unix_nano
     }
-    fn metric_name(&mut self) -> &mut StringBuilder {
-        &mut self.metric_name
+    fn name(&mut self) -> &mut StringBuilder {
+        &mut self.name
     }
-    fn metric_description(&mut self) -> &mut StringBuilder {
-        &mut self.metric_description
+    fn description(&mut self) -> &mut StringBuilder {
+        &mut self.description
     }
-    fn metric_unit(&mut self) -> &mut StringBuilder {
-        &mut self.metric_unit
+    fn unit(&mut self) -> &mut StringBuilder {
+        &mut self.unit
     }
-    fn value(&mut self) -> &mut Float64Builder {
-        &mut self.value
+    fn int_value(&mut self) -> &mut Int64Builder {
+        &mut self.int_value
+    }
+    fn double_value(&mut self) -> &mut Float64Builder {
+        &mut self.double_value
     }
     fn service_name(&mut self) -> &mut StringBuilder {
         &mut self.service_name
@@ -607,7 +629,7 @@ impl NumberMetricBuilders for SumBuilders {
     fn scope_attributes(&mut self) -> &mut StringBuilder {
         &mut self.scope_attributes
     }
-    fn flags(&mut self) -> &mut Int32Builder {
+    fn flags(&mut self) -> &mut UInt32Builder {
         &mut self.flags
     }
     fn json_builders(&mut self) -> (&mut StringBuilder, &mut StringBuilder, &mut String) {
@@ -622,20 +644,33 @@ impl NumberMetricBuilders for SumBuilders {
 fn append_metric_common<B: NumberMetricBuilders>(
     builders: &mut B,
     point: &NumberDataPoint,
-    value: f64,
+    value: NumberPointValue,
     meta: MetricMeta<'_>,
 ) -> Result<()> {
-    builders
-        .timestamp()
-        .append_value(u64_to_i64(point.time_unix_nano, "metric.time_unix_nano")? / 1_000);
-    builders.start_timestamp().append_value(
-        u64_to_i64(point.start_time_unix_nano, "metric.start_time_unix_nano")? / 1_000_000,
-    );
-    builders.metric_name().append_value(meta.name);
-    builders.metric_description().append_value(meta.description);
-    builders.metric_unit().append_value(meta.unit);
-    builders.value().append_value(value);
-    builders.flags().append_value(point.flags as i32);
+    append_required_ts_ns(
+        builders.time_unix_nano(),
+        point.time_unix_nano,
+        "metric.time_unix_nano",
+    )?;
+    append_opt_ts_ns(
+        builders.start_time_unix_nano(),
+        point.start_time_unix_nano,
+        "metric.start_time_unix_nano",
+    )?;
+    builders.name().append_value(meta.name);
+    builders.description().append_value(meta.description);
+    builders.unit().append_value(meta.unit);
+    match value {
+        NumberPointValue::Int(value) => {
+            builders.int_value().append_value(value);
+            builders.double_value().append_null();
+        }
+        NumberPointValue::Double(value) => {
+            builders.int_value().append_null();
+            builders.double_value().append_value(value);
+        }
+    }
+    builders.flags().append_value(point.flags);
     let (metric_attributes, exemplars_json, json_scratch) = builders.json_builders();
     append_attrs_json(metric_attributes, &point.attributes, json_scratch)?;
     append_exemplars_json(exemplars_json, &point.exemplars, json_scratch)?;
@@ -679,17 +714,17 @@ fn append_number_metric_context<B: NumberMetricBuilders>(
 
 struct HistogramBuilders {
     rows: usize,
-    timestamp: TimestampMicrosecondBuilder,
-    start_timestamp: Int64Builder,
-    metric_name: StringBuilder,
-    metric_description: StringBuilder,
-    metric_unit: StringBuilder,
-    count: Int64Builder,
+    time_unix_nano: TimestampNanosecondBuilder,
+    start_time_unix_nano: TimestampNanosecondBuilder,
+    name: StringBuilder,
+    description: StringBuilder,
+    unit: StringBuilder,
+    count: UInt64Builder,
     sum: Float64Builder,
     min: Float64Builder,
     max: Float64Builder,
-    bucket_counts: StringBuilder,
-    explicit_bounds: StringBuilder,
+    bucket_counts: ListBuilder<UInt64Builder>,
+    explicit_bounds: ListBuilder<Float64Builder>,
     service_name: StringBuilder,
     service_namespace: StringBuilder,
     service_instance_id: StringBuilder,
@@ -698,7 +733,7 @@ struct HistogramBuilders {
     scope_version: StringBuilder,
     scope_attributes: StringBuilder,
     metric_attributes: StringBuilder,
-    flags: Int32Builder,
+    flags: UInt32Builder,
     exemplars_json: StringBuilder,
     aggregation_temporality: Int32Builder,
     json_scratch: String,
@@ -708,17 +743,17 @@ impl HistogramBuilders {
     fn with_capacity(rows: usize) -> Self {
         Self {
             rows: 0,
-            timestamp: TimestampMicrosecondBuilder::with_capacity(rows),
-            start_timestamp: Int64Builder::with_capacity(rows),
-            metric_name: string_builder(rows),
-            metric_description: string_builder(rows),
-            metric_unit: string_builder(rows),
-            count: Int64Builder::with_capacity(rows),
+            time_unix_nano: TimestampNanosecondBuilder::with_capacity(rows),
+            start_time_unix_nano: TimestampNanosecondBuilder::with_capacity(rows),
+            name: string_builder(rows),
+            description: string_builder(rows),
+            unit: string_builder(rows),
+            count: UInt64Builder::with_capacity(rows),
             sum: Float64Builder::with_capacity(rows),
             min: Float64Builder::with_capacity(rows),
             max: Float64Builder::with_capacity(rows),
-            bucket_counts: string_builder(rows),
-            explicit_bounds: string_builder(rows),
+            bucket_counts: ListBuilder::new(UInt64Builder::new()),
+            explicit_bounds: ListBuilder::new(Float64Builder::new()),
             service_name: string_builder(rows),
             service_namespace: string_builder(rows),
             service_instance_id: string_builder(rows),
@@ -727,7 +762,7 @@ impl HistogramBuilders {
             scope_version: string_builder(rows),
             scope_attributes: string_builder(rows),
             metric_attributes: string_builder(rows),
-            flags: Int32Builder::with_capacity(rows),
+            flags: UInt32Builder::with_capacity(rows),
             exemplars_json: string_builder(rows),
             aggregation_temporality: Int32Builder::with_capacity(rows),
             json_scratch: String::new(),
@@ -740,34 +775,31 @@ impl HistogramBuilders {
         aggregation_temporality: i32,
         meta: MetricMeta<'_>,
     ) -> Result<()> {
-        self.timestamp
-            .append_value(u64_to_i64(point.time_unix_nano, "histogram.time_unix_nano")? / 1_000);
-        self.start_timestamp.append_value(
-            u64_to_i64(point.start_time_unix_nano, "histogram.start_time_unix_nano")? / 1_000_000,
-        );
-        self.metric_name.append_value(meta.name);
-        self.metric_description.append_value(meta.description);
-        self.metric_unit.append_value(meta.unit);
-        self.count.append_value(point.count as i64);
+        append_required_ts_ns(
+            &mut self.time_unix_nano,
+            point.time_unix_nano,
+            "histogram.time_unix_nano",
+        )?;
+        append_opt_ts_ns(
+            &mut self.start_time_unix_nano,
+            point.start_time_unix_nano,
+            "histogram.start_time_unix_nano",
+        )?;
+        self.name.append_value(meta.name);
+        self.description.append_value(meta.description);
+        self.unit.append_value(meta.unit);
+        self.count.append_value(point.count);
         append_finite_opt(&mut self.sum, point.sum);
         append_finite_opt(&mut self.min, point.min);
         append_finite_opt(&mut self.max, point.max);
-        append_u64_json_array(
-            &mut self.bucket_counts,
-            &point.bucket_counts,
-            &mut self.json_scratch,
-        )?;
-        append_f64_json_array(
-            &mut self.explicit_bounds,
-            &point.explicit_bounds,
-            &mut self.json_scratch,
-        )?;
+        append_u64_list(&mut self.bucket_counts, &point.bucket_counts);
+        append_f64_list(&mut self.explicit_bounds, &point.explicit_bounds);
         append_attrs_json(
             &mut self.metric_attributes,
             &point.attributes,
             &mut self.json_scratch,
         )?;
-        self.flags.append_value(point.flags as i32);
+        self.flags.append_value(point.flags);
         append_exemplars_json(
             &mut self.exemplars_json,
             &point.exemplars,
@@ -801,11 +833,11 @@ impl HistogramBuilders {
         record_batch(
             histogram_schema(),
             vec![
-                array(self.timestamp.finish()),
-                array(self.start_timestamp.finish()),
-                array(self.metric_name.finish()),
-                array(self.metric_description.finish()),
-                array(self.metric_unit.finish()),
+                array(self.time_unix_nano.finish()),
+                array(self.start_time_unix_nano.finish()),
+                array(self.name.finish()),
+                array(self.description.finish()),
+                array(self.unit.finish()),
                 array(self.count.finish()),
                 array(self.sum.finish()),
                 array(self.min.finish()),
@@ -831,22 +863,22 @@ impl HistogramBuilders {
 
 struct ExpHistogramBuilders {
     rows: usize,
-    timestamp: TimestampMicrosecondBuilder,
-    start_timestamp: Int64Builder,
-    metric_name: StringBuilder,
-    metric_description: StringBuilder,
-    metric_unit: StringBuilder,
-    count: Int64Builder,
+    time_unix_nano: TimestampNanosecondBuilder,
+    start_time_unix_nano: TimestampNanosecondBuilder,
+    name: StringBuilder,
+    description: StringBuilder,
+    unit: StringBuilder,
+    count: UInt64Builder,
     sum: Float64Builder,
     min: Float64Builder,
     max: Float64Builder,
     scale: Int32Builder,
-    zero_count: Int64Builder,
+    zero_count: UInt64Builder,
     zero_threshold: Float64Builder,
     positive_offset: Int32Builder,
-    positive_bucket_counts: StringBuilder,
+    positive_bucket_counts: ListBuilder<UInt64Builder>,
     negative_offset: Int32Builder,
-    negative_bucket_counts: StringBuilder,
+    negative_bucket_counts: ListBuilder<UInt64Builder>,
     service_name: StringBuilder,
     service_namespace: StringBuilder,
     service_instance_id: StringBuilder,
@@ -855,7 +887,7 @@ struct ExpHistogramBuilders {
     scope_version: StringBuilder,
     scope_attributes: StringBuilder,
     metric_attributes: StringBuilder,
-    flags: Int32Builder,
+    flags: UInt32Builder,
     exemplars_json: StringBuilder,
     aggregation_temporality: Int32Builder,
     json_scratch: String,
@@ -865,22 +897,22 @@ impl ExpHistogramBuilders {
     fn with_capacity(rows: usize) -> Self {
         Self {
             rows: 0,
-            timestamp: TimestampMicrosecondBuilder::with_capacity(rows),
-            start_timestamp: Int64Builder::with_capacity(rows),
-            metric_name: string_builder(rows),
-            metric_description: string_builder(rows),
-            metric_unit: string_builder(rows),
-            count: Int64Builder::with_capacity(rows),
+            time_unix_nano: TimestampNanosecondBuilder::with_capacity(rows),
+            start_time_unix_nano: TimestampNanosecondBuilder::with_capacity(rows),
+            name: string_builder(rows),
+            description: string_builder(rows),
+            unit: string_builder(rows),
+            count: UInt64Builder::with_capacity(rows),
             sum: Float64Builder::with_capacity(rows),
             min: Float64Builder::with_capacity(rows),
             max: Float64Builder::with_capacity(rows),
             scale: Int32Builder::with_capacity(rows),
-            zero_count: Int64Builder::with_capacity(rows),
+            zero_count: UInt64Builder::with_capacity(rows),
             zero_threshold: Float64Builder::with_capacity(rows),
             positive_offset: Int32Builder::with_capacity(rows),
-            positive_bucket_counts: string_builder(rows),
+            positive_bucket_counts: ListBuilder::new(UInt64Builder::new()),
             negative_offset: Int32Builder::with_capacity(rows),
-            negative_bucket_counts: string_builder(rows),
+            negative_bucket_counts: ListBuilder::new(UInt64Builder::new()),
             service_name: string_builder(rows),
             service_namespace: string_builder(rows),
             service_instance_id: string_builder(rows),
@@ -889,7 +921,7 @@ impl ExpHistogramBuilders {
             scope_version: string_builder(rows),
             scope_attributes: string_builder(rows),
             metric_attributes: string_builder(rows),
-            flags: Int32Builder::with_capacity(rows),
+            flags: UInt32Builder::with_capacity(rows),
             exemplars_json: string_builder(rows),
             aggregation_temporality: Int32Builder::with_capacity(rows),
             json_scratch: String::new(),
@@ -902,53 +934,46 @@ impl ExpHistogramBuilders {
         aggregation_temporality: i32,
         meta: MetricMeta<'_>,
     ) -> Result<()> {
-        self.timestamp.append_value(
-            u64_to_i64(point.time_unix_nano, "exp_histogram.time_unix_nano")? / 1_000,
-        );
-        self.start_timestamp.append_value(
-            u64_to_i64(
-                point.start_time_unix_nano,
-                "exp_histogram.start_time_unix_nano",
-            )? / 1_000_000,
-        );
-        self.metric_name.append_value(meta.name);
-        self.metric_description.append_value(meta.description);
-        self.metric_unit.append_value(meta.unit);
-        self.count.append_value(point.count as i64);
+        append_required_ts_ns(
+            &mut self.time_unix_nano,
+            point.time_unix_nano,
+            "exp_histogram.time_unix_nano",
+        )?;
+        append_opt_ts_ns(
+            &mut self.start_time_unix_nano,
+            point.start_time_unix_nano,
+            "exp_histogram.start_time_unix_nano",
+        )?;
+        self.name.append_value(meta.name);
+        self.description.append_value(meta.description);
+        self.unit.append_value(meta.unit);
+        self.count.append_value(point.count);
         append_finite_opt(&mut self.sum, point.sum);
         append_finite_opt(&mut self.min, point.min);
         append_finite_opt(&mut self.max, point.max);
         self.scale.append_value(point.scale);
-        self.zero_count.append_value(point.zero_count as i64);
+        self.zero_count.append_value(point.zero_count);
         append_finite(&mut self.zero_threshold, point.zero_threshold);
         if let Some(positive) = &point.positive {
             self.positive_offset.append_value(positive.offset);
-            append_u64_json_array(
-                &mut self.positive_bucket_counts,
-                &positive.bucket_counts,
-                &mut self.json_scratch,
-            )?;
+            append_u64_list(&mut self.positive_bucket_counts, &positive.bucket_counts);
         } else {
-            self.positive_offset.append_value(0);
-            self.positive_bucket_counts.append_value("[]");
+            self.positive_offset.append_null();
+            self.positive_bucket_counts.append_null();
         }
         if let Some(negative) = &point.negative {
             self.negative_offset.append_value(negative.offset);
-            append_u64_json_array(
-                &mut self.negative_bucket_counts,
-                &negative.bucket_counts,
-                &mut self.json_scratch,
-            )?;
+            append_u64_list(&mut self.negative_bucket_counts, &negative.bucket_counts);
         } else {
-            self.negative_offset.append_value(0);
-            self.negative_bucket_counts.append_value("[]");
+            self.negative_offset.append_null();
+            self.negative_bucket_counts.append_null();
         }
         append_attrs_json(
             &mut self.metric_attributes,
             &point.attributes,
             &mut self.json_scratch,
         )?;
-        self.flags.append_value(point.flags as i32);
+        self.flags.append_value(point.flags);
         append_exemplars_json(
             &mut self.exemplars_json,
             &point.exemplars,
@@ -982,11 +1007,11 @@ impl ExpHistogramBuilders {
         record_batch(
             exp_histogram_schema(),
             vec![
-                array(self.timestamp.finish()),
-                array(self.start_timestamp.finish()),
-                array(self.metric_name.finish()),
-                array(self.metric_description.finish()),
-                array(self.metric_unit.finish()),
+                array(self.time_unix_nano.finish()),
+                array(self.start_time_unix_nano.finish()),
+                array(self.name.finish()),
+                array(self.description.finish()),
+                array(self.unit.finish()),
                 array(self.count.finish()),
                 array(self.sum.finish()),
                 array(self.min.finish()),
@@ -1053,9 +1078,9 @@ fn append_metric_resource_scope_n(
 fn metric_point_value(
     value: &Option<number_data_point::Value>,
     skipped: &mut SkippedMetrics,
-) -> Option<f64> {
+) -> Option<NumberPointValue> {
     match value {
-        Some(number_data_point::Value::AsInt(value)) => Some(*value as f64),
+        Some(number_data_point::Value::AsInt(value)) => Some(NumberPointValue::Int(*value)),
         Some(number_data_point::Value::AsDouble(value)) if value.is_nan() => {
             skipped.nan_values += 1;
             None
@@ -1064,7 +1089,7 @@ fn metric_point_value(
             skipped.infinity_values += 1;
             None
         }
-        Some(number_data_point::Value::AsDouble(value)) => Some(*value),
+        Some(number_data_point::Value::AsDouble(value)) => Some(NumberPointValue::Double(*value)),
         None => {
             skipped.missing_values += 1;
             None
