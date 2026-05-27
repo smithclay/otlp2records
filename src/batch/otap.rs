@@ -1,14 +1,17 @@
 //! OTAP star request-to-RecordBatch conversion.
 
+use std::collections::hash_map::DefaultHasher;
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+
 use arrow_array::{
     builder::{
         BinaryBuilder, BooleanBuilder, DurationNanosecondBuilder, FixedSizeBinaryBuilder,
-        Float64Builder, Int32Builder, Int64Builder, ListBuilder, StringBuilder, StructBuilder,
+        Float64Builder, Int32Builder, Int64Builder, ListBuilder, StringBuilder,
         TimestampNanosecondBuilder, UInt16Builder, UInt32Builder, UInt64Builder, UInt8Builder,
     },
     RecordBatch,
 };
-use arrow_schema::{DataType, Field};
 use opentelemetry_proto::tonic::{
     collector::{
         logs::v1::ExportLogsServiceRequest, metrics::v1::ExportMetricsServiceRequest,
@@ -17,8 +20,8 @@ use opentelemetry_proto::tonic::{
     common::v1::{any_value, AnyValue, KeyValue},
     logs::v1::LogRecord,
     metrics::v1::{
-        exemplar, metric::Data, number_data_point, summary_data_point, Exemplar,
-        ExponentialHistogramDataPoint, HistogramDataPoint, NumberDataPoint, SummaryDataPoint,
+        exemplar, metric::Data, number_data_point, Exemplar, ExponentialHistogramDataPoint,
+        HistogramDataPoint, NumberDataPoint, SummaryDataPoint,
     },
     trace::v1::Span,
 };
@@ -27,16 +30,20 @@ use prost::Message;
 use crate::{
     api::{OtapLogsBatches, OtapMetricsBatches, OtapTracesBatches, SkippedMetrics},
     schema::{
-        otap_attrs_u16_schema, otap_attrs_u32_schema, otap_exemplars_schema,
-        otap_exp_histogram_data_points_schema, otap_histogram_data_points_schema, otap_logs_schema,
-        otap_metrics_schema, otap_number_data_points_schema, otap_quantile_schema,
-        otap_span_events_schema, otap_span_links_schema, otap_spans_schema,
-        otap_summary_data_points_schema,
+        otap_attrs_u16_schema_arc, otap_attrs_u32_schema_arc, otap_exemplars_schema_arc,
+        otap_exp_histogram_data_points_schema_arc, otap_histogram_data_points_schema_arc,
+        otap_logs_schema_arc, otap_metrics_schema_arc, otap_number_data_points_schema_arc,
+        otap_quantile_schema_arc, otap_span_events_schema_arc, otap_span_links_schema_arc,
+        otap_spans_schema_arc, otap_summary_data_points_schema_arc,
     },
     DecodeError, Error, Result,
 };
 
-use super::util::{array, record_batch, u64_to_i64};
+use super::context::hash_attrs;
+use super::util::{
+    append_f64_list, append_finite_opt, append_fixed_or_null, append_fixed_required,
+    append_opt_ts_ns, append_required_ts_ns, append_u64_list, array, record_batch, u64_to_i64,
+};
 
 const VALUE_EMPTY: u8 = 0;
 const VALUE_STR: u8 = 1;
@@ -57,7 +64,6 @@ pub fn transform_logs_request_otap(request: ExportLogsServiceRequest) -> Result<
     let mut builders = LogsBuilders::default();
 
     for resource_logs in request.resource_logs {
-        let resource_id = builders.next_resource_id()?;
         let resource_attrs = resource_logs
             .resource
             .as_ref()
@@ -68,19 +74,31 @@ pub fn transform_logs_request_otap(request: ExportLogsServiceRequest) -> Result<
             .resource
             .as_ref()
             .map(|r| r.dropped_attributes_count);
-        builders
-            .resource_attrs
-            .append_attrs(resource_id, resource_attrs)?;
+        let (resource_id, resource_is_new) =
+            builders.resource_id(resource_attrs, resource_schema_url, resource_dropped)?;
+        if resource_is_new {
+            builders
+                .resource_attrs
+                .append_attrs(resource_id, resource_attrs)?;
+        }
 
         for scope_logs in resource_logs.scope_logs {
-            let scope_id = builders.next_scope_id()?;
             let scope = scope_logs.scope.as_ref();
             let scope_attrs = scope.map(|s| s.attributes.as_slice()).unwrap_or(&[]);
             let scope_name = scope.and_then(|s| empty_to_none(&s.name));
             let scope_version = scope.and_then(|s| empty_to_none(&s.version));
             let scope_dropped = scope.map(|s| s.dropped_attributes_count);
             let schema_url = empty_to_none(&scope_logs.schema_url);
-            builders.scope_attrs.append_attrs(scope_id, scope_attrs)?;
+            let (scope_id, scope_is_new) = builders.scope_id(
+                scope_name,
+                scope_version,
+                scope_attrs,
+                schema_url,
+                scope_dropped,
+            )?;
+            if scope_is_new {
+                builders.scope_attrs.append_attrs(scope_id, scope_attrs)?;
+            }
 
             for record in scope_logs.log_records {
                 let id = builders.next_log_id()?;
@@ -114,7 +132,6 @@ pub fn transform_traces_request_otap(
     let mut builders = TracesBuilders::default();
 
     for resource_spans in request.resource_spans {
-        let resource_id = builders.next_resource_id()?;
         let resource_attrs = resource_spans
             .resource
             .as_ref()
@@ -125,19 +142,31 @@ pub fn transform_traces_request_otap(
             .resource
             .as_ref()
             .map(|r| r.dropped_attributes_count);
-        builders
-            .resource_attrs
-            .append_attrs(resource_id, resource_attrs)?;
+        let (resource_id, resource_is_new) =
+            builders.resource_id(resource_attrs, resource_schema_url, resource_dropped)?;
+        if resource_is_new {
+            builders
+                .resource_attrs
+                .append_attrs(resource_id, resource_attrs)?;
+        }
 
         for scope_spans in resource_spans.scope_spans {
-            let scope_id = builders.next_scope_id()?;
             let scope = scope_spans.scope.as_ref();
             let scope_attrs = scope.map(|s| s.attributes.as_slice()).unwrap_or(&[]);
             let scope_name = scope.and_then(|s| empty_to_none(&s.name));
             let scope_version = scope.and_then(|s| empty_to_none(&s.version));
             let scope_dropped = scope.map(|s| s.dropped_attributes_count);
             let schema_url = empty_to_none(&scope_spans.schema_url);
-            builders.scope_attrs.append_attrs(scope_id, scope_attrs)?;
+            let (scope_id, scope_is_new) = builders.scope_id(
+                scope_name,
+                scope_version,
+                scope_attrs,
+                schema_url,
+                scope_dropped,
+            )?;
+            if scope_is_new {
+                builders.scope_attrs.append_attrs(scope_id, scope_attrs)?;
+            }
 
             for span in scope_spans.spans {
                 let id = builders.next_span_id()?;
@@ -186,7 +215,6 @@ pub fn transform_metrics_request_otap(
     let mut builders = MetricsBuilders::default();
 
     for resource_metrics in request.resource_metrics {
-        let resource_id = builders.next_resource_id()?;
         let resource_attrs = resource_metrics
             .resource
             .as_ref()
@@ -197,23 +225,40 @@ pub fn transform_metrics_request_otap(
             .resource
             .as_ref()
             .map(|r| r.dropped_attributes_count);
-        builders
-            .resource_attrs
-            .append_attrs(resource_id, resource_attrs)?;
+        let (resource_id, resource_is_new) =
+            builders.resource_id(resource_attrs, resource_schema_url, resource_dropped)?;
+        if resource_is_new {
+            builders
+                .resource_attrs
+                .append_attrs(resource_id, resource_attrs)?;
+        }
 
         for scope_metrics in resource_metrics.scope_metrics {
-            let scope_id = builders.next_scope_id()?;
             let scope = scope_metrics.scope.as_ref();
             let scope_attrs = scope.map(|s| s.attributes.as_slice()).unwrap_or(&[]);
             let scope_name = scope.and_then(|s| empty_to_none(&s.name));
             let scope_version = scope.and_then(|s| empty_to_none(&s.version));
             let scope_dropped = scope.map(|s| s.dropped_attributes_count);
             let schema_url = empty_to_none(&scope_metrics.schema_url);
-            builders.scope_attrs.append_attrs(scope_id, scope_attrs)?;
+            let (scope_id, scope_is_new) = builders.scope_id(
+                scope_name,
+                scope_version,
+                scope_attrs,
+                schema_url,
+                scope_dropped,
+            )?;
+            if scope_is_new {
+                builders.scope_attrs.append_attrs(scope_id, scope_attrs)?;
+            }
 
             for metric in scope_metrics.metrics {
+                // OTLP allows a Metric to carry no data variant. We skip the
+                // row entirely rather than emit one with metric_type=0 (which
+                // is not a valid OTAP type code). See B6.
+                let Some(metric_type) = metric_type(&metric.data) else {
+                    continue;
+                };
                 let id = builders.next_metric_id()?;
-                let metric_type = metric_type(&metric.data);
                 let aggregation_temporality = aggregation_temporality(&metric.data);
                 let is_monotonic = is_monotonic(&metric.data);
                 builders.metrics.append(
@@ -252,7 +297,7 @@ pub fn transform_metrics_request_otap(
                             builders
                                 .histogram_dp_attrs
                                 .append_attrs(dp_id, &point.attributes)?;
-                            append_histogram_exemplars(
+                            append_exemplars(
                                 &mut builders.histogram_dp_exemplars,
                                 &mut builders.histogram_dp_exemplar_attrs,
                                 &mut builders.next_histogram_exemplar_id,
@@ -270,7 +315,7 @@ pub fn transform_metrics_request_otap(
                             builders
                                 .exp_histogram_dp_attrs
                                 .append_attrs(dp_id, &point.attributes)?;
-                            append_histogram_exemplars(
+                            append_exemplars(
                                 &mut builders.exp_histogram_dp_exemplars,
                                 &mut builders.exp_histogram_dp_exemplar_attrs,
                                 &mut builders.next_exp_histogram_exemplar_id,
@@ -311,6 +356,12 @@ fn append_number_point(
     metric_id: u16,
     point: &NumberDataPoint,
 ) -> Result<()> {
+    // Reject NaN / Infinity / missing values, bumping the SkippedMetrics
+    // counters that the normalized path also tracks (B2). Skipped points do
+    // not allocate a dp_id or emit any child rows.
+    if !validate_number_value(&point.value, &mut builders.skipped) {
+        return Ok(());
+    }
     let dp_id = builders.next_number_dp_id()?;
     builders
         .number_data_points
@@ -318,7 +369,7 @@ fn append_number_point(
     builders
         .number_dp_attrs
         .append_attrs(dp_id, &point.attributes)?;
-    append_histogram_exemplars(
+    append_exemplars(
         &mut builders.number_dp_exemplars,
         &mut builders.number_dp_exemplar_attrs,
         &mut builders.next_number_exemplar_id,
@@ -327,7 +378,29 @@ fn append_number_point(
     )
 }
 
-fn append_histogram_exemplars(
+fn validate_number_value(
+    value: &Option<number_data_point::Value>,
+    skipped: &mut SkippedMetrics,
+) -> bool {
+    match value {
+        Some(number_data_point::Value::AsInt(_)) => true,
+        Some(number_data_point::Value::AsDouble(v)) if v.is_nan() => {
+            skipped.nan_values += 1;
+            false
+        }
+        Some(number_data_point::Value::AsDouble(v)) if v.is_infinite() => {
+            skipped.infinity_values += 1;
+            false
+        }
+        Some(number_data_point::Value::AsDouble(_)) => true,
+        None => {
+            skipped.missing_values += 1;
+            false
+        }
+    }
+}
+
+fn append_exemplars(
     exemplars: &mut ExemplarBuilders,
     attrs: &mut AttrBuildersU32,
     next_id: &mut u32,
@@ -347,6 +420,8 @@ struct LogsBuilders {
     next_resource_id: u32,
     next_scope_id: u32,
     next_id: u32,
+    resource_ids: ContextIdMap,
+    scope_ids: ContextIdMap,
     logs: LogTableBuilder,
     resource_attrs: AttrBuildersU16,
     scope_attrs: AttrBuildersU16,
@@ -354,12 +429,28 @@ struct LogsBuilders {
 }
 
 impl LogsBuilders {
-    fn next_resource_id(&mut self) -> Result<u16> {
-        next_u16(&mut self.next_resource_id, "resource.id")
+    fn resource_id(
+        &mut self,
+        attrs: &[KeyValue],
+        schema_url: Option<&str>,
+        dropped: Option<u32>,
+    ) -> Result<(u16, bool)> {
+        let fp = resource_fingerprint(attrs, schema_url, dropped);
+        self.resource_ids
+            .lookup_or_insert(fp, &mut self.next_resource_id, "resource.id")
     }
 
-    fn next_scope_id(&mut self) -> Result<u16> {
-        next_u16(&mut self.next_scope_id, "scope.id")
+    fn scope_id(
+        &mut self,
+        name: Option<&str>,
+        version: Option<&str>,
+        attrs: &[KeyValue],
+        schema_url: Option<&str>,
+        dropped: Option<u32>,
+    ) -> Result<(u16, bool)> {
+        let fp = scope_fingerprint(name, version, attrs, schema_url, dropped);
+        self.scope_ids
+            .lookup_or_insert(fp, &mut self.next_scope_id, "scope.id")
     }
 
     fn next_log_id(&mut self) -> Result<u16> {
@@ -383,6 +474,8 @@ struct TracesBuilders {
     next_span_id: u32,
     next_event_id: u32,
     next_link_id: u32,
+    resource_ids: ContextIdMap,
+    scope_ids: ContextIdMap,
     spans: SpanTableBuilder,
     resource_attrs: AttrBuildersU16,
     scope_attrs: AttrBuildersU16,
@@ -394,11 +487,27 @@ struct TracesBuilders {
 }
 
 impl TracesBuilders {
-    fn next_resource_id(&mut self) -> Result<u16> {
-        next_u16(&mut self.next_resource_id, "resource.id")
+    fn resource_id(
+        &mut self,
+        attrs: &[KeyValue],
+        schema_url: Option<&str>,
+        dropped: Option<u32>,
+    ) -> Result<(u16, bool)> {
+        let fp = resource_fingerprint(attrs, schema_url, dropped);
+        self.resource_ids
+            .lookup_or_insert(fp, &mut self.next_resource_id, "resource.id")
     }
-    fn next_scope_id(&mut self) -> Result<u16> {
-        next_u16(&mut self.next_scope_id, "scope.id")
+    fn scope_id(
+        &mut self,
+        name: Option<&str>,
+        version: Option<&str>,
+        attrs: &[KeyValue],
+        schema_url: Option<&str>,
+        dropped: Option<u32>,
+    ) -> Result<(u16, bool)> {
+        let fp = scope_fingerprint(name, version, attrs, schema_url, dropped);
+        self.scope_ids
+            .lookup_or_insert(fp, &mut self.next_scope_id, "scope.id")
     }
     fn next_span_id(&mut self) -> Result<u16> {
         next_u16(&mut self.next_span_id, "span.id")
@@ -435,6 +544,8 @@ struct MetricsBuilders {
     next_histogram_exemplar_id: u32,
     next_exp_histogram_dp_id: u32,
     next_exp_histogram_exemplar_id: u32,
+    resource_ids: ContextIdMap,
+    scope_ids: ContextIdMap,
     metrics: MetricTableBuilder,
     resource_attrs: AttrBuildersU16,
     scope_attrs: AttrBuildersU16,
@@ -457,11 +568,27 @@ struct MetricsBuilders {
 }
 
 impl MetricsBuilders {
-    fn next_resource_id(&mut self) -> Result<u16> {
-        next_u16(&mut self.next_resource_id, "resource.id")
+    fn resource_id(
+        &mut self,
+        attrs: &[KeyValue],
+        schema_url: Option<&str>,
+        dropped: Option<u32>,
+    ) -> Result<(u16, bool)> {
+        let fp = resource_fingerprint(attrs, schema_url, dropped);
+        self.resource_ids
+            .lookup_or_insert(fp, &mut self.next_resource_id, "resource.id")
     }
-    fn next_scope_id(&mut self) -> Result<u16> {
-        next_u16(&mut self.next_scope_id, "scope.id")
+    fn scope_id(
+        &mut self,
+        name: Option<&str>,
+        version: Option<&str>,
+        attrs: &[KeyValue],
+        schema_url: Option<&str>,
+        dropped: Option<u32>,
+    ) -> Result<(u16, bool)> {
+        let fp = scope_fingerprint(name, version, attrs, schema_url, dropped);
+        self.scope_ids
+            .lookup_or_insert(fp, &mut self.next_scope_id, "scope.id")
     }
     fn next_metric_id(&mut self) -> Result<u16> {
         next_u16(&mut self.next_metric_id, "metric.id")
@@ -581,12 +708,12 @@ impl LogTableBuilder {
         append_opt_str(&mut self.scope_version, scope_version);
         append_opt_u32(&mut self.scope_dropped_attributes_count, scope_dropped);
         append_opt_str(&mut self.schema_url, schema_url);
-        append_opt_ts(
+        append_opt_ts_ns(
             &mut self.time_unix_nano,
             record.time_unix_nano,
             "log.time_unix_nano",
         )?;
-        append_opt_ts(
+        append_opt_ts_ns(
             &mut self.observed_time_unix_nano,
             record.observed_time_unix_nano,
             "log.observed_time_unix_nano",
@@ -608,7 +735,7 @@ impl LogTableBuilder {
 
     fn finish(mut self) -> Result<RecordBatch> {
         record_batch(
-            otap_logs_schema(),
+            otap_logs_schema_arc(),
             vec![
                 array(self.id.finish()),
                 array(self.resource_id.finish()),
@@ -711,8 +838,11 @@ impl SpanTableBuilder {
         schema_url: Option<&str>,
         span: &Span,
     ) -> Result<()> {
-        let start = u64_to_i64(span.start_time_unix_nano, "span.start_time_unix_nano")?;
-        let end = u64_to_i64(span.end_time_unix_nano, "span.end_time_unix_nano")?;
+        // Compute duration in u64 first so malformed `end < start` spans yield 0
+        // rather than a negative Duration value. Matches the normalized path.
+        let duration = span
+            .end_time_unix_nano
+            .saturating_sub(span.start_time_unix_nano);
         self.id.append_value(id);
         self.resource_id.append_value(resource_id);
         append_opt_str(&mut self.resource_schema_url, resource_schema_url);
@@ -725,9 +855,13 @@ impl SpanTableBuilder {
         append_opt_str(&mut self.scope_version, scope_version);
         append_opt_u32(&mut self.scope_dropped_attributes_count, scope_dropped);
         append_opt_str(&mut self.schema_url, schema_url);
-        self.start_time_unix_nano.append_value(start);
+        append_required_ts_ns(
+            &mut self.start_time_unix_nano,
+            span.start_time_unix_nano,
+            "span.start_time_unix_nano",
+        )?;
         self.duration_time_unix_nano
-            .append_value(end.saturating_sub(start));
+            .append_value(u64_to_i64(duration, "span.duration_time_unix_nano")?);
         append_fixed_required(&mut self.trace_id, &span.trace_id, 16, "span.trace_id")?;
         append_fixed_required(&mut self.span_id, &span.span_id, 8, "span.span_id")?;
         append_opt_str(&mut self.trace_state, empty_to_none(&span.trace_state));
@@ -756,7 +890,7 @@ impl SpanTableBuilder {
 
     fn finish(mut self) -> Result<RecordBatch> {
         record_batch(
-            otap_spans_schema(),
+            otap_spans_schema_arc(),
             vec![
                 array(self.id.finish()),
                 array(self.resource_id.finish()),
@@ -868,7 +1002,7 @@ impl MetricTableBuilder {
 
     fn finish(mut self) -> Result<RecordBatch> {
         record_batch(
-            otap_metrics_schema(),
+            otap_metrics_schema_arc(),
             vec![
                 array(self.id.finish()),
                 array(self.resource_id.finish()),
@@ -916,7 +1050,7 @@ impl AttrBuildersU16 {
     fn finish_u16(mut self) -> Result<RecordBatch> {
         let any = self.any.finish();
         record_batch(
-            otap_attrs_u16_schema(),
+            otap_attrs_u16_schema_arc(),
             vec![
                 array(self.parent_id.finish()),
                 any.0,
@@ -958,7 +1092,7 @@ impl AttrBuildersU32 {
     fn finish_u32(mut self) -> Result<RecordBatch> {
         let any = self.any.finish();
         record_batch(
-            otap_attrs_u32_schema(),
+            otap_attrs_u32_schema_arc(),
             vec![
                 array(self.parent_id.finish()),
                 any.0,
@@ -1228,12 +1362,12 @@ impl NumberDataPointBuilders {
     fn append(&mut self, id: u32, parent_id: u16, point: &NumberDataPoint) -> Result<()> {
         self.id.append_value(id);
         self.parent_id.append_value(parent_id);
-        append_opt_ts(
+        append_opt_ts_ns(
             &mut self.start_time_unix_nano,
             point.start_time_unix_nano,
             "number_dp.start_time_unix_nano",
         )?;
-        append_required_ts(
+        append_required_ts_ns(
             &mut self.time_unix_nano,
             point.time_unix_nano,
             "number_dp.time_unix_nano",
@@ -1245,7 +1379,7 @@ impl NumberDataPointBuilders {
             }
             Some(number_data_point::Value::AsDouble(value)) => {
                 self.int_value.append_null();
-                append_finite_opt_arrow(&mut self.double_value, Some(value));
+                append_finite_opt(&mut self.double_value, Some(value));
             }
             None => {
                 self.int_value.append_null();
@@ -1258,7 +1392,7 @@ impl NumberDataPointBuilders {
 
     fn finish(mut self) -> Result<RecordBatch> {
         record_batch(
-            otap_number_data_points_schema(),
+            otap_number_data_points_schema_arc(),
             vec![
                 array(self.id.finish()),
                 array(self.parent_id.finish()),
@@ -1286,7 +1420,7 @@ impl ExemplarBuilders {
     fn append(&mut self, id: u32, parent_id: u32, exemplar: &Exemplar) -> Result<()> {
         self.id.append_value(id);
         self.parent_id.append_value(parent_id);
-        append_required_ts(
+        append_required_ts_ns(
             &mut self.time_unix_nano,
             exemplar.time_unix_nano,
             "exemplar.time_unix_nano",
@@ -1298,7 +1432,7 @@ impl ExemplarBuilders {
             }
             Some(exemplar::Value::AsDouble(value)) => {
                 self.int_value.append_null();
-                append_finite_opt_arrow(&mut self.double_value, Some(value));
+                append_finite_opt(&mut self.double_value, Some(value));
             }
             None => {
                 self.int_value.append_null();
@@ -1312,7 +1446,7 @@ impl ExemplarBuilders {
 
     fn finish(mut self) -> Result<RecordBatch> {
         record_batch(
-            otap_exemplars_schema(),
+            otap_exemplars_schema_arc(),
             vec![
                 array(self.id.finish()),
                 array(self.parent_id.finish()),
@@ -1340,6 +1474,11 @@ impl Default for ExemplarBuilders {
     }
 }
 
+// Quantile values are emitted into the separate `quantile` child table rather
+// than embedded as a List<Struct> inside this row. The two representations are
+// not interchangeable; we pick the relational form for consistency with the
+// other star-schema child tables (B3).
+#[derive(Default)]
 struct SummaryDataPointBuilders {
     id: UInt32Builder,
     parent_id: UInt16Builder,
@@ -1347,49 +1486,32 @@ struct SummaryDataPointBuilders {
     time_unix_nano: TimestampNanosecondBuilder,
     count: UInt64Builder,
     sum: Float64Builder,
-    quantile: ListBuilder<StructBuilder>,
     flags: UInt32Builder,
-}
-
-impl Default for SummaryDataPointBuilders {
-    fn default() -> Self {
-        Self {
-            id: UInt32Builder::new(),
-            parent_id: UInt16Builder::new(),
-            start_time_unix_nano: TimestampNanosecondBuilder::new(),
-            time_unix_nano: TimestampNanosecondBuilder::new(),
-            count: UInt64Builder::new(),
-            sum: Float64Builder::new(),
-            quantile: quantile_list_builder(),
-            flags: UInt32Builder::new(),
-        }
-    }
 }
 
 impl SummaryDataPointBuilders {
     fn append(&mut self, id: u32, parent_id: u16, point: &SummaryDataPoint) -> Result<()> {
         self.id.append_value(id);
         self.parent_id.append_value(parent_id);
-        append_opt_ts(
+        append_opt_ts_ns(
             &mut self.start_time_unix_nano,
             point.start_time_unix_nano,
             "summary.start_time_unix_nano",
         )?;
-        append_required_ts(
+        append_required_ts_ns(
             &mut self.time_unix_nano,
             point.time_unix_nano,
             "summary.time_unix_nano",
         )?;
         self.count.append_value(point.count);
-        append_finite_opt_arrow(&mut self.sum, Some(point.sum));
-        append_quantile_list(&mut self.quantile, &point.quantile_values);
+        append_finite_opt(&mut self.sum, Some(point.sum));
         self.flags.append_value(point.flags);
         Ok(())
     }
 
     fn finish(mut self) -> Result<RecordBatch> {
         record_batch(
-            otap_summary_data_points_schema(),
+            otap_summary_data_points_schema_arc(),
             vec![
                 array(self.id.finish()),
                 array(self.parent_id.finish()),
@@ -1397,7 +1519,6 @@ impl SummaryDataPointBuilders {
                 array(self.time_unix_nano.finish()),
                 array(self.count.finish()),
                 array(self.sum.finish()),
-                array(self.quantile.finish()),
                 array(self.flags.finish()),
             ],
         )
@@ -1414,13 +1535,13 @@ struct QuantileBuilders {
 impl QuantileBuilders {
     fn append(&mut self, parent_id: u32, quantile: f64, value: f64) {
         self.parent_id.append_value(parent_id);
-        append_finite_opt_arrow(&mut self.quantile, Some(quantile));
-        append_finite_opt_arrow(&mut self.value, Some(value));
+        append_finite_opt(&mut self.quantile, Some(quantile));
+        append_finite_opt(&mut self.value, Some(value));
     }
 
     fn finish(mut self) -> Result<RecordBatch> {
         record_batch(
-            otap_quantile_schema(),
+            otap_quantile_schema_arc(),
             vec![
                 array(self.parent_id.finish()),
                 array(self.quantile.finish()),
@@ -1449,29 +1570,29 @@ impl HistogramDataPointBuilders {
     fn append(&mut self, id: u32, parent_id: u16, point: &HistogramDataPoint) -> Result<()> {
         self.id.append_value(id);
         self.parent_id.append_value(parent_id);
-        append_opt_ts(
+        append_opt_ts_ns(
             &mut self.start_time_unix_nano,
             point.start_time_unix_nano,
             "histogram.start_time_unix_nano",
         )?;
-        append_required_ts(
+        append_required_ts_ns(
             &mut self.time_unix_nano,
             point.time_unix_nano,
             "histogram.time_unix_nano",
         )?;
         self.count.append_value(point.count);
-        append_finite_opt_arrow(&mut self.sum, point.sum);
+        append_finite_opt(&mut self.sum, point.sum);
         append_u64_list(&mut self.bucket_counts, &point.bucket_counts);
         append_f64_list(&mut self.explicit_bounds, &point.explicit_bounds);
         self.flags.append_value(point.flags);
-        append_finite_opt_arrow(&mut self.min, point.min);
-        append_finite_opt_arrow(&mut self.max, point.max);
+        append_finite_opt(&mut self.min, point.min);
+        append_finite_opt(&mut self.max, point.max);
         Ok(())
     }
 
     fn finish(mut self) -> Result<RecordBatch> {
         record_batch(
-            otap_histogram_data_points_schema(),
+            otap_histogram_data_points_schema_arc(),
             vec![
                 array(self.id.finish()),
                 array(self.parent_id.finish()),
@@ -1518,18 +1639,18 @@ impl ExpHistogramDataPointBuilders {
     ) -> Result<()> {
         self.id.append_value(id);
         self.parent_id.append_value(parent_id);
-        append_opt_ts(
+        append_opt_ts_ns(
             &mut self.start_time_unix_nano,
             point.start_time_unix_nano,
             "exp_histogram.start_time_unix_nano",
         )?;
-        append_required_ts(
+        append_required_ts_ns(
             &mut self.time_unix_nano,
             point.time_unix_nano,
             "exp_histogram.time_unix_nano",
         )?;
         self.count.append_value(point.count);
-        append_finite_opt_arrow(&mut self.sum, point.sum);
+        append_finite_opt(&mut self.sum, point.sum);
         self.scale.append_value(point.scale);
         self.zero_count.append_value(point.zero_count);
         if let Some(positive) = &point.positive {
@@ -1547,15 +1668,15 @@ impl ExpHistogramDataPointBuilders {
             self.negative_bucket_counts.append(false);
         }
         self.flags.append_value(point.flags);
-        append_finite_opt_arrow(&mut self.min, point.min);
-        append_finite_opt_arrow(&mut self.max, point.max);
-        append_finite_opt_arrow(&mut self.zero_threshold, Some(point.zero_threshold));
+        append_finite_opt(&mut self.min, point.min);
+        append_finite_opt(&mut self.max, point.max);
+        append_finite_opt(&mut self.zero_threshold, Some(point.zero_threshold));
         Ok(())
     }
 
     fn finish(mut self) -> Result<RecordBatch> {
         record_batch(
-            otap_exp_histogram_data_points_schema(),
+            otap_exp_histogram_data_points_schema_arc(),
             vec![
                 array(self.id.finish()),
                 array(self.parent_id.finish()),
@@ -1596,7 +1717,7 @@ impl SpanEventBuilders {
     ) -> Result<()> {
         self.id.append_value(id);
         self.parent_id.append_value(parent_id);
-        append_opt_ts(
+        append_opt_ts_ns(
             &mut self.time_unix_nano,
             event.time_unix_nano,
             "span_event.time_unix_nano",
@@ -1609,7 +1730,7 @@ impl SpanEventBuilders {
 
     fn finish(mut self) -> Result<RecordBatch> {
         record_batch(
-            otap_span_events_schema(),
+            otap_span_events_schema_arc(),
             vec![
                 array(self.id.finish()),
                 array(self.parent_id.finish()),
@@ -1651,7 +1772,7 @@ impl SpanLinkBuilders {
 
     fn finish(mut self) -> Result<RecordBatch> {
         record_batch(
-            otap_span_links_schema(),
+            otap_span_links_schema_arc(),
             vec![
                 array(self.id.finish()),
                 array(self.parent_id.finish()),
@@ -1707,118 +1828,55 @@ fn append_opt_bool(builder: &mut BooleanBuilder, value: Option<bool>) {
     }
 }
 
-fn append_finite_opt_arrow(builder: &mut Float64Builder, value: Option<f64>) {
-    match value.filter(|value| value.is_finite()) {
-        Some(value) => builder.append_value(value),
-        None => builder.append_null(),
-    }
+/// Maps a resource or scope fingerprint to its previously assigned u16 id, so
+/// identical contexts across `resource_*` / `scope_*` blocks within a single
+/// request share the same id and emit their attribute rows only once (B4).
+#[derive(Default)]
+struct ContextIdMap {
+    map: HashMap<u64, u16>,
 }
 
-fn append_opt_ts(builder: &mut TimestampNanosecondBuilder, value: u64, field: &str) -> Result<()> {
-    if value == 0 {
-        builder.append_null();
-    } else {
-        builder.append_value(u64_to_i64(value, field)?);
-    }
-    Ok(())
-}
-
-fn append_required_ts(
-    builder: &mut TimestampNanosecondBuilder,
-    value: u64,
-    field: &str,
-) -> Result<()> {
-    builder.append_value(u64_to_i64(value, field)?);
-    Ok(())
-}
-
-fn append_fixed_or_null(
-    builder: &mut FixedSizeBinaryBuilder,
-    value: &[u8],
-    len: usize,
-) -> Result<()> {
-    if value.is_empty() {
-        builder.append_null();
-        return Ok(());
-    }
-    if value.len() != len {
-        return Err(Error::Decode(DecodeError::Unsupported(format!(
-            "fixed binary length mismatch: expected {len}, got {}",
-            value.len()
-        ))));
-    }
-    builder.append_value(value)?;
-    Ok(())
-}
-
-fn append_fixed_required(
-    builder: &mut FixedSizeBinaryBuilder,
-    value: &[u8],
-    len: usize,
-    field: &str,
-) -> Result<()> {
-    if value.len() != len {
-        return Err(Error::Decode(DecodeError::Unsupported(format!(
-            "{field} fixed binary length mismatch: expected {len}, got {}",
-            value.len()
-        ))));
-    }
-    builder.append_value(value)?;
-    Ok(())
-}
-
-fn append_u64_list(builder: &mut ListBuilder<UInt64Builder>, values: &[u64]) {
-    for value in values {
-        builder.values().append_value(*value);
-    }
-    builder.append(true);
-}
-
-fn append_f64_list(builder: &mut ListBuilder<Float64Builder>, values: &[f64]) {
-    for value in values {
-        if value.is_finite() {
-            builder.values().append_value(*value);
-        } else {
-            builder.values().append_null();
+impl ContextIdMap {
+    /// Returns `(id, is_new)`. When `is_new` is true the caller must emit the
+    /// child rows (resource_attrs / scope_attrs) for this id; otherwise the
+    /// previously emitted ones are reused.
+    fn lookup_or_insert(
+        &mut self,
+        fingerprint: u64,
+        next: &mut u32,
+        field: &str,
+    ) -> Result<(u16, bool)> {
+        if let Some(&id) = self.map.get(&fingerprint) {
+            return Ok((id, false));
         }
+        let id = next_u16(next, field)?;
+        self.map.insert(fingerprint, id);
+        Ok((id, true))
     }
-    builder.append(true);
 }
 
-fn append_quantile_list(
-    builder: &mut ListBuilder<StructBuilder>,
-    values: &[summary_data_point::ValueAtQuantile],
-) {
-    for value in values {
-        let struct_builder = builder.values();
-        {
-            let quantile = struct_builder
-                .field_builder::<Float64Builder>(0)
-                .expect("quantile field builder");
-            append_finite_opt_arrow(quantile, Some(value.quantile));
-        }
-        {
-            let quantile_value = struct_builder
-                .field_builder::<Float64Builder>(1)
-                .expect("quantile value field builder");
-            append_finite_opt_arrow(quantile_value, Some(value.value));
-        }
-        struct_builder.append(true);
-    }
-    builder.append(true);
+fn resource_fingerprint(attrs: &[KeyValue], schema_url: Option<&str>, dropped: Option<u32>) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    schema_url.hash(&mut hasher);
+    dropped.hash(&mut hasher);
+    hash_attrs(attrs, &mut hasher);
+    hasher.finish()
 }
 
-fn quantile_list_builder() -> ListBuilder<StructBuilder> {
-    ListBuilder::new(StructBuilder::new(
-        vec![
-            Field::new("quantile", DataType::Float64, true),
-            Field::new("value", DataType::Float64, true),
-        ],
-        vec![
-            Box::new(Float64Builder::new()),
-            Box::new(Float64Builder::new()),
-        ],
-    ))
+fn scope_fingerprint(
+    name: Option<&str>,
+    version: Option<&str>,
+    attrs: &[KeyValue],
+    schema_url: Option<&str>,
+    dropped: Option<u32>,
+) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    name.hash(&mut hasher);
+    version.hash(&mut hasher);
+    schema_url.hash(&mut hasher);
+    dropped.hash(&mut hasher);
+    hash_attrs(attrs, &mut hasher);
+    hasher.finish()
 }
 
 fn next_u16(next: &mut u32, field: &str) -> Result<u16> {
@@ -1827,15 +1885,24 @@ fn next_u16(next: &mut u32, field: &str) -> Result<u16> {
             "{field} exceeds UInt16 capacity"
         )))
     })?;
-    *next += 1;
+    // Defensive: the try_from gate keeps *next ≤ u16::MAX so this can't
+    // overflow in practice, but use checked_add to stay symmetric with
+    // next_u32 and to crash loudly if that invariant ever changes.
+    *next = next.checked_add(1).ok_or_else(|| {
+        Error::Decode(DecodeError::Unsupported(format!(
+            "{field} id counter overflow"
+        )))
+    })?;
     Ok(value)
 }
 
-fn next_u32(next: &mut u32, _field: &str) -> Result<u32> {
+fn next_u32(next: &mut u32, field: &str) -> Result<u32> {
     let value = *next;
-    *next = next
-        .checked_add(1)
-        .ok_or_else(|| Error::Decode(DecodeError::Unsupported("UInt32 id overflow".into())))?;
+    *next = next.checked_add(1).ok_or_else(|| {
+        Error::Decode(DecodeError::Unsupported(format!(
+            "{field} exceeds UInt32 capacity"
+        )))
+    })?;
     Ok(value)
 }
 
@@ -1843,14 +1910,14 @@ fn empty_to_none(value: &str) -> Option<&str> {
     (!value.is_empty()).then_some(value)
 }
 
-fn metric_type(data: &Option<Data>) -> u8 {
+fn metric_type(data: &Option<Data>) -> Option<u8> {
     match data {
-        Some(Data::Gauge(_)) => METRIC_GAUGE,
-        Some(Data::Sum(_)) => METRIC_SUM,
-        Some(Data::Histogram(_)) => METRIC_HISTOGRAM,
-        Some(Data::ExponentialHistogram(_)) => METRIC_EXP_HISTOGRAM,
-        Some(Data::Summary(_)) => METRIC_SUMMARY,
-        None => 0,
+        Some(Data::Gauge(_)) => Some(METRIC_GAUGE),
+        Some(Data::Sum(_)) => Some(METRIC_SUM),
+        Some(Data::Histogram(_)) => Some(METRIC_HISTOGRAM),
+        Some(Data::ExponentialHistogram(_)) => Some(METRIC_EXP_HISTOGRAM),
+        Some(Data::Summary(_)) => Some(METRIC_SUMMARY),
+        None => None,
     }
 }
 

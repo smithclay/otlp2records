@@ -142,10 +142,29 @@ pub fn group_batch_by_service(batch: RecordBatch) -> ServiceGroupedBatches {
     }
 }
 
-/// Extract the minimum timestamp from a RecordBatch.
+/// Extract the minimum timestamp from a RecordBatch, in microseconds.
 ///
-/// Looks for a normalized timestamp column and returns the minimum value in microseconds.
-/// Returns 0 if no valid timestamps found.
+/// Probes the batch for a single timestamp column, in this priority order:
+/// 1. `time_unix_nano`
+/// 2. `start_time_unix_nano`
+/// 3. `timestamp`
+///
+/// The first column found is interpreted based on its Arrow type:
+/// - `Timestamp(Nanosecond, _)`: the minimum non-null value is divided by `1_000`
+///   to convert nanoseconds to microseconds. This is a silent integer division,
+///   so sub-microsecond precision is truncated.
+/// - `Timestamp(Microsecond, _)`: the minimum non-null value is returned as-is.
+/// - `Int64`: the column is assumed to be in milliseconds and the minimum
+///   non-null value is multiplied by `1_000` to produce microseconds.
+///
+/// Returns `0` if the batch is empty, no candidate column exists, the column has
+/// an unsupported Arrow type, or all values are null.
+///
+/// This helper is intended for the normalized schema output produced by this
+/// crate (logs, traces, and metrics record tables share these column names and
+/// units). It is not suitable for OTAP "star" record batches, which have
+/// different/multiple timestamp columns per table and are not partitioned via
+/// this helper.
 pub fn extract_min_timestamp_micros(batch: &RecordBatch) -> i64 {
     if batch.num_rows() == 0 {
         return 0;
@@ -202,7 +221,7 @@ pub fn extract_service_name(batch: &RecordBatch) -> Arc<str> {
 mod tests {
     use super::*;
     use arrow_array::builder::{StringBuilder, TimestampMicrosecondBuilder};
-    use arrow_array::Int32Array;
+    use arrow_array::{Int32Array, Int64Array, TimestampNanosecondArray};
     use arrow_schema::{DataType, Field, Schema, TimeUnit};
     use std::sync::Arc as StdArc;
 
@@ -293,10 +312,41 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_min_timestamp_micros() {
+    fn test_extract_min_timestamp_micros_timestamp_micros() {
         let batch = create_test_batch(&["svc-a", "svc-a"], &[100, 50]);
         let min_ts = extract_min_timestamp_micros(&batch);
         assert_eq!(min_ts, 50);
+    }
+
+    #[test]
+    fn test_extract_min_timestamp_micros_timestamp_nanos() {
+        let schema = StdArc::new(Schema::new(vec![Field::new(
+            "time_unix_nano",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            false,
+        )]));
+        // 1_500 ns and 2_500 ns → min is 1_500 ns → 1 µs after truncating integer
+        // division by 1_000.
+        let ts_array = TimestampNanosecondArray::from(vec![2_500i64, 1_500i64]);
+        let batch = RecordBatch::try_new(schema, vec![StdArc::new(ts_array)]).unwrap();
+
+        let min_ts = extract_min_timestamp_micros(&batch);
+        assert_eq!(min_ts, 1);
+    }
+
+    #[test]
+    fn test_extract_min_timestamp_micros_int64_millis() {
+        let schema = StdArc::new(Schema::new(vec![Field::new(
+            "timestamp",
+            DataType::Int64,
+            false,
+        )]));
+        // Int64 fallback is treated as milliseconds and scaled to microseconds.
+        let ts_array = Int64Array::from(vec![5i64, 3i64, 9i64]);
+        let batch = RecordBatch::try_new(schema, vec![StdArc::new(ts_array)]).unwrap();
+
+        let min_ts = extract_min_timestamp_micros(&batch);
+        assert_eq!(min_ts, 3_000);
     }
 
     #[test]

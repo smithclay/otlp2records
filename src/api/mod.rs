@@ -1,5 +1,6 @@
 //! Public API orchestration.
 
+mod auto;
 mod json;
 mod logs;
 mod metrics;

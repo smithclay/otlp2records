@@ -18,7 +18,7 @@ use prost::Message;
 
 use crate::{
     api::{MetricBatches, SkippedMetrics},
-    schema::{exp_histogram_schema, gauge_schema, histogram_schema, sum_schema},
+    schema::{exp_histogram_schema_arc, gauge_schema_arc, histogram_schema_arc, sum_schema_arc},
     Result,
 };
 
@@ -387,7 +387,7 @@ impl GaugeBuilders {
             return Ok(None);
         }
         record_batch(
-            gauge_schema(),
+            gauge_schema_arc(),
             vec![
                 array(self.time_unix_nano.finish()),
                 array(self.start_time_unix_nano.finish()),
@@ -485,7 +485,7 @@ impl SumBuilders {
             return Ok(None);
         }
         record_batch(
-            sum_schema(),
+            sum_schema_arc(),
             vec![
                 array(self.time_unix_nano.finish()),
                 array(self.start_time_unix_nano.finish()),
@@ -831,7 +831,7 @@ impl HistogramBuilders {
             return Ok(None);
         }
         record_batch(
-            histogram_schema(),
+            histogram_schema_arc(),
             vec![
                 array(self.time_unix_nano.finish()),
                 array(self.start_time_unix_nano.finish()),
@@ -1005,7 +1005,7 @@ impl ExpHistogramBuilders {
             return Ok(None);
         }
         record_batch(
-            exp_histogram_schema(),
+            exp_histogram_schema_arc(),
             vec![
                 array(self.time_unix_nano.finish()),
                 array(self.start_time_unix_nano.finish()),

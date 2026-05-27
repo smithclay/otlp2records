@@ -190,6 +190,11 @@ Implement `TransformObserver` to receive `TransformPhaseTiming` and `TransformCo
 events. Counters include duplicate resource/scope context hits and misses plus repeated
 resource/scope attribute row-copy counts and bytes.
 
+Observer instrumentation is implemented only for `SchemaOutput::Normalized` (the
+default). The `otap-star` path does not currently invoke `TransformObserver`;
+call `transform_logs_with_schema` etc. without an observer when selecting
+`OtapStar`. Wiring observers through OTAP is tracked separately.
+
 ### Output Functions
 
 | Function | Description |

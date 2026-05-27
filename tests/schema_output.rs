@@ -1,8 +1,7 @@
 use std::str::FromStr;
 
 use arrow_array::{
-    Array, BinaryArray, Float64Array, ListArray, StringArray, StructArray, UInt16Array,
-    UInt32Array, UInt8Array,
+    Array, BinaryArray, Float64Array, StringArray, UInt16Array, UInt32Array, UInt8Array,
 };
 use arrow_schema::{DataType, TimeUnit};
 use opentelemetry_proto::tonic::{
@@ -201,6 +200,49 @@ fn otap_traces_emit_event_link_child_tables() {
 }
 
 #[test]
+fn otap_span_with_end_before_start_clamps_duration_to_zero() {
+    // A malformed span where end < start must clamp the Duration to 0 rather
+    // than emit a negative value. The normalized path already does this; OTAP
+    // must match (regression test for branch B1).
+    let mut request = trace_request();
+    let span = &mut request.resource_spans[0].scope_spans[0].spans[0];
+    span.start_time_unix_nano = 1_700_000_000_000_000_100;
+    span.end_time_unix_nano = 1_700_000_000_000_000_000;
+
+    let TracesOutput::OtapStar(otap) = transform_traces_with_schema(
+        &request.encode_to_vec(),
+        InputFormat::Protobuf,
+        SchemaOutput::OtapStar,
+    )
+    .unwrap() else {
+        panic!("expected otap-star traces");
+    };
+    let normalized = transform_traces(&request.encode_to_vec(), InputFormat::Protobuf).unwrap();
+
+    let otap_duration = otap
+        .spans
+        .column_by_name("duration_time_unix_nano")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<arrow_array::DurationNanosecondArray>()
+        .unwrap()
+        .value(0);
+    let normalized_duration = normalized
+        .column_by_name("duration_time_unix_nano")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<arrow_array::DurationNanosecondArray>()
+        .unwrap()
+        .value(0);
+
+    assert_eq!(otap_duration, 0, "OTAP duration must clamp at 0");
+    assert_eq!(
+        normalized_duration, 0,
+        "normalized duration must clamp at 0"
+    );
+}
+
+#[test]
 fn otap_metrics_emit_all_metric_point_tables() {
     let output = transform_metrics_with_schema(
         &metrics_request().encode_to_vec(),
@@ -239,9 +281,15 @@ fn otap_metrics_emit_all_metric_point_tables() {
         .field_with_name("time_unix_nano")
         .unwrap()
         .is_nullable());
-    assert_summary_quantile_schema(batches.summary_data_points.schema().as_ref());
+    // Quantiles live only in the separate `quantile` child table — there is no
+    // embedded list in summary_data_points (B3).
+    assert!(batches
+        .summary_data_points
+        .schema()
+        .field_with_name("quantile")
+        .is_err());
     assert_eq!(
-        summary_quantiles(&batches.summary_data_points),
+        quantile_pairs(&batches.quantile),
         vec![(0.5, 2.0), (0.99, 3.0)]
     );
     assert_eq!(
@@ -266,6 +314,209 @@ fn otap_metrics_emit_all_metric_point_tables() {
         f64_col(&batches.exp_histogram_data_points, "zero_threshold"),
         vec![0.25]
     );
+}
+
+#[test]
+fn otap_metrics_skip_nan_inf_and_missing_values_and_bump_counters() {
+    // OTAP must drop NaN / Infinity / missing number data points and increment
+    // SkippedMetrics, matching the normalized path (regression test for B2).
+    let request = ExportMetricsServiceRequest {
+        resource_metrics: vec![ResourceMetrics {
+            resource: Some(Resource {
+                attributes: vec![attr("service.name", "svc")],
+                ..Default::default()
+            }),
+            scope_metrics: vec![ScopeMetrics {
+                scope: Some(InstrumentationScope {
+                    name: "scope".to_string(),
+                    ..Default::default()
+                }),
+                metrics: vec![Metric {
+                    name: "g".to_string(),
+                    data: Some(Data::Gauge(Gauge {
+                        data_points: vec![
+                            NumberDataPoint {
+                                attributes: vec![],
+                                start_time_unix_nano: 1,
+                                time_unix_nano: 2,
+                                value: Some(number_data_point::Value::AsDouble(f64::NAN)),
+                                exemplars: vec![],
+                                flags: 0,
+                            },
+                            NumberDataPoint {
+                                attributes: vec![],
+                                start_time_unix_nano: 1,
+                                time_unix_nano: 2,
+                                value: Some(number_data_point::Value::AsDouble(f64::INFINITY)),
+                                exemplars: vec![],
+                                flags: 0,
+                            },
+                            NumberDataPoint {
+                                attributes: vec![],
+                                start_time_unix_nano: 1,
+                                time_unix_nano: 2,
+                                value: None,
+                                exemplars: vec![],
+                                flags: 0,
+                            },
+                            NumberDataPoint {
+                                attributes: vec![attr("ok", "yes")],
+                                start_time_unix_nano: 1,
+                                time_unix_nano: 2,
+                                value: Some(number_data_point::Value::AsDouble(1.5)),
+                                exemplars: vec![],
+                                flags: 0,
+                            },
+                        ],
+                    })),
+                    ..Default::default()
+                }],
+                schema_url: String::new(),
+            }],
+            schema_url: String::new(),
+        }],
+    };
+
+    let MetricsOutput::OtapStar(batches) = transform_metrics_with_schema(
+        &request.encode_to_vec(),
+        InputFormat::Protobuf,
+        SchemaOutput::OtapStar,
+    )
+    .unwrap() else {
+        panic!("expected otap-star metrics");
+    };
+
+    assert_eq!(batches.skipped.nan_values, 1);
+    assert_eq!(batches.skipped.infinity_values, 1);
+    assert_eq!(batches.skipped.missing_values, 1);
+    assert_eq!(batches.skipped.summaries, 0);
+    assert_eq!(batches.skipped.total(), 3);
+    // Only the one valid point makes it into the child tables.
+    assert_eq!(batches.number_data_points.num_rows(), 1);
+    assert_eq!(batches.number_dp_attrs.num_rows(), 1);
+}
+
+#[test]
+fn otap_metric_with_no_data_variant_is_skipped() {
+    // A Metric with `data: None` must not be written into the metrics table
+    // (it would carry metric_type=0, which is not a defined OTAP code). B6.
+    let request = ExportMetricsServiceRequest {
+        resource_metrics: vec![ResourceMetrics {
+            resource: Some(Resource {
+                attributes: vec![attr("service.name", "svc")],
+                ..Default::default()
+            }),
+            scope_metrics: vec![ScopeMetrics {
+                scope: Some(InstrumentationScope {
+                    name: "scope".to_string(),
+                    ..Default::default()
+                }),
+                metrics: vec![
+                    Metric {
+                        name: "no-data".to_string(),
+                        data: None,
+                        ..Default::default()
+                    },
+                    Metric {
+                        name: "g".to_string(),
+                        data: Some(Data::Gauge(Gauge {
+                            data_points: vec![number_point(1.0, "k", vec![])],
+                        })),
+                        ..Default::default()
+                    },
+                ],
+                schema_url: String::new(),
+            }],
+            schema_url: String::new(),
+        }],
+    };
+
+    let MetricsOutput::OtapStar(batches) = transform_metrics_with_schema(
+        &request.encode_to_vec(),
+        InputFormat::Protobuf,
+        SchemaOutput::OtapStar,
+    )
+    .unwrap() else {
+        panic!("expected otap-star metrics");
+    };
+
+    assert_eq!(batches.metrics.num_rows(), 1);
+    assert_eq!(u8_col(&batches.metrics, "metric_type"), vec![1]); // METRIC_GAUGE
+    assert_eq!(
+        string_col(&batches.metrics, "name"),
+        vec![Some("g".to_string())]
+    );
+}
+
+#[test]
+fn otap_logs_dedupe_repeated_resource_and_scope_contexts() {
+    // Two resource_logs entries with identical resource attributes, schema_url
+    // and dropped_attributes_count must share one resource_id and emit a single
+    // resource_attrs row. Same for scope. (Regression test for B4.)
+    let resource = Resource {
+        attributes: vec![attr("service.name", "svc")],
+        dropped_attributes_count: 0,
+        ..Default::default()
+    };
+    let scope = InstrumentationScope {
+        name: "scope".to_string(),
+        version: "1".to_string(),
+        attributes: vec![attr("scope.key", "scope-value")],
+        dropped_attributes_count: 0,
+    };
+    let make_record = |body: &str| LogRecord {
+        time_unix_nano: 1_700_000_000_000_000_000,
+        observed_time_unix_nano: 1_700_000_000_000_000_100,
+        trace_id: bytes16(),
+        span_id: bytes8(),
+        severity_number: 9,
+        severity_text: "INFO".to_string(),
+        body: Some(AnyValue {
+            value: Some(any_value::Value::StringValue(body.to_string())),
+        }),
+        attributes: vec![],
+        dropped_attributes_count: 0,
+        flags: 0,
+        event_name: String::new(),
+    };
+    let request = ExportLogsServiceRequest {
+        resource_logs: vec![
+            ResourceLogs {
+                resource: Some(resource.clone()),
+                scope_logs: vec![ScopeLogs {
+                    scope: Some(scope.clone()),
+                    log_records: vec![make_record("a")],
+                    schema_url: "scope-schema".to_string(),
+                }],
+                schema_url: "resource-schema".to_string(),
+            },
+            ResourceLogs {
+                resource: Some(resource),
+                scope_logs: vec![ScopeLogs {
+                    scope: Some(scope),
+                    log_records: vec![make_record("b")],
+                    schema_url: "scope-schema".to_string(),
+                }],
+                schema_url: "resource-schema".to_string(),
+            },
+        ],
+    };
+
+    let LogsOutput::OtapStar(batches) = transform_logs_with_schema(
+        &request.encode_to_vec(),
+        InputFormat::Protobuf,
+        SchemaOutput::OtapStar,
+    )
+    .unwrap() else {
+        panic!("expected otap-star logs");
+    };
+
+    // Two log records — but the resource and scope are deduped.
+    assert_eq!(batches.logs.num_rows(), 2);
+    assert_eq!(u16_col(&batches.logs, "resource_id"), vec![0, 0]);
+    assert_eq!(u16_col(&batches.logs, "scope_id"), vec![0, 0]);
+    assert_eq!(batches.resource_attrs.num_rows(), 1);
+    assert_eq!(batches.scope_attrs.num_rows(), 1);
 }
 
 #[test]
@@ -415,44 +666,22 @@ fn string_col(batch: &arrow_array::RecordBatch, name: &str) -> Vec<Option<String
         .collect()
 }
 
-fn summary_quantiles(batch: &arrow_array::RecordBatch) -> Vec<(f64, f64)> {
-    let col = batch
-        .column_by_name("quantile")
-        .unwrap()
-        .as_any()
-        .downcast_ref::<ListArray>()
-        .unwrap();
-    let values = col.value(0);
-    let values = values.as_any().downcast_ref::<StructArray>().unwrap();
-    let quantiles = values
+fn quantile_pairs(batch: &arrow_array::RecordBatch) -> Vec<(f64, f64)> {
+    let quantile = batch
         .column_by_name("quantile")
         .unwrap()
         .as_any()
         .downcast_ref::<Float64Array>()
         .unwrap();
-    let quantile_values = values
+    let value = batch
         .column_by_name("value")
         .unwrap()
         .as_any()
         .downcast_ref::<Float64Array>()
         .unwrap();
-    (0..values.len())
-        .map(|idx| (quantiles.value(idx), quantile_values.value(idx)))
+    (0..batch.num_rows())
+        .map(|idx| (quantile.value(idx), value.value(idx)))
         .collect()
-}
-
-fn assert_summary_quantile_schema(schema: &arrow_schema::Schema) {
-    let field = schema.field_with_name("quantile").unwrap();
-    let DataType::List(item) = field.data_type() else {
-        panic!("expected summary quantile list");
-    };
-    let DataType::Struct(fields) = item.data_type() else {
-        panic!("expected summary quantile list item struct");
-    };
-    assert_eq!(fields[0].name(), "quantile");
-    assert_eq!(fields[0].data_type(), &DataType::Float64);
-    assert_eq!(fields[1].name(), "value");
-    assert_eq!(fields[1].data_type(), &DataType::Float64);
 }
 
 fn binary_col(batch: &arrow_array::RecordBatch, name: &str) -> Vec<Option<Vec<u8>>> {
@@ -502,7 +731,6 @@ fn log_request() -> ExportLogsServiceRequest {
                     dropped_attributes_count: 4,
                     flags: 1,
                     event_name: "login".to_string(),
-                    ..Default::default()
                 }],
                 schema_url: "scope-schema".to_string(),
             }],

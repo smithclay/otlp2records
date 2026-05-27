@@ -1,10 +1,12 @@
 //! Arrow schema accessors.
 
+use std::sync::Arc;
+
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use once_cell::sync::Lazy;
 
-static LOGS_SCHEMA: Lazy<Schema> = Lazy::new(|| {
-    Schema::new(vec![
+static LOGS_SCHEMA: Lazy<Arc<Schema>> = Lazy::new(|| {
+    Arc::new(Schema::new(vec![
         ts_ns("time_unix_nano", true),
         ts_ns("observed_time_unix_nano", true),
         fixed("trace_id", 16, true),
@@ -23,11 +25,11 @@ static LOGS_SCHEMA: Lazy<Schema> = Lazy::new(|| {
         utf8("log_attributes", true),
         u32_field("dropped_attributes_count", true),
         u32_field("flags", true),
-    ])
+    ]))
 });
 
-static TRACES_SCHEMA: Lazy<Schema> = Lazy::new(|| {
-    Schema::new(vec![
+static TRACES_SCHEMA: Lazy<Arc<Schema>> = Lazy::new(|| {
+    Arc::new(Schema::new(vec![
         ts_ns("start_time_unix_nano", false),
         duration_ns("duration_time_unix_nano", false),
         fixed("trace_id", 16, false),
@@ -52,11 +54,11 @@ static TRACES_SCHEMA: Lazy<Schema> = Lazy::new(|| {
         u32_field("dropped_events_count", true),
         u32_field("dropped_links_count", true),
         u32_field("flags", true),
-    ])
+    ]))
 });
 
-static GAUGE_SCHEMA: Lazy<Schema> = Lazy::new(|| {
-    Schema::new(vec![
+static GAUGE_SCHEMA: Lazy<Arc<Schema>> = Lazy::new(|| {
+    Arc::new(Schema::new(vec![
         ts_ns("time_unix_nano", false),
         ts_ns("start_time_unix_nano", true),
         utf8("name", false),
@@ -74,11 +76,11 @@ static GAUGE_SCHEMA: Lazy<Schema> = Lazy::new(|| {
         utf8("metric_attributes", true),
         u32_field("flags", true),
         utf8("exemplars_json", true),
-    ])
+    ]))
 });
 
-static SUM_SCHEMA: Lazy<Schema> = Lazy::new(|| {
-    Schema::new(vec![
+static SUM_SCHEMA: Lazy<Arc<Schema>> = Lazy::new(|| {
+    Arc::new(Schema::new(vec![
         ts_ns("time_unix_nano", false),
         ts_ns("start_time_unix_nano", true),
         utf8("name", false),
@@ -98,11 +100,11 @@ static SUM_SCHEMA: Lazy<Schema> = Lazy::new(|| {
         utf8("exemplars_json", true),
         i32_field("aggregation_temporality", true),
         bool_field("is_monotonic", true),
-    ])
+    ]))
 });
 
-static HISTOGRAM_SCHEMA: Lazy<Schema> = Lazy::new(|| {
-    Schema::new(vec![
+static HISTOGRAM_SCHEMA: Lazy<Arc<Schema>> = Lazy::new(|| {
+    Arc::new(Schema::new(vec![
         ts_ns("time_unix_nano", false),
         ts_ns("start_time_unix_nano", true),
         utf8("name", false),
@@ -125,11 +127,11 @@ static HISTOGRAM_SCHEMA: Lazy<Schema> = Lazy::new(|| {
         u32_field("flags", true),
         utf8("exemplars_json", true),
         i32_field("aggregation_temporality", true),
-    ])
+    ]))
 });
 
-static EXP_HISTOGRAM_SCHEMA: Lazy<Schema> = Lazy::new(|| {
-    Schema::new(vec![
+static EXP_HISTOGRAM_SCHEMA: Lazy<Arc<Schema>> = Lazy::new(|| {
+    Arc::new(Schema::new(vec![
         ts_ns("time_unix_nano", false),
         ts_ns("start_time_unix_nano", true),
         utf8("name", false),
@@ -157,31 +159,55 @@ static EXP_HISTOGRAM_SCHEMA: Lazy<Schema> = Lazy::new(|| {
         u32_field("flags", true),
         utf8("exemplars_json", true),
         i32_field("aggregation_temporality", true),
-    ])
+    ]))
 });
 
 pub fn logs_schema() -> Schema {
-    LOGS_SCHEMA.clone()
+    (**LOGS_SCHEMA).clone()
 }
 
 pub fn traces_schema() -> Schema {
-    TRACES_SCHEMA.clone()
+    (**TRACES_SCHEMA).clone()
 }
 
 pub fn gauge_schema() -> Schema {
-    GAUGE_SCHEMA.clone()
+    (**GAUGE_SCHEMA).clone()
 }
 
 pub fn sum_schema() -> Schema {
-    SUM_SCHEMA.clone()
+    (**SUM_SCHEMA).clone()
 }
 
 pub fn histogram_schema() -> Schema {
-    HISTOGRAM_SCHEMA.clone()
+    (**HISTOGRAM_SCHEMA).clone()
 }
 
 pub fn exp_histogram_schema() -> Schema {
-    EXP_HISTOGRAM_SCHEMA.clone()
+    (**EXP_HISTOGRAM_SCHEMA).clone()
+}
+
+pub(crate) fn logs_schema_arc() -> Arc<Schema> {
+    Arc::clone(&LOGS_SCHEMA)
+}
+
+pub(crate) fn traces_schema_arc() -> Arc<Schema> {
+    Arc::clone(&TRACES_SCHEMA)
+}
+
+pub(crate) fn gauge_schema_arc() -> Arc<Schema> {
+    Arc::clone(&GAUGE_SCHEMA)
+}
+
+pub(crate) fn sum_schema_arc() -> Arc<Schema> {
+    Arc::clone(&SUM_SCHEMA)
+}
+
+pub(crate) fn histogram_schema_arc() -> Arc<Schema> {
+    Arc::clone(&HISTOGRAM_SCHEMA)
+}
+
+pub(crate) fn exp_histogram_schema_arc() -> Arc<Schema> {
+    Arc::clone(&EXP_HISTOGRAM_SCHEMA)
 }
 
 fn ts_ns(name: &str, nullable: bool) -> Field {

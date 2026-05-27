@@ -42,23 +42,27 @@ pub enum LogsOutput {
 }
 
 /// Result of transforming traces with explicit schema selection.
+///
+/// The OTAP variant is boxed to keep the enum small — the OTAP trace tables
+/// are ~8× the size of a normalized RecordBatch.
 #[derive(Debug)]
-#[allow(clippy::large_enum_variant)]
 pub enum TracesOutput {
     /// Current flattened ClickStack-compatible span batch.
     Normalized(RecordBatch),
     /// OTAP star multi-table trace batches.
-    OtapStar(OtapTracesBatches),
+    OtapStar(Box<OtapTracesBatches>),
 }
 
 /// Result of transforming metrics with explicit schema selection.
+///
+/// The OTAP variant is boxed (it carries 18 record batches); see
+/// `TracesOutput` for the same rationale.
 #[derive(Debug)]
-#[allow(clippy::large_enum_variant)]
 pub enum MetricsOutput {
     /// Current flattened ClickStack-compatible metric batches.
     Normalized(MetricBatches),
     /// OTAP star multi-table metric batches.
-    OtapStar(OtapMetricsBatches),
+    OtapStar(Box<OtapMetricsBatches>),
 }
 
 /// OTAP star log tables.
@@ -134,6 +138,12 @@ pub struct OtapMetricsBatches {
     pub exp_histogram_dp_exemplar_attrs: RecordBatch,
     pub skipped: SkippedMetrics,
 }
+
+/// Number of named tables exposed by [`OtapMetricsBatches::iter_named_batches`].
+/// Kept in sync via the `iter_named_batches_covers_all_metric_tables` test;
+/// bump this and the iterator together whenever a new table is added.
+#[cfg(test)]
+const OTAP_METRICS_NAMED_BATCH_COUNT: usize = 18;
 
 impl OtapMetricsBatches {
     pub fn iter_named_batches(&self) -> impl Iterator<Item = (&'static str, &RecordBatch)> {
@@ -233,4 +243,59 @@ pub struct JsonMetricBatches {
     pub exp_histogram: Vec<serde_json::Value>,
     /// Metrics that were skipped during processing
     pub skipped: SkippedMetrics,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_array::RecordBatch;
+    use arrow_schema::Schema;
+    use std::sync::Arc;
+
+    fn empty() -> RecordBatch {
+        RecordBatch::new_empty(Arc::new(Schema::empty()))
+    }
+
+    /// Guards against silent drift between the named-batch iterator and the
+    /// struct fields. If a new table is added to `OtapMetricsBatches`, bump
+    /// `OTAP_METRICS_NAMED_BATCH_COUNT` and add the corresponding entry to
+    /// `iter_named_batches`.
+    #[test]
+    fn iter_named_batches_covers_all_metric_tables() {
+        let batches = OtapMetricsBatches {
+            metrics: empty(),
+            resource_attrs: empty(),
+            scope_attrs: empty(),
+            number_data_points: empty(),
+            number_dp_attrs: empty(),
+            number_dp_exemplars: empty(),
+            number_dp_exemplar_attrs: empty(),
+            summary_data_points: empty(),
+            quantile: empty(),
+            summary_dp_attrs: empty(),
+            histogram_data_points: empty(),
+            histogram_dp_attrs: empty(),
+            histogram_dp_exemplars: empty(),
+            histogram_dp_exemplar_attrs: empty(),
+            exp_histogram_data_points: empty(),
+            exp_histogram_dp_attrs: empty(),
+            exp_histogram_dp_exemplars: empty(),
+            exp_histogram_dp_exemplar_attrs: empty(),
+            skipped: SkippedMetrics::default(),
+        };
+        assert_eq!(
+            batches.iter_named_batches().count(),
+            OTAP_METRICS_NAMED_BATCH_COUNT
+        );
+        // Names must be unique (no duplicate or stale entries).
+        let names: Vec<_> = batches.iter_named_batches().map(|(n, _)| n).collect();
+        let mut sorted = names.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            names.len(),
+            "duplicate names in iter_named_batches"
+        );
+    }
 }

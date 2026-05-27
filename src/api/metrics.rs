@@ -4,14 +4,11 @@ use std::time::Instant;
 
 use crate::{
     api::{
-        optional_batch_to_json_values, JsonMetricBatches, MetricBatches, MetricsOutput,
-        SchemaOutput,
+        auto::auto_dispatch, optional_batch_to_json_values, JsonMetricBatches, MetricBatches,
+        MetricsOutput, SchemaOutput,
     },
     batch::{self, TransformObserver, TransformPhase, TransformSignal},
-    decode::{
-        decode_metrics_json_request, decode_metrics_jsonl_request, looks_like_json, DecodeError,
-        InputFormat,
-    },
+    decode::{decode_metrics_json_request, decode_metrics_jsonl_request, DecodeError, InputFormat},
     Error, Result,
 };
 
@@ -36,9 +33,8 @@ pub fn transform_metrics_with_schema(
 ) -> Result<MetricsOutput> {
     match schema_output {
         SchemaOutput::Normalized => transform_metrics(bytes, format).map(MetricsOutput::Normalized),
-        SchemaOutput::OtapStar => {
-            transform_metrics_otap(bytes, format).map(MetricsOutput::OtapStar)
-        }
+        SchemaOutput::OtapStar => transform_metrics_otap(bytes, format)
+            .map(|batches| MetricsOutput::OtapStar(Box::new(batches))),
     }
 }
 
@@ -88,30 +84,13 @@ fn transform_metrics_otap(
 }
 
 fn transform_metrics_otap_auto(bytes: &[u8]) -> Result<crate::api::OtapMetricsBatches> {
-    if looks_like_json(bytes) {
-        match transform_metrics_otap(bytes, InputFormat::Json) {
-            Ok(batches) => Ok(batches),
-            Err(json_err) => match transform_metrics_otap(bytes, InputFormat::Jsonl) {
-                Ok(batches) => Ok(batches),
-                Err(_) => batch::transform_metrics_protobuf_otap(bytes).map_err(|proto_err| {
-                    Error::Decode(DecodeError::Unsupported(format!(
-                        "json decode failed: {json_err}; protobuf fallback failed: {proto_err}"
-                    )))
-                }),
-            },
-        }
-    } else {
-        match batch::transform_metrics_protobuf_otap(bytes) {
-            Ok(batches) => Ok(batches),
-            Err(proto_err) => {
-                transform_metrics_otap(bytes, InputFormat::Json).map_err(|json_err| {
-                    Error::Decode(DecodeError::Unsupported(format!(
-                        "protobuf decode failed: {proto_err}; json fallback failed: {json_err}"
-                    )))
-                })
-            }
-        }
-    }
+    auto_dispatch(
+        bytes,
+        &mut (),
+        |b, _| transform_metrics_otap(b, InputFormat::Json),
+        |b, _| transform_metrics_otap(b, InputFormat::Jsonl),
+        |b, _| batch::transform_metrics_protobuf_otap(b),
+    )
 }
 
 fn transform_metrics_json_arrow_observed(
@@ -151,66 +130,26 @@ fn transform_metrics_json_arrow_observed(
 }
 
 fn transform_metrics_auto(bytes: &[u8]) -> Result<MetricBatches> {
-    if looks_like_json(bytes) {
-        match transform_metrics_json_arrow(bytes, InputFormat::Json) {
-            Ok(batches) => Ok(batches),
-            Err(json_err) => match transform_metrics_json_arrow(bytes, InputFormat::Jsonl) {
-                Ok(batches) => Ok(batches),
-                Err(_) => batch::transform_metrics_protobuf(bytes).map_err(|proto_err| {
-                    Error::Decode(DecodeError::Unsupported(format!(
-                        "json decode failed: {json_err}; protobuf fallback failed: {proto_err}"
-                    )))
-                }),
-            },
-        }
-    } else {
-        match batch::transform_metrics_protobuf(bytes) {
-            Ok(batches) => Ok(batches),
-            Err(proto_err) => {
-                transform_metrics_json_arrow(bytes, InputFormat::Json).map_err(|json_err| {
-                    Error::Decode(DecodeError::Unsupported(format!(
-                        "protobuf decode failed: {proto_err}; json fallback failed: {json_err}"
-                    )))
-                })
-            }
-        }
-    }
+    auto_dispatch(
+        bytes,
+        &mut (),
+        |b, _| transform_metrics_json_arrow(b, InputFormat::Json),
+        |b, _| transform_metrics_json_arrow(b, InputFormat::Jsonl),
+        |b, _| batch::transform_metrics_protobuf(b),
+    )
 }
 
 fn transform_metrics_auto_observed(
     bytes: &[u8],
     observer: &mut Option<&mut dyn TransformObserver>,
 ) -> Result<MetricBatches> {
-    if looks_like_json(bytes) {
-        match transform_metrics_json_arrow_observed(bytes, InputFormat::Json, observer) {
-            Ok(batches) => Ok(batches),
-            Err(json_err) => {
-                match transform_metrics_json_arrow_observed(bytes, InputFormat::Jsonl, observer) {
-                    Ok(batches) => Ok(batches),
-                    Err(_) => batch::transform_metrics_protobuf_observed(bytes, observer).map_err(
-                        |proto_err| {
-                            Error::Decode(DecodeError::Unsupported(format!(
-                            "json decode failed: {json_err}; protobuf fallback failed: {proto_err}"
-                        )))
-                        },
-                    ),
-                }
-            }
-        }
-    } else {
-        match batch::transform_metrics_protobuf_observed(bytes, observer) {
-            Ok(batches) => Ok(batches),
-            Err(proto_err) => {
-                transform_metrics_json_arrow_observed(bytes, InputFormat::Json, observer).map_err(
-                    |json_err| {
-                        Error::Decode(DecodeError::Unsupported(format!(
-                            "protobuf decode failed: {proto_err}; json fallback failed: {json_err}"
-                        )))
-                    },
-                )
-            }
-        }
-    }
+    auto_dispatch(
+        bytes,
+        observer,
+        |b, obs| transform_metrics_json_arrow_observed(b, InputFormat::Json, obs),
+        |b, obs| transform_metrics_json_arrow_observed(b, InputFormat::Jsonl, obs),
+        |b, obs| batch::transform_metrics_protobuf_observed(b, obs),
+    )
 }
 
 /// Transform OTLP metrics to JSON values.

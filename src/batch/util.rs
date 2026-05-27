@@ -167,10 +167,10 @@ pub(super) fn array<A: Array + 'static>(array: A) -> ArrayRef {
 
 #[inline]
 pub(super) fn record_batch(
-    schema: arrow_schema::Schema,
+    schema: Arc<arrow_schema::Schema>,
     arrays: Vec<ArrayRef>,
 ) -> Result<RecordBatch> {
-    Ok(RecordBatch::try_new(Arc::new(schema), arrays)?)
+    Ok(RecordBatch::try_new(schema, arrays)?)
 }
 
 #[inline]

@@ -5,12 +5,9 @@ use std::time::Instant;
 use arrow_array::RecordBatch;
 
 use crate::{
-    api::{batch_to_json_values, SchemaOutput, TracesOutput},
+    api::{auto::auto_dispatch, batch_to_json_values, SchemaOutput, TracesOutput},
     batch::{self, TransformObserver, TransformPhase, TransformSignal},
-    decode::{
-        decode_traces_json_request, decode_traces_jsonl_request, looks_like_json, DecodeError,
-        InputFormat,
-    },
+    decode::{decode_traces_json_request, decode_traces_jsonl_request, DecodeError, InputFormat},
     Error, Result,
 };
 
@@ -34,7 +31,8 @@ pub fn transform_traces_with_schema(
 ) -> Result<TracesOutput> {
     match schema_output {
         SchemaOutput::Normalized => transform_traces(bytes, format).map(TracesOutput::Normalized),
-        SchemaOutput::OtapStar => transform_traces_otap(bytes, format).map(TracesOutput::OtapStar),
+        SchemaOutput::OtapStar => transform_traces_otap(bytes, format)
+            .map(|batches| TracesOutput::OtapStar(Box::new(batches))),
     }
 }
 
@@ -84,28 +82,13 @@ fn transform_traces_otap(
 }
 
 fn transform_traces_otap_auto(bytes: &[u8]) -> Result<crate::api::OtapTracesBatches> {
-    if looks_like_json(bytes) {
-        match transform_traces_otap(bytes, InputFormat::Json) {
-            Ok(batch) => Ok(batch),
-            Err(json_err) => match transform_traces_otap(bytes, InputFormat::Jsonl) {
-                Ok(batch) => Ok(batch),
-                Err(_) => batch::transform_traces_protobuf_otap(bytes).map_err(|proto_err| {
-                    Error::Decode(DecodeError::Unsupported(format!(
-                        "json decode failed: {json_err}; protobuf fallback failed: {proto_err}"
-                    )))
-                }),
-            },
-        }
-    } else {
-        match batch::transform_traces_protobuf_otap(bytes) {
-            Ok(batch) => Ok(batch),
-            Err(proto_err) => transform_traces_otap(bytes, InputFormat::Json).map_err(|json_err| {
-                Error::Decode(DecodeError::Unsupported(format!(
-                    "protobuf decode failed: {proto_err}; json fallback failed: {json_err}"
-                )))
-            }),
-        }
-    }
+    auto_dispatch(
+        bytes,
+        &mut (),
+        |b, _| transform_traces_otap(b, InputFormat::Json),
+        |b, _| transform_traces_otap(b, InputFormat::Jsonl),
+        |b, _| batch::transform_traces_protobuf_otap(b),
+    )
 }
 
 fn transform_traces_json_arrow_observed(
@@ -145,66 +128,26 @@ fn transform_traces_json_arrow_observed(
 }
 
 fn transform_traces_auto(bytes: &[u8]) -> Result<RecordBatch> {
-    if looks_like_json(bytes) {
-        match transform_traces_json_arrow(bytes, InputFormat::Json) {
-            Ok(batch) => Ok(batch),
-            Err(json_err) => match transform_traces_json_arrow(bytes, InputFormat::Jsonl) {
-                Ok(batch) => Ok(batch),
-                Err(_) => batch::transform_traces_protobuf(bytes).map_err(|proto_err| {
-                    Error::Decode(DecodeError::Unsupported(format!(
-                        "json decode failed: {json_err}; protobuf fallback failed: {proto_err}"
-                    )))
-                }),
-            },
-        }
-    } else {
-        match batch::transform_traces_protobuf(bytes) {
-            Ok(batch) => Ok(batch),
-            Err(proto_err) => {
-                transform_traces_json_arrow(bytes, InputFormat::Json).map_err(|json_err| {
-                    Error::Decode(DecodeError::Unsupported(format!(
-                        "protobuf decode failed: {proto_err}; json fallback failed: {json_err}"
-                    )))
-                })
-            }
-        }
-    }
+    auto_dispatch(
+        bytes,
+        &mut (),
+        |b, _| transform_traces_json_arrow(b, InputFormat::Json),
+        |b, _| transform_traces_json_arrow(b, InputFormat::Jsonl),
+        |b, _| batch::transform_traces_protobuf(b),
+    )
 }
 
 fn transform_traces_auto_observed(
     bytes: &[u8],
     observer: &mut Option<&mut dyn TransformObserver>,
 ) -> Result<RecordBatch> {
-    if looks_like_json(bytes) {
-        match transform_traces_json_arrow_observed(bytes, InputFormat::Json, observer) {
-            Ok(batch) => Ok(batch),
-            Err(json_err) => {
-                match transform_traces_json_arrow_observed(bytes, InputFormat::Jsonl, observer) {
-                    Ok(batch) => Ok(batch),
-                    Err(_) => batch::transform_traces_protobuf_observed(bytes, observer).map_err(
-                        |proto_err| {
-                            Error::Decode(DecodeError::Unsupported(format!(
-                            "json decode failed: {json_err}; protobuf fallback failed: {proto_err}"
-                        )))
-                        },
-                    ),
-                }
-            }
-        }
-    } else {
-        match batch::transform_traces_protobuf_observed(bytes, observer) {
-            Ok(batch) => Ok(batch),
-            Err(proto_err) => {
-                transform_traces_json_arrow_observed(bytes, InputFormat::Json, observer).map_err(
-                    |json_err| {
-                        Error::Decode(DecodeError::Unsupported(format!(
-                            "protobuf decode failed: {proto_err}; json fallback failed: {json_err}"
-                        )))
-                    },
-                )
-            }
-        }
-    }
+    auto_dispatch(
+        bytes,
+        observer,
+        |b, obs| transform_traces_json_arrow_observed(b, InputFormat::Json, obs),
+        |b, obs| transform_traces_json_arrow_observed(b, InputFormat::Jsonl, obs),
+        |b, obs| batch::transform_traces_protobuf_observed(b, obs),
+    )
 }
 
 /// Transform OTLP traces to JSON values.

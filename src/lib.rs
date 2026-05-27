@@ -63,10 +63,12 @@ pub use error::{Error, Result};
 pub use output::to_parquet;
 pub use output::{to_ipc, to_json};
 pub use schema::{
-    exp_histogram_schema, gauge_schema, histogram_schema, logs_schema, otap_attrs_u16_schema,
-    otap_attrs_u32_schema, otap_exemplars_schema, otap_exp_histogram_data_points_schema,
-    otap_histogram_data_points_schema, otap_logs_schema, otap_metrics_schema,
-    otap_number_data_points_schema, otap_quantile_schema, otap_span_events_schema,
-    otap_span_links_schema, otap_spans_schema, otap_summary_data_points_schema, schema_def,
-    schema_defs, sum_schema, traces_schema, FieldType, SchemaDef, SchemaField,
+    exp_histogram_schema, gauge_schema, histogram_schema, logs_schema, schema_def, schema_defs,
+    sum_schema, traces_schema, FieldType, SchemaDef, SchemaField,
 };
+
+// OTAP star Arrow schemas are not re-exported at the crate root. They are
+// available via the corresponding `RecordBatch::schema()` on the tables inside
+// `OtapLogsBatches`, `OtapTracesBatches`, and `OtapMetricsBatches` — that is
+// the supported way to inspect OTAP types. Adding 13 free-standing schema
+// accessors doubled the public surface without adding capability.

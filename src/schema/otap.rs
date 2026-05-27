@@ -1,10 +1,18 @@
 //! OTAP star Arrow schema accessors.
+//!
+//! The `otap_*_schema()` functions are preserved for parity with the normalized
+//! schema accessors (and so external consumers can reintroduce them at the
+//! crate root if needed). Internal call sites use the `_arc` variants instead
+//! so the cached `Lazy<Arc<Schema>>` is shared by reference, eliminating the
+//! per-call `Schema::clone` + `Arc::new` pair from each `record_batch` build.
+
+use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use once_cell::sync::Lazy;
 
-static OTAP_LOGS_SCHEMA: Lazy<Schema> = Lazy::new(|| {
-    Schema::new(vec![
+static OTAP_LOGS_SCHEMA: Lazy<Arc<Schema>> = Lazy::new(|| {
+    Arc::new(Schema::new(vec![
         u16_field("id", false),
         u16_field("resource_id", true),
         utf8("resource_schema_url", true),
@@ -30,11 +38,11 @@ static OTAP_LOGS_SCHEMA: Lazy<Schema> = Lazy::new(|| {
         binary("body_ser", true),
         u32_field("dropped_attributes_count", true),
         u32_field("flags", true),
-    ])
+    ]))
 });
 
-static OTAP_SPANS_SCHEMA: Lazy<Schema> = Lazy::new(|| {
-    Schema::new(vec![
+static OTAP_SPANS_SCHEMA: Lazy<Arc<Schema>> = Lazy::new(|| {
+    Arc::new(Schema::new(vec![
         u16_field("id", false),
         u16_field("resource_id", true),
         utf8("resource_schema_url", true),
@@ -58,11 +66,11 @@ static OTAP_SPANS_SCHEMA: Lazy<Schema> = Lazy::new(|| {
         i32_field("status_code", true),
         utf8("status_status_message", true),
         u32_field("flags", true),
-    ])
+    ]))
 });
 
-static OTAP_METRICS_SCHEMA: Lazy<Schema> = Lazy::new(|| {
-    Schema::new(vec![
+static OTAP_METRICS_SCHEMA: Lazy<Arc<Schema>> = Lazy::new(|| {
+    Arc::new(Schema::new(vec![
         u16_field("id", false),
         u16_field("resource_id", true),
         utf8("resource_schema_url", true),
@@ -78,14 +86,16 @@ static OTAP_METRICS_SCHEMA: Lazy<Schema> = Lazy::new(|| {
         utf8("unit", true),
         i32_field("aggregation_temporality", true),
         bool_field("is_monotonic", true),
-    ])
+    ]))
 });
 
-static OTAP_ATTRS_U16_SCHEMA: Lazy<Schema> = Lazy::new(|| attrs_schema(DataType::UInt16));
-static OTAP_ATTRS_U32_SCHEMA: Lazy<Schema> = Lazy::new(|| attrs_schema(DataType::UInt32));
+static OTAP_ATTRS_U16_SCHEMA: Lazy<Arc<Schema>> =
+    Lazy::new(|| Arc::new(attrs_schema(DataType::UInt16)));
+static OTAP_ATTRS_U32_SCHEMA: Lazy<Arc<Schema>> =
+    Lazy::new(|| Arc::new(attrs_schema(DataType::UInt32)));
 
-static OTAP_NUMBER_DPS_SCHEMA: Lazy<Schema> = Lazy::new(|| {
-    Schema::new(vec![
+static OTAP_NUMBER_DPS_SCHEMA: Lazy<Arc<Schema>> = Lazy::new(|| {
+    Arc::new(Schema::new(vec![
         u32_field("id", false),
         u16_field("parent_id", false),
         ts_ns("start_time_unix_nano", true),
@@ -93,11 +103,11 @@ static OTAP_NUMBER_DPS_SCHEMA: Lazy<Schema> = Lazy::new(|| {
         i64_field("int_value", true),
         f64_field("double_value", true),
         u32_field("flags", true),
-    ])
+    ]))
 });
 
-static OTAP_EXEMPLARS_SCHEMA: Lazy<Schema> = Lazy::new(|| {
-    Schema::new(vec![
+static OTAP_EXEMPLARS_SCHEMA: Lazy<Arc<Schema>> = Lazy::new(|| {
+    Arc::new(Schema::new(vec![
         u32_field("id", false),
         u32_field("parent_id", false),
         ts_ns("time_unix_nano", false),
@@ -105,32 +115,34 @@ static OTAP_EXEMPLARS_SCHEMA: Lazy<Schema> = Lazy::new(|| {
         f64_field("double_value", true),
         fixed("span_id", 8, true),
         fixed("trace_id", 16, true),
-    ])
+    ]))
 });
 
-static OTAP_SUMMARY_DPS_SCHEMA: Lazy<Schema> = Lazy::new(|| {
-    Schema::new(vec![
+// Quantile values live in the separate `quantile` child table (see B3 in the
+// review notes). Keeping a single representation avoids forcing consumers to
+// dedupe between an embedded list and the relational table.
+static OTAP_SUMMARY_DPS_SCHEMA: Lazy<Arc<Schema>> = Lazy::new(|| {
+    Arc::new(Schema::new(vec![
         u32_field("id", false),
         u16_field("parent_id", false),
         ts_ns("start_time_unix_nano", true),
         ts_ns("time_unix_nano", false),
         u64_field("count", true),
         f64_field("sum", true),
-        quantile_list("quantile", true),
         u32_field("flags", true),
-    ])
+    ]))
 });
 
-static OTAP_QUANTILE_SCHEMA: Lazy<Schema> = Lazy::new(|| {
-    Schema::new(vec![
+static OTAP_QUANTILE_SCHEMA: Lazy<Arc<Schema>> = Lazy::new(|| {
+    Arc::new(Schema::new(vec![
         u32_field("parent_id", false),
         f64_field("quantile", true),
         f64_field("value", true),
-    ])
+    ]))
 });
 
-static OTAP_HISTOGRAM_DPS_SCHEMA: Lazy<Schema> = Lazy::new(|| {
-    Schema::new(vec![
+static OTAP_HISTOGRAM_DPS_SCHEMA: Lazy<Arc<Schema>> = Lazy::new(|| {
+    Arc::new(Schema::new(vec![
         u32_field("id", false),
         u16_field("parent_id", false),
         ts_ns("start_time_unix_nano", true),
@@ -142,11 +154,11 @@ static OTAP_HISTOGRAM_DPS_SCHEMA: Lazy<Schema> = Lazy::new(|| {
         u32_field("flags", true),
         f64_field("min", true),
         f64_field("max", true),
-    ])
+    ]))
 });
 
-static OTAP_EXP_HISTOGRAM_DPS_SCHEMA: Lazy<Schema> = Lazy::new(|| {
-    Schema::new(vec![
+static OTAP_EXP_HISTOGRAM_DPS_SCHEMA: Lazy<Arc<Schema>> = Lazy::new(|| {
+    Arc::new(Schema::new(vec![
         u32_field("id", false),
         u16_field("parent_id", false),
         ts_ns("start_time_unix_nano", true),
@@ -163,21 +175,21 @@ static OTAP_EXP_HISTOGRAM_DPS_SCHEMA: Lazy<Schema> = Lazy::new(|| {
         f64_field("min", true),
         f64_field("max", true),
         f64_field("zero_threshold", true),
-    ])
+    ]))
 });
 
-static OTAP_SPAN_EVENTS_SCHEMA: Lazy<Schema> = Lazy::new(|| {
-    Schema::new(vec![
+static OTAP_SPAN_EVENTS_SCHEMA: Lazy<Arc<Schema>> = Lazy::new(|| {
+    Arc::new(Schema::new(vec![
         u32_field("id", false),
         u16_field("parent_id", false),
         ts_ns("time_unix_nano", true),
         utf8("name", false),
         u32_field("dropped_attributes_count", true),
-    ])
+    ]))
 });
 
-static OTAP_SPAN_LINKS_SCHEMA: Lazy<Schema> = Lazy::new(|| {
-    Schema::new(vec![
+static OTAP_SPAN_LINKS_SCHEMA: Lazy<Arc<Schema>> = Lazy::new(|| {
+    Arc::new(Schema::new(vec![
         u32_field("id", false),
         u16_field("parent_id", false),
         fixed("trace_id", 16, false),
@@ -185,59 +197,124 @@ static OTAP_SPAN_LINKS_SCHEMA: Lazy<Schema> = Lazy::new(|| {
         utf8("trace_state", true),
         u32_field("dropped_attributes_count", true),
         u32_field("flags", true),
-    ])
+    ]))
 });
 
+#[allow(dead_code)]
 pub fn otap_logs_schema() -> Schema {
-    OTAP_LOGS_SCHEMA.clone()
+    (**OTAP_LOGS_SCHEMA).clone()
 }
 
+#[allow(dead_code)]
 pub fn otap_spans_schema() -> Schema {
-    OTAP_SPANS_SCHEMA.clone()
+    (**OTAP_SPANS_SCHEMA).clone()
 }
 
+#[allow(dead_code)]
 pub fn otap_metrics_schema() -> Schema {
-    OTAP_METRICS_SCHEMA.clone()
+    (**OTAP_METRICS_SCHEMA).clone()
 }
 
+#[allow(dead_code)]
 pub fn otap_attrs_u16_schema() -> Schema {
-    OTAP_ATTRS_U16_SCHEMA.clone()
+    (**OTAP_ATTRS_U16_SCHEMA).clone()
 }
 
+#[allow(dead_code)]
 pub fn otap_attrs_u32_schema() -> Schema {
-    OTAP_ATTRS_U32_SCHEMA.clone()
+    (**OTAP_ATTRS_U32_SCHEMA).clone()
 }
 
+#[allow(dead_code)]
 pub fn otap_number_data_points_schema() -> Schema {
-    OTAP_NUMBER_DPS_SCHEMA.clone()
+    (**OTAP_NUMBER_DPS_SCHEMA).clone()
 }
 
+#[allow(dead_code)]
 pub fn otap_exemplars_schema() -> Schema {
-    OTAP_EXEMPLARS_SCHEMA.clone()
+    (**OTAP_EXEMPLARS_SCHEMA).clone()
 }
 
+#[allow(dead_code)]
 pub fn otap_summary_data_points_schema() -> Schema {
-    OTAP_SUMMARY_DPS_SCHEMA.clone()
+    (**OTAP_SUMMARY_DPS_SCHEMA).clone()
 }
 
+#[allow(dead_code)]
 pub fn otap_quantile_schema() -> Schema {
-    OTAP_QUANTILE_SCHEMA.clone()
+    (**OTAP_QUANTILE_SCHEMA).clone()
 }
 
+#[allow(dead_code)]
 pub fn otap_histogram_data_points_schema() -> Schema {
-    OTAP_HISTOGRAM_DPS_SCHEMA.clone()
+    (**OTAP_HISTOGRAM_DPS_SCHEMA).clone()
 }
 
+#[allow(dead_code)]
 pub fn otap_exp_histogram_data_points_schema() -> Schema {
-    OTAP_EXP_HISTOGRAM_DPS_SCHEMA.clone()
+    (**OTAP_EXP_HISTOGRAM_DPS_SCHEMA).clone()
 }
 
+#[allow(dead_code)]
 pub fn otap_span_events_schema() -> Schema {
-    OTAP_SPAN_EVENTS_SCHEMA.clone()
+    (**OTAP_SPAN_EVENTS_SCHEMA).clone()
 }
 
+#[allow(dead_code)]
 pub fn otap_span_links_schema() -> Schema {
-    OTAP_SPAN_LINKS_SCHEMA.clone()
+    (**OTAP_SPAN_LINKS_SCHEMA).clone()
+}
+
+pub(crate) fn otap_logs_schema_arc() -> Arc<Schema> {
+    Arc::clone(&OTAP_LOGS_SCHEMA)
+}
+
+pub(crate) fn otap_spans_schema_arc() -> Arc<Schema> {
+    Arc::clone(&OTAP_SPANS_SCHEMA)
+}
+
+pub(crate) fn otap_metrics_schema_arc() -> Arc<Schema> {
+    Arc::clone(&OTAP_METRICS_SCHEMA)
+}
+
+pub(crate) fn otap_attrs_u16_schema_arc() -> Arc<Schema> {
+    Arc::clone(&OTAP_ATTRS_U16_SCHEMA)
+}
+
+pub(crate) fn otap_attrs_u32_schema_arc() -> Arc<Schema> {
+    Arc::clone(&OTAP_ATTRS_U32_SCHEMA)
+}
+
+pub(crate) fn otap_number_data_points_schema_arc() -> Arc<Schema> {
+    Arc::clone(&OTAP_NUMBER_DPS_SCHEMA)
+}
+
+pub(crate) fn otap_exemplars_schema_arc() -> Arc<Schema> {
+    Arc::clone(&OTAP_EXEMPLARS_SCHEMA)
+}
+
+pub(crate) fn otap_summary_data_points_schema_arc() -> Arc<Schema> {
+    Arc::clone(&OTAP_SUMMARY_DPS_SCHEMA)
+}
+
+pub(crate) fn otap_quantile_schema_arc() -> Arc<Schema> {
+    Arc::clone(&OTAP_QUANTILE_SCHEMA)
+}
+
+pub(crate) fn otap_histogram_data_points_schema_arc() -> Arc<Schema> {
+    Arc::clone(&OTAP_HISTOGRAM_DPS_SCHEMA)
+}
+
+pub(crate) fn otap_exp_histogram_data_points_schema_arc() -> Arc<Schema> {
+    Arc::clone(&OTAP_EXP_HISTOGRAM_DPS_SCHEMA)
+}
+
+pub(crate) fn otap_span_events_schema_arc() -> Arc<Schema> {
+    Arc::clone(&OTAP_SPAN_EVENTS_SCHEMA)
+}
+
+pub(crate) fn otap_span_links_schema_arc() -> Arc<Schema> {
+    Arc::clone(&OTAP_SPAN_LINKS_SCHEMA)
 }
 
 fn attrs_schema(parent_type: DataType) -> Schema {
@@ -324,19 +401,4 @@ fn f64_list(name: &str, nullable: bool) -> Field {
         DataType::List(Field::new("item", DataType::Float64, true).into()),
         nullable,
     )
-}
-
-fn quantile_list(name: &str, nullable: bool) -> Field {
-    let item = Field::new(
-        "item",
-        DataType::Struct(
-            vec![
-                Field::new("quantile", DataType::Float64, true),
-                Field::new("value", DataType::Float64, true),
-            ]
-            .into(),
-        ),
-        true,
-    );
-    Field::new(name, DataType::List(item.into()), nullable)
 }

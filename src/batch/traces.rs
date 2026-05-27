@@ -15,7 +15,7 @@ use opentelemetry_proto::tonic::{
 };
 use prost::Message;
 
-use crate::{schema::traces_schema, Result};
+use crate::{schema::traces_schema_arc, Result};
 
 use super::{
     context::{ContextDuplicateTracker, ResourceContext, ScopeContext},
@@ -473,7 +473,7 @@ impl TraceBuilders {
 
     fn finish(mut self) -> Result<RecordBatch> {
         record_batch(
-            traces_schema(),
+            traces_schema_arc(),
             vec![
                 array(self.start_time_unix_nano.finish()),
                 array(self.duration_time_unix_nano.finish()),

@@ -15,7 +15,7 @@ use opentelemetry_proto::tonic::{
 };
 use prost::Message;
 
-use crate::{schema::logs_schema, Result};
+use crate::{schema::logs_schema_arc, Result};
 
 use super::{
     context::{ContextDuplicateTracker, ResourceContext, ScopeContext},
@@ -433,7 +433,7 @@ impl LogBuilders {
 
     fn finish(mut self) -> Result<RecordBatch> {
         record_batch(
-            logs_schema(),
+            logs_schema_arc(),
             vec![
                 array(self.time_unix_nano.finish()),
                 array(self.observed_time_unix_nano.finish()),
