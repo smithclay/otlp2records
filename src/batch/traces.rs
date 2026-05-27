@@ -1,7 +1,5 @@
 //! Trace request-to-RecordBatch conversion.
 
-use std::time::Instant;
-
 use arrow_array::{
     builder::{
         DurationNanosecondBuilder, FixedSizeBinaryBuilder, Int32Builder, StringBuilder,
@@ -21,8 +19,8 @@ use super::{
     context::{ContextDuplicateTracker, ResourceContext, ScopeContext},
     json::{append_attrs_json, append_span_events_json, append_span_links_json},
     profile::{
-        measure_phase, measure_result, observe_counter, observe_phase, TransformCounter,
-        TransformObserver, TransformPhase, TransformSignal,
+        finish_phase, measure_phase, measure_result, observe_counter, phase_start,
+        TransformCounter, TransformObserver, TransformPhase, TransformSignal,
     },
     util::{
         append_empty_as_null, append_fixed_or_null, append_fixed_required, append_opt_n,
@@ -214,21 +212,6 @@ fn append_span_observed(
         phase_start,
     );
     Ok(())
-}
-
-fn phase_start(observer: &Option<&mut dyn TransformObserver>) -> Option<Instant> {
-    observer.is_some().then(Instant::now)
-}
-
-fn finish_phase(
-    observer: &mut Option<&mut dyn TransformObserver>,
-    signal: TransformSignal,
-    phase: TransformPhase,
-    start: Option<Instant>,
-) {
-    if let Some(start) = start {
-        observe_phase(observer, signal, phase, start.elapsed());
-    }
 }
 
 struct TraceBuilders {

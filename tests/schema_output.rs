@@ -21,9 +21,12 @@ use opentelemetry_proto::tonic::{
     trace::v1::{span, ResourceSpans, ScopeSpans, Span, Status},
 };
 use otlp2records::{
-    transform_logs, transform_logs_with_schema, transform_metrics, transform_metrics_with_schema,
-    transform_traces, transform_traces_with_schema, InputFormat, LogsOutput, MetricsOutput,
-    SchemaOutput, TracesOutput,
+    transform_logs, transform_logs_with_schema, transform_logs_with_schema_and_observer,
+    transform_metrics, transform_metrics_with_schema, transform_metrics_with_schema_and_observer,
+    transform_traces, transform_traces_with_schema, transform_traces_with_schema_and_observer,
+    InputFormat, LogsOutput, MetricsOutput, SchemaOutput, TracesOutput, TransformCounter,
+    TransformCounterValue, TransformObserver, TransformPhase, TransformPhaseTiming,
+    TransformSignal,
 };
 use prost::Message;
 
@@ -394,6 +397,217 @@ fn otap_metrics_skip_nan_inf_and_missing_values_and_bump_counters() {
     // Only the one valid point makes it into the child tables.
     assert_eq!(batches.number_data_points.num_rows(), 1);
     assert_eq!(batches.number_dp_attrs.num_rows(), 1);
+}
+
+/// Captures phase timings and counters for assertion in observer tests.
+#[derive(Default)]
+struct CaptureObserver {
+    phases: Vec<(TransformSignal, TransformPhase)>,
+    counters: Vec<(TransformSignal, TransformCounter, u64)>,
+}
+
+impl TransformObserver for CaptureObserver {
+    fn on_phase(&mut self, t: TransformPhaseTiming) {
+        self.phases.push((t.signal, t.phase));
+    }
+    fn on_counter(&mut self, c: TransformCounterValue) {
+        self.counters.push((c.signal, c.counter, c.value));
+    }
+}
+
+impl CaptureObserver {
+    fn phase_count(&self, signal: TransformSignal, phase: TransformPhase) -> usize {
+        self.phases
+            .iter()
+            .filter(|(s, p)| *s == signal && *p == phase)
+            .count()
+    }
+    fn counter_sum(&self, signal: TransformSignal, counter: TransformCounter) -> u64 {
+        self.counters
+            .iter()
+            .filter(|(s, c, _)| *s == signal && *c == counter)
+            .map(|(_, _, v)| *v)
+            .sum()
+    }
+}
+
+#[test]
+fn otap_logs_observer_reports_phases_dedup_and_output_rows() {
+    // Two resource_logs with identical resource attrs (one dedup hit), each
+    // with one scope and one record. Verifies the observer sees:
+    //  - ProtobufDecode + BuilderInit + ArrowFinalize once
+    //  - ResourceLogsBuild twice, ScopeLogsBuild twice, LogRecordBuild twice
+    //  - ResourceContextDuplicateMiss=1 + Hit=1
+    //  - ScopeContextDuplicateMiss=2 (each scope is a fresh tuple even though
+    //    name/version match — schema_url and the (resource, scope) pair are
+    //    keyed independently per scope; both scopes share the same fingerprint
+    //    so we actually get Miss=1 + Hit=1)
+    //  - OutputRows = 2
+    let resource = Resource {
+        attributes: vec![attr("service.name", "svc")],
+        dropped_attributes_count: 0,
+        ..Default::default()
+    };
+    let scope = InstrumentationScope {
+        name: "scope".to_string(),
+        version: "1".to_string(),
+        attributes: vec![],
+        dropped_attributes_count: 0,
+    };
+    let record = |body: &str| LogRecord {
+        time_unix_nano: 1_700_000_000_000_000_000,
+        observed_time_unix_nano: 1_700_000_000_000_000_100,
+        trace_id: bytes16(),
+        span_id: bytes8(),
+        severity_number: 9,
+        severity_text: "INFO".to_string(),
+        body: Some(AnyValue {
+            value: Some(any_value::Value::StringValue(body.to_string())),
+        }),
+        attributes: vec![],
+        dropped_attributes_count: 0,
+        flags: 0,
+        event_name: String::new(),
+    };
+    let request = ExportLogsServiceRequest {
+        resource_logs: vec![
+            ResourceLogs {
+                resource: Some(resource.clone()),
+                scope_logs: vec![ScopeLogs {
+                    scope: Some(scope.clone()),
+                    log_records: vec![record("a")],
+                    schema_url: "scope-schema".to_string(),
+                }],
+                schema_url: "resource-schema".to_string(),
+            },
+            ResourceLogs {
+                resource: Some(resource),
+                scope_logs: vec![ScopeLogs {
+                    scope: Some(scope),
+                    log_records: vec![record("b")],
+                    schema_url: "scope-schema".to_string(),
+                }],
+                schema_url: "resource-schema".to_string(),
+            },
+        ],
+    };
+
+    let mut obs = CaptureObserver::default();
+    let bytes = request.encode_to_vec();
+    let LogsOutput::OtapStar(_) = transform_logs_with_schema_and_observer(
+        &bytes,
+        InputFormat::Protobuf,
+        SchemaOutput::OtapStar,
+        &mut obs,
+    )
+    .unwrap() else {
+        panic!("expected otap-star logs");
+    };
+
+    use TransformPhase::*;
+    let s = TransformSignal::Logs;
+    assert_eq!(obs.phase_count(s, ProtobufDecode), 1);
+    assert_eq!(obs.phase_count(s, BuilderInit), 1);
+    assert_eq!(obs.phase_count(s, ResourceLogsBuild), 2);
+    assert_eq!(obs.phase_count(s, ScopeLogsBuild), 2);
+    assert_eq!(obs.phase_count(s, LogRecordBuild), 2);
+    assert_eq!(obs.phase_count(s, ArrowFinalize), 1);
+
+    use TransformCounter::*;
+    assert_eq!(obs.counter_sum(s, ResourceContextDuplicateMiss), 1);
+    assert_eq!(obs.counter_sum(s, ResourceContextDuplicateHit), 1);
+    assert_eq!(obs.counter_sum(s, ScopeContextDuplicateMiss), 1);
+    assert_eq!(obs.counter_sum(s, ScopeContextDuplicateHit), 1);
+    assert_eq!(obs.counter_sum(s, OutputRows), 2);
+}
+
+#[test]
+fn otap_observer_without_observer_argument_emits_nothing() {
+    // Sanity: the non-observer code path must not call Instant::now() in a
+    // way that would emit phases. Achieved by passing through to the existing
+    // transform_*_with_schema. Just verify it runs and yields a batch.
+    let bytes = log_request().encode_to_vec();
+    let LogsOutput::OtapStar(batches) =
+        transform_logs_with_schema(&bytes, InputFormat::Protobuf, SchemaOutput::OtapStar).unwrap()
+    else {
+        panic!("expected otap-star logs");
+    };
+    assert_eq!(batches.logs.num_rows(), 1);
+}
+
+#[test]
+fn otap_traces_observer_reports_span_build_and_dedup() {
+    let bytes = trace_request().encode_to_vec();
+    let mut obs = CaptureObserver::default();
+    let TracesOutput::OtapStar(_) = transform_traces_with_schema_and_observer(
+        &bytes,
+        InputFormat::Protobuf,
+        SchemaOutput::OtapStar,
+        &mut obs,
+    )
+    .unwrap() else {
+        panic!("expected otap-star traces");
+    };
+    use TransformPhase::*;
+    let s = TransformSignal::Traces;
+    assert_eq!(obs.phase_count(s, ProtobufDecode), 1);
+    assert_eq!(obs.phase_count(s, ResourceSpansBuild), 1);
+    assert_eq!(obs.phase_count(s, ScopeSpansBuild), 1);
+    assert_eq!(obs.phase_count(s, SpanBuild), 1);
+    assert_eq!(obs.phase_count(s, ArrowFinalize), 1);
+    assert_eq!(obs.counter_sum(s, TransformCounter::OutputRows), 1);
+}
+
+#[test]
+fn otap_metrics_observer_reports_metric_build_phases() {
+    let bytes = metrics_request().encode_to_vec();
+    let mut obs = CaptureObserver::default();
+    let MetricsOutput::OtapStar(_) = transform_metrics_with_schema_and_observer(
+        &bytes,
+        InputFormat::Protobuf,
+        SchemaOutput::OtapStar,
+        &mut obs,
+    )
+    .unwrap() else {
+        panic!("expected otap-star metrics");
+    };
+    use TransformPhase::*;
+    let s = TransformSignal::Metrics;
+    assert_eq!(obs.phase_count(s, ProtobufDecode), 1);
+    assert_eq!(obs.phase_count(s, ResourceMetricsBuild), 1);
+    assert_eq!(obs.phase_count(s, ScopeMetricsBuild), 1);
+    // metrics_request() builds 5 Metric entries (gauge, sum, histogram,
+    // exp_histogram, summary), so MetricBuild fires 5×.
+    assert_eq!(obs.phase_count(s, MetricBuild), 5);
+    assert_eq!(obs.phase_count(s, ArrowFinalize), 1);
+    assert_eq!(obs.counter_sum(s, TransformCounter::OutputRows), 5);
+}
+
+#[test]
+fn otap_logs_auto_dispatch_handles_both_json_and_protobuf() {
+    // S19: exercise the auto_dispatch fallback chain for the OTAP path. The
+    // existing `json_and_protobuf_inputs_have_same_otap_schema` test uses
+    // explicit InputFormat::Json / Protobuf; this one uses InputFormat::Auto
+    // to verify the dispatch picks the right branch for either payload.
+    let json_bytes: &[u8] = include_bytes!("fixtures/sample_otlp.json");
+    let proto_bytes = log_request().encode_to_vec();
+
+    let LogsOutput::OtapStar(json_batches) =
+        transform_logs_with_schema(json_bytes, InputFormat::Auto, SchemaOutput::OtapStar).unwrap()
+    else {
+        panic!("expected otap-star logs from JSON via Auto");
+    };
+    let LogsOutput::OtapStar(proto_batches) =
+        transform_logs_with_schema(&proto_bytes, InputFormat::Auto, SchemaOutput::OtapStar)
+            .unwrap()
+    else {
+        panic!("expected otap-star logs from protobuf via Auto");
+    };
+
+    assert!(json_batches.logs.num_rows() > 0);
+    assert_eq!(proto_batches.logs.num_rows(), 1);
+    // Both Auto paths must produce identical schemas (one canonical layout).
+    assert_eq!(json_batches.logs.schema(), proto_batches.logs.schema());
 }
 
 #[test]

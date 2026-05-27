@@ -3,6 +3,7 @@
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
+use std::time::Instant;
 
 use arrow_array::{
     builder::{
@@ -40,6 +41,10 @@ use crate::{
 };
 
 use super::context::hash_attrs;
+use super::profile::{
+    finish_phase, observe_counter, observe_phase, phase_start, TransformCounter, TransformObserver,
+    TransformPhase, TransformSignal,
+};
 use super::util::{
     append_f64_list, append_finite_opt, append_fixed_or_null, append_fixed_required,
     append_opt_ts_ns, append_required_ts_ns, append_u64_list, array, record_batch, u64_to_i64,
@@ -61,9 +66,20 @@ const METRIC_EXP_HISTOGRAM: u8 = 4;
 const METRIC_SUMMARY: u8 = 5;
 
 pub fn transform_logs_request_otap(request: ExportLogsServiceRequest) -> Result<OtapLogsBatches> {
+    transform_logs_request_otap_observed(request, &mut None)
+}
+
+pub fn transform_logs_request_otap_observed(
+    request: ExportLogsServiceRequest,
+    observer: &mut Option<&mut dyn TransformObserver>,
+) -> Result<OtapLogsBatches> {
+    let signal = TransformSignal::Logs;
+    let init_start = phase_start(observer);
     let mut builders = LogsBuilders::default();
+    finish_phase(observer, signal, TransformPhase::BuilderInit, init_start);
 
     for resource_logs in request.resource_logs {
+        let res_start = phase_start(observer);
         let resource_attrs = resource_logs
             .resource
             .as_ref()
@@ -76,6 +92,7 @@ pub fn transform_logs_request_otap(request: ExportLogsServiceRequest) -> Result<
             .map(|r| r.dropped_attributes_count);
         let (resource_id, resource_is_new) =
             builders.resource_id(resource_attrs, resource_schema_url, resource_dropped)?;
+        observe_dedup(observer, signal, DedupKind::Resource, resource_is_new);
         if resource_is_new {
             builders
                 .resource_attrs
@@ -83,6 +100,7 @@ pub fn transform_logs_request_otap(request: ExportLogsServiceRequest) -> Result<
         }
 
         for scope_logs in resource_logs.scope_logs {
+            let scope_start = phase_start(observer);
             let scope = scope_logs.scope.as_ref();
             let scope_attrs = scope.map(|s| s.attributes.as_slice()).unwrap_or(&[]);
             let scope_name = scope.and_then(|s| empty_to_none(&s.name));
@@ -96,11 +114,13 @@ pub fn transform_logs_request_otap(request: ExportLogsServiceRequest) -> Result<
                 schema_url,
                 scope_dropped,
             )?;
+            observe_dedup(observer, signal, DedupKind::Scope, scope_is_new);
             if scope_is_new {
                 builders.scope_attrs.append_attrs(scope_id, scope_attrs)?;
             }
 
             for record in scope_logs.log_records {
+                let rec_start = phase_start(observer);
                 let id = builders.next_log_id()?;
                 builders.logs.append(
                     id,
@@ -115,23 +135,76 @@ pub fn transform_logs_request_otap(request: ExportLogsServiceRequest) -> Result<
                     &record,
                 )?;
                 builders.log_attrs.append_attrs(id, &record.attributes)?;
+                finish_phase(observer, signal, TransformPhase::LogRecordBuild, rec_start);
             }
+            finish_phase(
+                observer,
+                signal,
+                TransformPhase::ScopeLogsBuild,
+                scope_start,
+            );
         }
+        finish_phase(
+            observer,
+            signal,
+            TransformPhase::ResourceLogsBuild,
+            res_start,
+        );
     }
 
-    builders.finish()
+    let finalize_start = phase_start(observer);
+    let batches = builders.finish()?;
+    finish_phase(
+        observer,
+        signal,
+        TransformPhase::ArrowFinalize,
+        finalize_start,
+    );
+    observe_counter(
+        observer,
+        signal,
+        TransformCounter::OutputRows,
+        batches.logs.num_rows() as u64,
+    );
+    Ok(batches)
 }
 
 pub fn transform_logs_protobuf_otap(bytes: &[u8]) -> Result<OtapLogsBatches> {
-    transform_logs_request_otap(ExportLogsServiceRequest::decode(bytes)?)
+    transform_logs_protobuf_otap_observed(bytes, &mut None)
+}
+
+pub fn transform_logs_protobuf_otap_observed(
+    bytes: &[u8],
+    observer: &mut Option<&mut dyn TransformObserver>,
+) -> Result<OtapLogsBatches> {
+    let start = Instant::now();
+    let request = ExportLogsServiceRequest::decode(bytes)?;
+    observe_phase(
+        observer,
+        TransformSignal::Logs,
+        TransformPhase::ProtobufDecode,
+        start.elapsed(),
+    );
+    transform_logs_request_otap_observed(request, observer)
 }
 
 pub fn transform_traces_request_otap(
     request: ExportTraceServiceRequest,
 ) -> Result<OtapTracesBatches> {
+    transform_traces_request_otap_observed(request, &mut None)
+}
+
+pub fn transform_traces_request_otap_observed(
+    request: ExportTraceServiceRequest,
+    observer: &mut Option<&mut dyn TransformObserver>,
+) -> Result<OtapTracesBatches> {
+    let signal = TransformSignal::Traces;
+    let init_start = phase_start(observer);
     let mut builders = TracesBuilders::default();
+    finish_phase(observer, signal, TransformPhase::BuilderInit, init_start);
 
     for resource_spans in request.resource_spans {
+        let res_start = phase_start(observer);
         let resource_attrs = resource_spans
             .resource
             .as_ref()
@@ -144,6 +217,7 @@ pub fn transform_traces_request_otap(
             .map(|r| r.dropped_attributes_count);
         let (resource_id, resource_is_new) =
             builders.resource_id(resource_attrs, resource_schema_url, resource_dropped)?;
+        observe_dedup(observer, signal, DedupKind::Resource, resource_is_new);
         if resource_is_new {
             builders
                 .resource_attrs
@@ -151,6 +225,7 @@ pub fn transform_traces_request_otap(
         }
 
         for scope_spans in resource_spans.scope_spans {
+            let scope_start = phase_start(observer);
             let scope = scope_spans.scope.as_ref();
             let scope_attrs = scope.map(|s| s.attributes.as_slice()).unwrap_or(&[]);
             let scope_name = scope.and_then(|s| empty_to_none(&s.name));
@@ -164,11 +239,13 @@ pub fn transform_traces_request_otap(
                 schema_url,
                 scope_dropped,
             )?;
+            observe_dedup(observer, signal, DedupKind::Scope, scope_is_new);
             if scope_is_new {
                 builders.scope_attrs.append_attrs(scope_id, scope_attrs)?;
             }
 
             for span in scope_spans.spans {
+                let span_start = phase_start(observer);
                 let id = builders.next_span_id()?;
                 builders.spans.append(
                     id,
@@ -198,23 +275,76 @@ pub fn transform_traces_request_otap(
                         .span_link_attrs
                         .append_attrs(link_id, &link.attributes)?;
                 }
+                finish_phase(observer, signal, TransformPhase::SpanBuild, span_start);
             }
+            finish_phase(
+                observer,
+                signal,
+                TransformPhase::ScopeSpansBuild,
+                scope_start,
+            );
         }
+        finish_phase(
+            observer,
+            signal,
+            TransformPhase::ResourceSpansBuild,
+            res_start,
+        );
     }
 
-    builders.finish()
+    let finalize_start = phase_start(observer);
+    let batches = builders.finish()?;
+    finish_phase(
+        observer,
+        signal,
+        TransformPhase::ArrowFinalize,
+        finalize_start,
+    );
+    observe_counter(
+        observer,
+        signal,
+        TransformCounter::OutputRows,
+        batches.spans.num_rows() as u64,
+    );
+    Ok(batches)
 }
 
 pub fn transform_traces_protobuf_otap(bytes: &[u8]) -> Result<OtapTracesBatches> {
-    transform_traces_request_otap(ExportTraceServiceRequest::decode(bytes)?)
+    transform_traces_protobuf_otap_observed(bytes, &mut None)
+}
+
+pub fn transform_traces_protobuf_otap_observed(
+    bytes: &[u8],
+    observer: &mut Option<&mut dyn TransformObserver>,
+) -> Result<OtapTracesBatches> {
+    let start = Instant::now();
+    let request = ExportTraceServiceRequest::decode(bytes)?;
+    observe_phase(
+        observer,
+        TransformSignal::Traces,
+        TransformPhase::ProtobufDecode,
+        start.elapsed(),
+    );
+    transform_traces_request_otap_observed(request, observer)
 }
 
 pub fn transform_metrics_request_otap(
     request: ExportMetricsServiceRequest,
 ) -> Result<OtapMetricsBatches> {
+    transform_metrics_request_otap_observed(request, &mut None)
+}
+
+pub fn transform_metrics_request_otap_observed(
+    request: ExportMetricsServiceRequest,
+    observer: &mut Option<&mut dyn TransformObserver>,
+) -> Result<OtapMetricsBatches> {
+    let signal = TransformSignal::Metrics;
+    let init_start = phase_start(observer);
     let mut builders = MetricsBuilders::default();
+    finish_phase(observer, signal, TransformPhase::BuilderInit, init_start);
 
     for resource_metrics in request.resource_metrics {
+        let res_start = phase_start(observer);
         let resource_attrs = resource_metrics
             .resource
             .as_ref()
@@ -227,6 +357,7 @@ pub fn transform_metrics_request_otap(
             .map(|r| r.dropped_attributes_count);
         let (resource_id, resource_is_new) =
             builders.resource_id(resource_attrs, resource_schema_url, resource_dropped)?;
+        observe_dedup(observer, signal, DedupKind::Resource, resource_is_new);
         if resource_is_new {
             builders
                 .resource_attrs
@@ -234,6 +365,7 @@ pub fn transform_metrics_request_otap(
         }
 
         for scope_metrics in resource_metrics.scope_metrics {
+            let scope_start = phase_start(observer);
             let scope = scope_metrics.scope.as_ref();
             let scope_attrs = scope.map(|s| s.attributes.as_slice()).unwrap_or(&[]);
             let scope_name = scope.and_then(|s| empty_to_none(&s.name));
@@ -247,11 +379,13 @@ pub fn transform_metrics_request_otap(
                 schema_url,
                 scope_dropped,
             )?;
+            observe_dedup(observer, signal, DedupKind::Scope, scope_is_new);
             if scope_is_new {
                 builders.scope_attrs.append_attrs(scope_id, scope_attrs)?;
             }
 
             for metric in scope_metrics.metrics {
+                let metric_start = phase_start(observer);
                 // OTLP allows a Metric to carry no data variant. We skip the
                 // row entirely rather than emit one with metric_type=0 (which
                 // is not a valid OTAP type code). See B6.
@@ -340,15 +474,57 @@ pub fn transform_metrics_request_otap(
                     }
                     None => {}
                 }
+                finish_phase(observer, signal, TransformPhase::MetricBuild, metric_start);
             }
+            finish_phase(
+                observer,
+                signal,
+                TransformPhase::ScopeMetricsBuild,
+                scope_start,
+            );
         }
+        finish_phase(
+            observer,
+            signal,
+            TransformPhase::ResourceMetricsBuild,
+            res_start,
+        );
     }
 
-    builders.finish()
+    let finalize_start = phase_start(observer);
+    let batches = builders.finish()?;
+    finish_phase(
+        observer,
+        signal,
+        TransformPhase::ArrowFinalize,
+        finalize_start,
+    );
+    observe_counter(
+        observer,
+        signal,
+        TransformCounter::OutputRows,
+        batches.metrics.num_rows() as u64,
+    );
+    Ok(batches)
 }
 
 pub fn transform_metrics_protobuf_otap(bytes: &[u8]) -> Result<OtapMetricsBatches> {
-    transform_metrics_request_otap(ExportMetricsServiceRequest::decode(bytes)?)
+    transform_metrics_protobuf_otap_observed(bytes, &mut None)
+}
+
+pub fn transform_metrics_protobuf_otap_observed(
+    bytes: &[u8],
+    observer: &mut Option<&mut dyn TransformObserver>,
+) -> Result<OtapMetricsBatches> {
+    let start = Instant::now();
+    let request = ExportMetricsServiceRequest::decode(bytes)?;
+    observe_phase(
+        observer,
+        TransformSignal::Metrics,
+        TransformPhase::ProtobufDecode,
+        start.elapsed(),
+    );
+    transform_metrics_request_otap_observed(request, observer)
 }
 
 fn append_number_point(
@@ -1259,6 +1435,16 @@ impl AnyValueBuilders {
     }
 }
 
+// Minimal CBOR encoder per RFC 8949. We only need a deterministic, no-deps
+// serializer for the `body_ser` and `attrs.ser` columns when an AnyValue is a
+// map or array. Major types used here:
+//   0 = unsigned integer
+//   1 = negative integer (encoded as -1 - n)
+//   2 = byte string
+//   3 = text string (UTF-8)
+//   4 = array
+//   5 = map
+//   7 = simple/float values: 0xf4=false, 0xf5=true, 0xf6=null, 0xfb=f64
 fn cbor_array(values: &[AnyValue]) -> Vec<u8> {
     let mut out = Vec::new();
     cbor_len(&mut out, 4, values.len() as u64);
@@ -1826,6 +2012,31 @@ fn append_opt_bool(builder: &mut BooleanBuilder, value: Option<bool>) {
         Some(value) => builder.append_value(value),
         None => builder.append_null(),
     }
+}
+
+#[derive(Clone, Copy)]
+enum DedupKind {
+    Resource,
+    Scope,
+}
+
+/// Emit the appropriate `*DuplicateHit` / `*DuplicateMiss` counter for a
+/// resource or scope lookup. `is_new` mirrors the second tuple element returned
+/// by [`ContextIdMap::lookup_or_insert`] (true → first time we saw this
+/// context, i.e. a miss; false → reuse, i.e. a hit).
+fn observe_dedup(
+    observer: &mut Option<&mut dyn TransformObserver>,
+    signal: TransformSignal,
+    kind: DedupKind,
+    is_new: bool,
+) {
+    let counter = match (kind, is_new) {
+        (DedupKind::Resource, true) => TransformCounter::ResourceContextDuplicateMiss,
+        (DedupKind::Resource, false) => TransformCounter::ResourceContextDuplicateHit,
+        (DedupKind::Scope, true) => TransformCounter::ScopeContextDuplicateMiss,
+        (DedupKind::Scope, false) => TransformCounter::ScopeContextDuplicateHit,
+    };
+    observe_counter(observer, signal, counter, 1);
 }
 
 /// Maps a resource or scope fingerprint to its previously assigned u16 id, so

@@ -66,7 +66,11 @@ pub enum MetricsOutput {
 }
 
 /// OTAP star log tables.
+///
+/// Marked `#[non_exhaustive]` so additional `RecordBatch` fields can be added
+/// in the future without it being a breaking change for external crates.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct OtapLogsBatches {
     pub logs: RecordBatch,
     pub resource_attrs: RecordBatch,
@@ -87,7 +91,11 @@ impl OtapLogsBatches {
 }
 
 /// OTAP star trace tables.
+///
+/// Marked `#[non_exhaustive]` so additional `RecordBatch` fields can be added
+/// in the future without it being a breaking change for external crates.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct OtapTracesBatches {
     pub spans: RecordBatch,
     pub resource_attrs: RecordBatch,
@@ -116,7 +124,11 @@ impl OtapTracesBatches {
 }
 
 /// OTAP star metric tables.
+///
+/// Marked `#[non_exhaustive]` so additional `RecordBatch` fields can be added
+/// in the future without it being a breaking change for external crates.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct OtapMetricsBatches {
     pub metrics: RecordBatch,
     pub resource_attrs: RecordBatch,
@@ -183,7 +195,9 @@ impl OtapMetricsBatches {
 /// Tracks metrics that were skipped during transformation.
 #[derive(Debug, Default, Clone)]
 pub struct SkippedMetrics {
-    /// Count of summary metrics skipped (deprecated in OTLP spec).
+    /// Count of summary metrics skipped. Only populated by
+    /// [`SchemaOutput::Normalized`], which intentionally drops summary metrics;
+    /// the OTAP star output emits summary tables and never increments this.
     pub summaries: usize,
     /// Count of data points skipped due to NaN values.
     pub nan_values: usize,

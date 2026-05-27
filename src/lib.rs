@@ -42,12 +42,13 @@ pub mod wasm;
 
 pub use api::{
     transform_logs, transform_logs_json, transform_logs_partitioned, transform_logs_with_observer,
-    transform_logs_with_schema, transform_metrics, transform_metrics_json,
-    transform_metrics_partitioned, transform_metrics_with_observer, transform_metrics_with_schema,
-    transform_traces, transform_traces_json, transform_traces_partitioned,
-    transform_traces_with_observer, transform_traces_with_schema, JsonMetricBatches, LogsOutput,
-    MetricBatches, MetricsOutput, OtapLogsBatches, OtapMetricsBatches, OtapTracesBatches,
-    SchemaOutput, SkippedMetrics, TracesOutput,
+    transform_logs_with_schema, transform_logs_with_schema_and_observer, transform_metrics,
+    transform_metrics_json, transform_metrics_partitioned, transform_metrics_with_observer,
+    transform_metrics_with_schema, transform_metrics_with_schema_and_observer, transform_traces,
+    transform_traces_json, transform_traces_partitioned, transform_traces_with_observer,
+    transform_traces_with_schema, transform_traces_with_schema_and_observer, JsonMetricBatches,
+    LogsOutput, MetricBatches, MetricsOutput, OtapLogsBatches, OtapMetricsBatches,
+    OtapTracesBatches, SchemaOutput, SkippedMetrics, TracesOutput,
 };
 pub use arrow::{
     extract_min_timestamp_micros, extract_service_name, group_batch_by_service, PartitionedBatch,

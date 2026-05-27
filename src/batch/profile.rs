@@ -11,7 +11,11 @@ pub enum TransformSignal {
 }
 
 /// Timed transform phase.
+///
+/// Marked `#[non_exhaustive]` because the phase set evolves as the transform
+/// pipelines grow (e.g. OTAP star added per-resource/scope/metric variants).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum TransformPhase {
     ProtobufDecode,
     JsonDecode,
@@ -22,18 +26,24 @@ pub enum TransformPhase {
     ResourceLogsBuild,
     /// Broad trace resource group build timing. Includes nested narrow timings.
     ResourceSpansBuild,
+    /// Broad metric resource group build timing. Includes nested narrow timings.
+    ResourceMetricsBuild,
     ResourceContextBuild,
     ResourceAttributesJson,
     /// Broad log scope group build timing. Includes nested narrow timings.
     ScopeLogsBuild,
     /// Broad trace scope group build timing. Includes nested narrow timings.
     ScopeSpansBuild,
+    /// Broad metric scope group build timing. Includes nested narrow timings.
+    ScopeMetricsBuild,
     ScopeContextBuild,
     ScopeAttributesJson,
     /// Broad log record build timing. Includes nested narrow timings.
     LogRecordBuild,
     /// Broad trace span build timing. Includes nested narrow timings.
     SpanBuild,
+    /// Broad metric build timing (per `Metric` proto). Includes nested narrow timings.
+    MetricBuild,
     ArrowAppend,
     BodyAppend,
     ResourceAttributesAppend,
@@ -50,7 +60,11 @@ pub enum TransformPhase {
 }
 
 /// Counted transform event.
+///
+/// Marked `#[non_exhaustive]` so new counters can be added without it being a
+/// major-version break for callers that match on this enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum TransformCounter {
     OutputRows,
     ResourceContextDuplicateHit,
@@ -119,6 +133,28 @@ pub(crate) fn observe_counter(
             counter,
             value,
         });
+    }
+}
+
+/// Begin timing a phase by inverting the closure-based `measure_*` helpers:
+/// returns `Some(Instant::now())` when an observer is attached, `None`
+/// otherwise. Pair with [`finish_phase`] at the end of the work block. Useful
+/// when the work spans multiple borrows of `observer` (e.g. nested broad
+/// phases around inner loops that themselves emit observations).
+pub(crate) fn phase_start(observer: &Option<&mut dyn TransformObserver>) -> Option<Instant> {
+    observer.is_some().then(Instant::now)
+}
+
+/// Emit a phase timing previously started by [`phase_start`]. No-op when
+/// `start` is `None` (observer was disabled).
+pub(crate) fn finish_phase(
+    observer: &mut Option<&mut dyn TransformObserver>,
+    signal: TransformSignal,
+    phase: TransformPhase,
+    start: Option<Instant>,
+) {
+    if let Some(start) = start {
+        observe_phase(observer, signal, phase, start.elapsed());
     }
 }
 

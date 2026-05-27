@@ -190,10 +190,23 @@ Implement `TransformObserver` to receive `TransformPhaseTiming` and `TransformCo
 events. Counters include duplicate resource/scope context hits and misses plus repeated
 resource/scope attribute row-copy counts and bytes.
 
-Observer instrumentation is implemented only for `SchemaOutput::Normalized` (the
-default). The `otap-star` path does not currently invoke `TransformObserver`;
-call `transform_logs_with_schema` etc. without an observer when selecting
-`OtapStar`. Wiring observers through OTAP is tracked separately.
+To observe an OTAP star transform, use the `*_with_schema_and_observer` entry
+points, which route to either schema and thread the observer through:
+
+| Function | Description |
+|----------|-------------|
+| `transform_logs_with_schema_and_observer(bytes, format, schema_output, observer)` | Logs transform with both schema selection and observer |
+| `transform_traces_with_schema_and_observer(bytes, format, schema_output, observer)` | Traces transform with both schema selection and observer |
+| `transform_metrics_with_schema_and_observer(bytes, format, schema_output, observer)` | Metrics transform with both schema selection and observer |
+
+The OTAP path emits the same phase enum (`ProtobufDecode`, `JsonDecode`,
+`JsonlDecode`, `BuilderInit`, `ResourceLogsBuild` / `ResourceSpansBuild` /
+`ResourceMetricsBuild`, the matching `Scope*Build` and per-record
+`LogRecordBuild` / `SpanBuild` / `MetricBuild`, and `ArrowFinalize`) plus the
+`OutputRows`, `Resource/ScopeContextDuplicateHit`, and
+`Resource/ScopeContextDuplicateMiss` counters. The
+`Resource/ScopeAttributesRowCopies*` counters are normalized-only — OTAP
+emits attributes as their own child tables, so no row replication happens.
 
 ### Output Functions
 
