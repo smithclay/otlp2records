@@ -100,6 +100,27 @@ pub enum OtlpStatus {
     Internal = 5,
 }
 
+/// One optional Arrow batch returned by `otlp_transform_metrics_all`.
+///
+/// If `present` is 0, `array` and `schema` are not initialized and must not be
+/// released by the caller. If `present` is non-zero, the caller owns both and
+/// must call their Arrow C Data release callbacks.
+#[repr(C)]
+pub struct OtlpArrowBatch {
+    pub array: FFI_ArrowArray,
+    pub schema: FFI_ArrowSchema,
+    pub present: c_int,
+}
+
+/// Output batches for all normalized metric shapes.
+#[repr(C)]
+pub struct OtlpMetricsArrowBatches {
+    pub gauge: OtlpArrowBatch,
+    pub sum: OtlpArrowBatch,
+    pub histogram: OtlpArrowBatch,
+    pub exp_histogram: OtlpArrowBatch,
+}
+
 // ============================================================================
 // Parser Handle
 // ============================================================================
@@ -389,6 +410,41 @@ pub unsafe extern "C" fn otlp_get_schema(
 // FFI Functions - One-Shot API
 // ============================================================================
 
+unsafe fn export_record_batch(
+    batch: RecordBatch,
+    out_array: *mut FFI_ArrowArray,
+    out_schema: *mut FFI_ArrowSchema,
+) -> Result<(), OtlpStatus> {
+    let schema = batch.schema();
+    let ffi_schema =
+        FFI_ArrowSchema::try_from(schema.as_ref()).map_err(|_| OtlpStatus::Internal)?;
+
+    let struct_array: arrow_array::StructArray = batch.into();
+    let array_data = struct_array.into_data();
+    let ffi_array = FFI_ArrowArray::new(&array_data);
+
+    std::ptr::write(out_schema, ffi_schema);
+    std::ptr::write(out_array, ffi_array);
+
+    Ok(())
+}
+
+unsafe fn export_optional_metric_batch(
+    batch: Option<RecordBatch>,
+    out_batch: *mut OtlpArrowBatch,
+) -> Result<(), OtlpStatus> {
+    (*out_batch).present = 0;
+    if let Some(batch) = batch {
+        export_record_batch(
+            batch,
+            std::ptr::addr_of_mut!((*out_batch).array),
+            std::ptr::addr_of_mut!((*out_batch).schema),
+        )?;
+        (*out_batch).present = 1;
+    }
+    Ok(())
+}
+
 /// Transform OTLP bytes to Arrow in one call (non-streaming).
 ///
 /// # Safety
@@ -481,6 +537,66 @@ pub unsafe extern "C" fn otlp_transform(
             }
             Err(_) => OtlpStatus::ParseFailed,
         }
+    }))
+    .unwrap_or(OtlpStatus::Internal)
+}
+
+/// Transform OTLP metric bytes to all metric Arrow batches in one parse.
+///
+/// # Safety
+///
+/// - `data` must be valid for `len` bytes
+/// - `out_batches` must be a valid pointer to `OtlpMetricsArrowBatches`
+/// - Caller must release array/schema for every output whose `present` is non-zero
+///
+/// # Returns
+///
+/// `OTLP_OK` on success, error code otherwise.
+#[no_mangle]
+pub unsafe extern "C" fn otlp_transform_metrics_all(
+    format: OtlpInputFormat,
+    data: *const u8,
+    len: usize,
+    out_batches: *mut OtlpMetricsArrowBatches,
+) -> OtlpStatus {
+    if data.is_null() || out_batches.is_null() {
+        return OtlpStatus::InvalidArgument;
+    }
+
+    // Make every output safely inspectable even when parsing/export fails before a
+    // specific metric shape is written.
+    (*out_batches).gauge.present = 0;
+    (*out_batches).sum.present = 0;
+    (*out_batches).histogram.present = 0;
+    (*out_batches).exp_histogram.present = 0;
+
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let slice = std::slice::from_raw_parts(data, len);
+        let format: InputFormat = format.into();
+        let batches = match transform_metrics(slice, format) {
+            Ok(batches) => batches,
+            Err(_) => return OtlpStatus::ParseFailed,
+        };
+
+        if export_optional_metric_batch(batches.gauge, std::ptr::addr_of_mut!((*out_batches).gauge))
+            .is_err()
+            || export_optional_metric_batch(batches.sum, std::ptr::addr_of_mut!((*out_batches).sum))
+                .is_err()
+            || export_optional_metric_batch(
+                batches.histogram,
+                std::ptr::addr_of_mut!((*out_batches).histogram),
+            )
+            .is_err()
+            || export_optional_metric_batch(
+                batches.exp_histogram,
+                std::ptr::addr_of_mut!((*out_batches).exp_histogram),
+            )
+            .is_err()
+        {
+            return OtlpStatus::Internal;
+        }
+
+        OtlpStatus::Ok
     }))
     .unwrap_or(OtlpStatus::Internal)
 }

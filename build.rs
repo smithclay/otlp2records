@@ -15,7 +15,7 @@ fn generate_c_header() {
 
     let output_file = include_dir.join("otlp2records_ffi.h");
 
-    println!("cargo:rerun-if-changed=src/ffi.rs");
+    println!("cargo:rerun-if-changed=src/bindings/ffi.rs");
 
     let config = cbindgen::Config {
         language: cbindgen::Language::C,
