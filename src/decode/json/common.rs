@@ -70,7 +70,11 @@ pub fn decode_bytes_field(encoded: &str) -> Vec<u8> {
 
 /// Convert hex string to bytes.
 pub fn hex_to_bytes(hex: &str) -> Option<Vec<u8>> {
-    if !hex.len().is_multiple_of(2) || hex.is_empty() {
+    // Use `% 2 != 0` rather than `usize::is_multiple_of` so the crate compiles
+    // on Rust toolchains older than 1.87 (the duckdb-otlp extension's CI image
+    // is one such consumer). The two expressions are exactly equivalent for
+    // unsigned operands.
+    if hex.len() % 2 != 0 || hex.is_empty() {
         return None;
     }
 
