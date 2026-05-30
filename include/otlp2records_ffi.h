@@ -34,7 +34,7 @@ typedef enum OtlpInputFormat {
 } OtlpInputFormat;
 
 /*
- OTLP signal types supported by the parser.
+ OTLP signal types supported by the transformer.
 
  C names: OTLP_SIGNAL_LOGS, OTLP_SIGNAL_TRACES, etc.
  */
@@ -98,14 +98,6 @@ typedef enum OtlpStatus {
 } OtlpStatus;
 
 /*
- Opaque parser handle for streaming OTLP data.
-
- This handle maintains state for parsing OTLP data and producing Arrow batches.
- It is NOT thread-safe - use one handle per thread.
- */
-typedef struct OtlpParserHandle OtlpParserHandle;
-
-/*
  One optional Arrow batch returned by `otlp_transform_metrics_all`.
 
  If `present` is 0, `array` and `schema` are not initialized and must not be
@@ -126,80 +118,15 @@ typedef struct OtlpMetricsArrowBatches {
   struct OtlpArrowBatch sum;
   struct OtlpArrowBatch histogram;
   struct OtlpArrowBatch exp_histogram;
+  uint64_t skipped_summaries;
+  uint64_t skipped_nan_values;
+  uint64_t skipped_infinity_values;
+  uint64_t skipped_missing_values;
 } OtlpMetricsArrowBatches;
 
 #ifdef __cplusplus
 extern "C" {
 #endif // __cplusplus
-
-/*
- Create a new streaming parser for the given signal type.
-
- # Safety
-
- - `out_handle` must be a valid, non-null pointer to a pointer
- - On success, caller owns the handle and must call `otlp_parser_destroy()`
-
- # Returns
-
- `OTLP_OK` on success, error code otherwise.
- */
-enum OtlpStatus otlp_parser_create(enum OtlpSignalType signal_type,
-                                   enum OtlpInputFormat format,
-                                   struct OtlpParserHandle **out_handle);
-
-/*
- Destroy a parser handle and release all resources.
-
- # Safety
-
- - `handle` may be null (no-op in that case)
- - After this call, the handle pointer is invalid
- */
-void otlp_parser_destroy(struct OtlpParserHandle *handle);
-
-/*
- Push input bytes to the parser.
-
- # Safety
-
- - `handle` must be a valid parser handle
- - `data` must be valid for `len` bytes (or null if len is 0)
- - Caller retains ownership of `data` buffer
-
- # Arguments
-
- - `handle`: Parser handle
- - `data`: Pointer to input bytes (JSON or protobuf)
- - `len`: Length of input bytes
- - `is_final`: Non-zero if this is the last chunk (triggers parsing)
-
- # Returns
-
- `OTLP_OK` on success, error code otherwise.
- */
-enum OtlpStatus otlp_parser_push(struct OtlpParserHandle *handle,
-                                 const uint8_t *data,
-                                 uintptr_t len,
-                                 int is_final);
-
-/*
- Export available batches as an ArrowArrayStream.
-
- # Safety
-
- - `handle` must be a valid parser handle
- - `out_stream` must be a valid pointer to FFI_ArrowArrayStream
- - Caller must call `out_stream->release()` when done
- - Stream is valid until next `push()` or `destroy()` on handle
-
- # Returns
-
- `OTLP_OK` on success, error code otherwise.
- Stream may yield 0 batches if no data was parsed.
- */
-enum OtlpStatus otlp_parser_drain(struct OtlpParserHandle *handle,
-                                  FFI_ArrowArrayStream *out_stream);
 
 /*
  Get the Arrow schema for a signal type.
@@ -252,20 +179,6 @@ enum OtlpStatus otlp_transform_metrics_all(enum OtlpInputFormat format,
                                            const uint8_t *data,
                                            uintptr_t len,
                                            struct OtlpMetricsArrowBatches *out_batches);
-
-/*
- Get the last error message for a parser handle.
-
- # Safety
-
- - `handle` may be null (returns null in that case)
- - Returned string is valid until next FFI call on same handle
-
- # Returns
-
- Error message string, or null if no error.
- */
-const char *otlp_parser_last_error(const struct OtlpParserHandle *handle);
 
 /*
  Get a static message for a status code.
