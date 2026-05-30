@@ -231,16 +231,18 @@ pub unsafe extern "C" fn otlp_transform(
         let slice = std::slice::from_raw_parts(data, len);
         let format: InputFormat = format.into();
 
+        // otlp_transform is the canonical verb for single-shape signals (Logs/Traces) only.
+        // Metric signals have four shape-specific schemas from a single parse; callers must use
+        // otlp_transform_metrics_all (which returns all shapes from one parse) instead of having
+        // this function parse-and-discard 3 of 4 shapes. Reject metric signals here.
         let batch_result = match signal_type {
             OtlpSignalType::Logs => transform_logs(slice, format).map(Some),
             OtlpSignalType::Traces => transform_traces(slice, format).map(Some),
-            OtlpSignalType::MetricsGauge => transform_metrics(slice, format).map(|m| m.gauge),
-            OtlpSignalType::MetricsSum => transform_metrics(slice, format).map(|m| m.sum),
-            OtlpSignalType::MetricsHistogram => {
-                transform_metrics(slice, format).map(|m| m.histogram)
-            }
-            OtlpSignalType::MetricsExpHistogram => {
-                transform_metrics(slice, format).map(|m| m.exp_histogram)
+            OtlpSignalType::MetricsGauge
+            | OtlpSignalType::MetricsSum
+            | OtlpSignalType::MetricsHistogram
+            | OtlpSignalType::MetricsExpHistogram => {
+                return OtlpStatus::InvalidArgument;
             }
         };
 
