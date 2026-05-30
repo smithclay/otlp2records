@@ -1,6 +1,6 @@
 //! C FFI bindings for otlp2records
 //!
-//! Exposes streaming OTLP parser via Arrow C Data Interface.
+//! Exposes one-shot OTLP transforms via Arrow C Data Interface.
 //!
 //! # Safety
 //!
@@ -10,18 +10,13 @@
 //! # Memory Ownership
 //!
 //! - Input data: Caller owns, Rust borrows during function call
-//! - Parser handle: Rust allocates, caller must call `otlp_parser_destroy()`
 //! - ArrowSchema/ArrowArray: Rust allocates, caller must call `release()` callback
-//! - Error strings: Rust owns, valid until next FFI call on same handle
 
-use std::ffi::{c_char, c_int, CString};
-use std::ptr;
+use std::ffi::{c_char, c_int};
 use std::sync::Arc;
 
 use arrow_array::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
-use arrow_array::ffi_stream::FFI_ArrowArrayStream;
 use arrow_array::{Array, RecordBatch};
-use arrow_schema::Schema;
 
 use crate::decode::InputFormat;
 use crate::{
@@ -33,7 +28,7 @@ use crate::{
 // C-compatible enums
 // ============================================================================
 
-/// OTLP signal types supported by the parser.
+/// OTLP signal types supported by the transformer.
 ///
 /// C names: OTLP_SIGNAL_LOGS, OTLP_SIGNAL_TRACES, etc.
 #[repr(C)]
@@ -119,247 +114,10 @@ pub struct OtlpMetricsArrowBatches {
     pub sum: OtlpArrowBatch,
     pub histogram: OtlpArrowBatch,
     pub exp_histogram: OtlpArrowBatch,
-}
-
-// ============================================================================
-// Parser Handle
-// ============================================================================
-
-/// Opaque parser handle for streaming OTLP data.
-///
-/// This handle maintains state for parsing OTLP data and producing Arrow batches.
-/// It is NOT thread-safe - use one handle per thread.
-pub struct OtlpParserHandle {
-    signal_type: OtlpSignalType,
-    format: InputFormat,
-    buffer: Vec<u8>,
-    batches: Vec<RecordBatch>,
-    last_error: Option<CString>,
-}
-
-impl OtlpParserHandle {
-    fn new(signal_type: OtlpSignalType, format: OtlpInputFormat) -> Self {
-        Self {
-            signal_type,
-            format: format.into(),
-            buffer: Vec::new(),
-            batches: Vec::new(),
-            last_error: None,
-        }
-    }
-
-    fn set_error(&mut self, msg: &str) {
-        self.last_error = CString::new(msg).ok();
-    }
-
-    fn clear_error(&mut self) {
-        self.last_error = None;
-    }
-
-    fn push(&mut self, data: &[u8], is_final: bool) -> OtlpStatus {
-        self.clear_error();
-        self.buffer.extend_from_slice(data);
-
-        if !is_final {
-            // For streaming: could parse complete lines for JSONL here
-            // For now, wait until is_final
-            return OtlpStatus::Ok;
-        }
-
-        // Parse the complete buffer
-        let result = match self.signal_type {
-            OtlpSignalType::Logs => transform_logs(&self.buffer, self.format).map(Some),
-            OtlpSignalType::Traces => transform_traces(&self.buffer, self.format).map(Some),
-            OtlpSignalType::MetricsGauge => {
-                transform_metrics(&self.buffer, self.format).map(|m| m.gauge)
-            }
-            OtlpSignalType::MetricsSum => {
-                transform_metrics(&self.buffer, self.format).map(|m| m.sum)
-            }
-            OtlpSignalType::MetricsHistogram => {
-                transform_metrics(&self.buffer, self.format).map(|m| m.histogram)
-            }
-            OtlpSignalType::MetricsExpHistogram => {
-                transform_metrics(&self.buffer, self.format).map(|m| m.exp_histogram)
-            }
-        };
-
-        match result {
-            Ok(Some(batch)) => {
-                self.batches.push(batch);
-                self.buffer.clear();
-                OtlpStatus::Ok
-            }
-            Ok(None) => {
-                // No data of this type (e.g., no gauge metrics in input)
-                self.buffer.clear();
-                OtlpStatus::Ok
-            }
-            Err(e) => {
-                self.set_error(&e.to_string());
-                self.buffer.clear();
-                OtlpStatus::ParseFailed
-            }
-        }
-    }
-
-    fn get_schema(&self) -> Arc<Schema> {
-        match self.signal_type {
-            OtlpSignalType::Logs => Arc::new(logs_schema()),
-            OtlpSignalType::Traces => Arc::new(traces_schema()),
-            OtlpSignalType::MetricsGauge => Arc::new(gauge_schema()),
-            OtlpSignalType::MetricsSum => Arc::new(sum_schema()),
-            OtlpSignalType::MetricsHistogram => Arc::new(histogram_schema()),
-            OtlpSignalType::MetricsExpHistogram => Arc::new(exp_histogram_schema()),
-        }
-    }
-}
-
-// ============================================================================
-// FFI Functions - Parser Lifecycle
-// ============================================================================
-
-/// Create a new streaming parser for the given signal type.
-///
-/// # Safety
-///
-/// - `out_handle` must be a valid, non-null pointer to a pointer
-/// - On success, caller owns the handle and must call `otlp_parser_destroy()`
-///
-/// # Returns
-///
-/// `OTLP_OK` on success, error code otherwise.
-#[no_mangle]
-pub unsafe extern "C" fn otlp_parser_create(
-    signal_type: OtlpSignalType,
-    format: OtlpInputFormat,
-    out_handle: *mut *mut OtlpParserHandle,
-) -> OtlpStatus {
-    if out_handle.is_null() {
-        return OtlpStatus::InvalidArgument;
-    }
-
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let handle = Box::new(OtlpParserHandle::new(signal_type, format));
-        *out_handle = Box::into_raw(handle);
-        OtlpStatus::Ok
-    }))
-    .unwrap_or(OtlpStatus::Internal)
-}
-
-/// Destroy a parser handle and release all resources.
-///
-/// # Safety
-///
-/// - `handle` may be null (no-op in that case)
-/// - After this call, the handle pointer is invalid
-#[no_mangle]
-pub unsafe extern "C" fn otlp_parser_destroy(handle: *mut OtlpParserHandle) {
-    if !handle.is_null() {
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            drop(Box::from_raw(handle));
-        }));
-    }
-}
-
-// ============================================================================
-// FFI Functions - Streaming Interface
-// ============================================================================
-
-/// Push input bytes to the parser.
-///
-/// # Safety
-///
-/// - `handle` must be a valid parser handle
-/// - `data` must be valid for `len` bytes (or null if len is 0)
-/// - Caller retains ownership of `data` buffer
-///
-/// # Arguments
-///
-/// - `handle`: Parser handle
-/// - `data`: Pointer to input bytes (JSON or protobuf)
-/// - `len`: Length of input bytes
-/// - `is_final`: Non-zero if this is the last chunk (triggers parsing)
-///
-/// # Returns
-///
-/// `OTLP_OK` on success, error code otherwise.
-#[no_mangle]
-pub unsafe extern "C" fn otlp_parser_push(
-    handle: *mut OtlpParserHandle,
-    data: *const u8,
-    len: usize,
-    is_final: c_int,
-) -> OtlpStatus {
-    if handle.is_null() {
-        return OtlpStatus::InvalidArgument;
-    }
-    if data.is_null() && len > 0 {
-        return OtlpStatus::InvalidArgument;
-    }
-
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let handle = &mut *handle;
-        let slice = if len > 0 && !data.is_null() {
-            std::slice::from_raw_parts(data, len)
-        } else {
-            &[]
-        };
-
-        handle.push(slice, is_final != 0)
-    }))
-    .unwrap_or_else(|_| {
-        if let Some(handle) = handle.as_mut() {
-            handle.set_error("Internal panic in parser");
-        }
-        OtlpStatus::Internal
-    })
-}
-
-/// Export available batches as an ArrowArrayStream.
-///
-/// # Safety
-///
-/// - `handle` must be a valid parser handle
-/// - `out_stream` must be a valid pointer to FFI_ArrowArrayStream
-/// - Caller must call `out_stream->release()` when done
-/// - Stream is valid until next `push()` or `destroy()` on handle
-///
-/// # Returns
-///
-/// `OTLP_OK` on success, error code otherwise.
-/// Stream may yield 0 batches if no data was parsed.
-#[no_mangle]
-pub unsafe extern "C" fn otlp_parser_drain(
-    handle: *mut OtlpParserHandle,
-    out_stream: *mut FFI_ArrowArrayStream,
-) -> OtlpStatus {
-    if handle.is_null() || out_stream.is_null() {
-        return OtlpStatus::InvalidArgument;
-    }
-
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let handle = &mut *handle;
-        handle.clear_error();
-
-        // Take batches from handle
-        let batches = std::mem::take(&mut handle.batches);
-        let schema = handle.get_schema();
-
-        // Create a RecordBatchReader from the batches
-        let reader = arrow_array::RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
-
-        // Export to FFI stream
-        let stream = arrow_array::ffi_stream::FFI_ArrowArrayStream::new(Box::new(reader));
-        std::ptr::write(out_stream, stream);
-        OtlpStatus::Ok
-    }))
-    .unwrap_or_else(|_| {
-        if let Some(handle) = handle.as_mut() {
-            handle.set_error("Internal panic during drain");
-        }
-        OtlpStatus::Internal
-    })
+    pub skipped_summaries: u64,
+    pub skipped_nan_values: u64,
+    pub skipped_infinity_values: u64,
+    pub skipped_missing_values: u64,
 }
 
 // ============================================================================
@@ -487,28 +245,8 @@ pub unsafe extern "C" fn otlp_transform(
         };
 
         match batch_result {
-            Ok(Some(batch)) => {
-                // Get schema
-                let schema = batch.schema();
-
-                // Export schema
-                let ffi_schema = match FFI_ArrowSchema::try_from(schema.as_ref()) {
-                    Ok(s) => s,
-                    Err(_) => return OtlpStatus::Internal,
-                };
-
-                // Convert RecordBatch to StructArray for FFI export
-                let struct_array: arrow_array::StructArray = batch.into();
-                let array_data = struct_array.into_data();
-
-                // Export array
-                let ffi_array = FFI_ArrowArray::new(&array_data);
-
-                std::ptr::write(out_schema, ffi_schema);
-                std::ptr::write(out_array, ffi_array);
-
-                OtlpStatus::Ok
-            }
+            Ok(Some(batch)) => export_record_batch(batch, out_array, out_schema)
+                .map_or_else(|status| status, |_| OtlpStatus::Ok),
             Ok(None) => {
                 // No data of this type - create empty batch
                 let schema = match signal_type {
@@ -521,19 +259,8 @@ pub unsafe extern "C" fn otlp_transform(
                 };
 
                 let empty_batch = RecordBatch::new_empty(Arc::new(schema.clone()));
-                let ffi_schema = match FFI_ArrowSchema::try_from(&schema) {
-                    Ok(s) => s,
-                    Err(_) => return OtlpStatus::Internal,
-                };
-
-                let struct_array: arrow_array::StructArray = empty_batch.into();
-                let array_data = struct_array.into_data();
-                let ffi_array = FFI_ArrowArray::new(&array_data);
-
-                std::ptr::write(out_schema, ffi_schema);
-                std::ptr::write(out_array, ffi_array);
-
-                OtlpStatus::Ok
+                export_record_batch(empty_batch, out_array, out_schema)
+                    .map_or_else(|status| status, |_| OtlpStatus::Ok)
             }
             Err(_) => OtlpStatus::ParseFailed,
         }
@@ -569,6 +296,10 @@ pub unsafe extern "C" fn otlp_transform_metrics_all(
     (*out_batches).sum.present = 0;
     (*out_batches).histogram.present = 0;
     (*out_batches).exp_histogram.present = 0;
+    (*out_batches).skipped_summaries = 0;
+    (*out_batches).skipped_nan_values = 0;
+    (*out_batches).skipped_infinity_values = 0;
+    (*out_batches).skipped_missing_values = 0;
 
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let slice = std::slice::from_raw_parts(data, len);
@@ -577,6 +308,7 @@ pub unsafe extern "C" fn otlp_transform_metrics_all(
             Ok(batches) => batches,
             Err(_) => return OtlpStatus::ParseFailed,
         };
+        let skipped = batches.skipped;
 
         if export_optional_metric_batch(batches.gauge, std::ptr::addr_of_mut!((*out_batches).gauge))
             .is_err()
@@ -596,35 +328,14 @@ pub unsafe extern "C" fn otlp_transform_metrics_all(
             return OtlpStatus::Internal;
         }
 
+        (*out_batches).skipped_summaries = skipped.summaries as u64;
+        (*out_batches).skipped_nan_values = skipped.nan_values as u64;
+        (*out_batches).skipped_infinity_values = skipped.infinity_values as u64;
+        (*out_batches).skipped_missing_values = skipped.missing_values as u64;
+
         OtlpStatus::Ok
     }))
     .unwrap_or(OtlpStatus::Internal)
-}
-
-// ============================================================================
-// FFI Functions - Error Handling
-// ============================================================================
-
-/// Get the last error message for a parser handle.
-///
-/// # Safety
-///
-/// - `handle` may be null (returns null in that case)
-/// - Returned string is valid until next FFI call on same handle
-///
-/// # Returns
-///
-/// Error message string, or null if no error.
-#[no_mangle]
-pub unsafe extern "C" fn otlp_parser_last_error(handle: *const OtlpParserHandle) -> *const c_char {
-    if handle.is_null() {
-        return ptr::null();
-    }
-
-    match &(*handle).last_error {
-        Some(s) => s.as_ptr(),
-        None => ptr::null(),
-    }
 }
 
 /// Get a static message for a status code.
@@ -661,11 +372,14 @@ pub extern "C" fn otlp_status_message(status: OtlpStatus) -> *const c_char {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::ffi_stream::ArrowArrayStreamReader;
     use opentelemetry_proto::tonic::{
-        collector::logs::v1::ExportLogsServiceRequest,
+        collector::{logs::v1::ExportLogsServiceRequest, metrics::v1::ExportMetricsServiceRequest},
         common::v1::{any_value, AnyValue, InstrumentationScope, KeyValue},
         logs::v1::{LogRecord, ResourceLogs, ScopeLogs},
+        metrics::v1::{
+            metric, number_data_point, Gauge, Metric, NumberDataPoint, ResourceMetrics,
+            ScopeMetrics, Summary, SummaryDataPoint,
+        },
         resource::v1::Resource,
     };
     use prost::Message;
@@ -703,68 +417,6 @@ mod tests {
             }],
         };
         request.encode_to_vec()
-    }
-
-    #[test]
-    fn test_parser_create_destroy() {
-        unsafe {
-            let mut handle: *mut OtlpParserHandle = ptr::null_mut();
-            let status =
-                otlp_parser_create(OtlpSignalType::Logs, OtlpInputFormat::Protobuf, &mut handle);
-            assert_eq!(status, OtlpStatus::Ok);
-            assert!(!handle.is_null());
-
-            otlp_parser_destroy(handle);
-        }
-    }
-
-    #[test]
-    fn test_parser_create_null_handle() {
-        unsafe {
-            let status = otlp_parser_create(
-                OtlpSignalType::Logs,
-                OtlpInputFormat::Protobuf,
-                ptr::null_mut(),
-            );
-            assert_eq!(status, OtlpStatus::InvalidArgument);
-        }
-    }
-
-    #[test]
-    fn test_parser_destroy_null() {
-        unsafe {
-            // Should not panic
-            otlp_parser_destroy(ptr::null_mut());
-        }
-    }
-
-    #[test]
-    fn test_parser_push_and_drain() {
-        unsafe {
-            let mut handle: *mut OtlpParserHandle = ptr::null_mut();
-            let status =
-                otlp_parser_create(OtlpSignalType::Logs, OtlpInputFormat::Protobuf, &mut handle);
-            assert_eq!(status, OtlpStatus::Ok);
-
-            let bytes = create_test_log_bytes();
-            let status = otlp_parser_push(handle, bytes.as_ptr(), bytes.len(), 1);
-            assert_eq!(status, OtlpStatus::Ok);
-
-            let mut stream = std::mem::MaybeUninit::<FFI_ArrowArrayStream>::uninit();
-            let status = otlp_parser_drain(handle, stream.as_mut_ptr());
-            assert_eq!(status, OtlpStatus::Ok);
-
-            let stream = stream.assume_init();
-
-            // Read batches from stream
-            let reader = ArrowArrayStreamReader::try_new(stream).unwrap();
-            let batches: Vec<_> = reader.collect();
-            assert_eq!(batches.len(), 1);
-            assert!(batches[0].is_ok());
-            assert_eq!(batches[0].as_ref().unwrap().num_rows(), 1);
-
-            otlp_parser_destroy(handle);
-        }
     }
 
     #[test]
@@ -820,6 +472,91 @@ mod tests {
     }
 
     #[test]
+    fn test_metrics_all_reports_skipped_counters() {
+        let request = ExportMetricsServiceRequest {
+            resource_metrics: vec![ResourceMetrics {
+                resource: Some(Resource {
+                    attributes: vec![KeyValue {
+                        key: "service.name".to_string(),
+                        value: Some(AnyValue {
+                            value: Some(any_value::Value::StringValue("test-service".to_string())),
+                        }),
+                    }],
+                    ..Default::default()
+                }),
+                scope_metrics: vec![ScopeMetrics {
+                    scope: Some(InstrumentationScope {
+                        name: "test-lib".to_string(),
+                        ..Default::default()
+                    }),
+                    metrics: vec![
+                        Metric {
+                            name: "invalid_gauge".to_string(),
+                            data: Some(metric::Data::Gauge(Gauge {
+                                data_points: vec![
+                                    NumberDataPoint {
+                                        value: Some(number_data_point::Value::AsDouble(f64::NAN)),
+                                        ..Default::default()
+                                    },
+                                    NumberDataPoint {
+                                        value: Some(number_data_point::Value::AsDouble(
+                                            f64::INFINITY,
+                                        )),
+                                        ..Default::default()
+                                    },
+                                    NumberDataPoint {
+                                        value: None,
+                                        ..Default::default()
+                                    },
+                                ],
+                            })),
+                            ..Default::default()
+                        },
+                        Metric {
+                            name: "summary".to_string(),
+                            data: Some(metric::Data::Summary(Summary {
+                                data_points: vec![
+                                    SummaryDataPoint {
+                                        time_unix_nano: 1,
+                                        ..Default::default()
+                                    },
+                                    SummaryDataPoint {
+                                        time_unix_nano: 2,
+                                        ..Default::default()
+                                    },
+                                ],
+                            })),
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+        let bytes = request.encode_to_vec();
+
+        unsafe {
+            let mut batches = std::mem::zeroed::<OtlpMetricsArrowBatches>();
+            let status = otlp_transform_metrics_all(
+                OtlpInputFormat::Protobuf,
+                bytes.as_ptr(),
+                bytes.len(),
+                &mut batches,
+            );
+            assert_eq!(status, OtlpStatus::Ok);
+            assert_eq!(batches.gauge.present, 0);
+            assert_eq!(batches.sum.present, 0);
+            assert_eq!(batches.histogram.present, 0);
+            assert_eq!(batches.exp_histogram.present, 0);
+            assert_eq!(batches.skipped_summaries, 2);
+            assert_eq!(batches.skipped_nan_values, 1);
+            assert_eq!(batches.skipped_infinity_values, 1);
+            assert_eq!(batches.skipped_missing_values, 1);
+        }
+    }
+
+    #[test]
     fn test_status_message() {
         let msg = otlp_status_message(OtlpStatus::Ok);
         assert!(!msg.is_null());
@@ -827,47 +564,6 @@ mod tests {
         unsafe {
             let c_str = std::ffi::CStr::from_ptr(msg);
             assert_eq!(c_str.to_str().unwrap(), "Success");
-        }
-    }
-
-    #[test]
-    fn test_parser_push_null_handle() {
-        unsafe {
-            let status = otlp_parser_push(ptr::null_mut(), ptr::null(), 0, 1);
-            assert_eq!(status, OtlpStatus::InvalidArgument);
-        }
-    }
-
-    #[test]
-    fn test_parser_push_null_data_with_len() {
-        unsafe {
-            let mut handle: *mut OtlpParserHandle = ptr::null_mut();
-            otlp_parser_create(OtlpSignalType::Logs, OtlpInputFormat::Auto, &mut handle);
-
-            // Null data with len > 0 should fail
-            let status = otlp_parser_push(handle, ptr::null(), 10, 1);
-            assert_eq!(status, OtlpStatus::InvalidArgument);
-
-            otlp_parser_destroy(handle);
-        }
-    }
-
-    #[test]
-    fn test_parser_error_message() {
-        unsafe {
-            let mut handle: *mut OtlpParserHandle = ptr::null_mut();
-            otlp_parser_create(OtlpSignalType::Logs, OtlpInputFormat::Protobuf, &mut handle);
-
-            // Push invalid data
-            let invalid = b"not valid protobuf";
-            let status = otlp_parser_push(handle, invalid.as_ptr(), invalid.len(), 1);
-            assert_eq!(status, OtlpStatus::ParseFailed);
-
-            // Should have error message
-            let err = otlp_parser_last_error(handle);
-            assert!(!err.is_null());
-
-            otlp_parser_destroy(handle);
         }
     }
 }

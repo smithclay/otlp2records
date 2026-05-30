@@ -51,19 +51,6 @@ struct ArrowArray {
 
 #endif /* ARROW_C_DATA_INTERFACE */
 
-#ifndef ARROW_C_STREAM_INTERFACE
-#define ARROW_C_STREAM_INTERFACE
-
-struct ArrowArrayStream {
-    int (*get_schema)(struct ArrowArrayStream*, struct ArrowSchema* out);
-    int (*get_next)(struct ArrowArrayStream*, struct ArrowArray* out);
-    const char* (*get_last_error)(struct ArrowArrayStream*);
-    void (*release)(struct ArrowArrayStream*);
-    void* private_data;
-};
-
-#endif /* ARROW_C_STREAM_INTERFACE */
-
 /* ============================================================================
  * otlp2records Types
  * ============================================================================ */
@@ -138,82 +125,11 @@ typedef struct OtlpMetricsArrowBatches {
     OtlpArrowBatch sum;
     OtlpArrowBatch histogram;
     OtlpArrowBatch exp_histogram;
+    uint64_t skipped_summaries;
+    uint64_t skipped_nan_values;
+    uint64_t skipped_infinity_values;
+    uint64_t skipped_missing_values;
 } OtlpMetricsArrowBatches;
-
-/**
- * @brief Opaque parser handle for streaming OTLP data.
- *
- * This handle maintains state for parsing OTLP data and producing Arrow batches.
- * It is NOT thread-safe - use one handle per thread.
- */
-typedef struct OtlpParserHandle OtlpParserHandle;
-
-/* ============================================================================
- * Parser Lifecycle
- * ============================================================================ */
-
-/**
- * @brief Create a new streaming parser for the given signal type.
- *
- * @param signal_type The OTLP signal type (logs, traces, metrics_gauge, etc.)
- * @param format Input format hint (OTLP_FORMAT_AUTO for auto-detection)
- * @param out_handle Output: pointer to created parser handle
- * @return OTLP_OK on success, error code otherwise
- *
- * @note Caller owns the handle and must call otlp_parser_destroy().
- */
-OtlpStatus otlp_parser_create(
-    OtlpSignalType signal_type,
-    OtlpInputFormat format,
-    OtlpParserHandle** out_handle
-);
-
-/**
- * @brief Destroy parser and release all resources.
- *
- * @param handle Parser handle (may be NULL, which is a no-op)
- */
-void otlp_parser_destroy(OtlpParserHandle* handle);
-
-/* ============================================================================
- * Streaming Interface
- * ============================================================================ */
-
-/**
- * @brief Push input bytes to the parser.
- *
- * @param handle Parser handle
- * @param data Pointer to input bytes (JSON or protobuf)
- * @param len Length of input bytes
- * @param is_final Non-zero if this is the last chunk (triggers parsing)
- * @return OTLP_OK on success, error code otherwise
- *
- * @note Caller retains ownership of data buffer.
- * @note For JSONL: Each complete line is parsed immediately.
- * @note For JSON/protobuf: Data is buffered until is_final=true.
- */
-OtlpStatus otlp_parser_push(
-    OtlpParserHandle* handle,
-    const uint8_t* data,
-    size_t len,
-    int is_final
-);
-
-/**
- * @brief Export available batches as an ArrowArrayStream.
- *
- * @param handle Parser handle
- * @param out_stream Output: ArrowArrayStream to populate
- * @return OTLP_OK on success, error code otherwise
- *
- * @note Caller must call out_stream->release() when done.
- * @note Stream is valid until next push() or destroy() on handle.
- * @note Stream may yield 0 batches if no data was parsed.
- */
-OtlpStatus otlp_parser_drain(
-    OtlpParserHandle* handle,
-    struct ArrowArrayStream* out_stream
-);
 
 /* ============================================================================
  * Schema Access
@@ -267,6 +183,7 @@ OtlpStatus otlp_transform(
  * @param data Input bytes
  * @param len Length of input bytes
  * @param out_batches Output: optional batches for gauge/sum/histogram/exp_histogram
+ *                     plus skipped metric counters
  * @return OTLP_OK on success, error code otherwise
  *
  * @note Caller should zero-initialize out_batches before calling.
@@ -279,20 +196,6 @@ OtlpStatus otlp_transform_metrics_all(
     size_t len,
     OtlpMetricsArrowBatches* out_batches
 );
-
-/* ============================================================================
- * Error Handling
- * ============================================================================ */
-
-/**
- * @brief Get the last error message for a parser handle.
- *
- * @param handle Parser handle (may be NULL)
- * @return Error message string, or NULL if no error
- *
- * @note Returned string is valid until next FFI call on same handle.
- */
-const char* otlp_parser_last_error(const OtlpParserHandle* handle);
 
 /**
  * @brief Get a static message for a status code.
