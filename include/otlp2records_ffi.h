@@ -105,6 +105,29 @@ typedef enum OtlpStatus {
  */
 typedef struct OtlpParserHandle OtlpParserHandle;
 
+/*
+ One optional Arrow batch returned by `otlp_transform_metrics_all`.
+
+ If `present` is 0, `array` and `schema` are not initialized and must not be
+ released by the caller. If `present` is non-zero, the caller owns both and
+ must call their Arrow C Data release callbacks.
+ */
+typedef struct OtlpArrowBatch {
+  FFI_ArrowArray array;
+  FFI_ArrowSchema schema;
+  int present;
+} OtlpArrowBatch;
+
+/*
+ Output batches for all normalized metric shapes.
+ */
+typedef struct OtlpMetricsArrowBatches {
+  struct OtlpArrowBatch gauge;
+  struct OtlpArrowBatch sum;
+  struct OtlpArrowBatch histogram;
+  struct OtlpArrowBatch exp_histogram;
+} OtlpMetricsArrowBatches;
+
 #ifdef __cplusplus
 extern "C" {
 #endif // __cplusplus
@@ -211,6 +234,24 @@ enum OtlpStatus otlp_transform(enum OtlpSignalType signal_type,
                                uintptr_t len,
                                FFI_ArrowArray *out_array,
                                FFI_ArrowSchema *out_schema);
+
+/*
+ Transform OTLP metric bytes to all metric Arrow batches in one parse.
+
+ # Safety
+
+ - `data` must be valid for `len` bytes
+ - `out_batches` must be a valid pointer to `OtlpMetricsArrowBatches`
+ - Caller must release array/schema for every output whose `present` is non-zero
+
+ # Returns
+
+ `OTLP_OK` on success, error code otherwise.
+ */
+enum OtlpStatus otlp_transform_metrics_all(enum OtlpInputFormat format,
+                                           const uint8_t *data,
+                                           uintptr_t len,
+                                           struct OtlpMetricsArrowBatches *out_batches);
 
 /*
  Get the last error message for a parser handle.

@@ -119,6 +119,28 @@ typedef enum OtlpStatus {
 } OtlpStatus;
 
 /**
+ * @brief One optional Arrow batch returned by otlp_transform_metrics_all().
+ *
+ * If present is 0, array/schema are not initialized and must not be released.
+ * If present is non-zero, caller must release both array and schema.
+ */
+typedef struct OtlpArrowBatch {
+    struct ArrowArray array;
+    struct ArrowSchema schema;
+    int present;
+} OtlpArrowBatch;
+
+/**
+ * @brief Output batches for all normalized metric shapes.
+ */
+typedef struct OtlpMetricsArrowBatches {
+    OtlpArrowBatch gauge;
+    OtlpArrowBatch sum;
+    OtlpArrowBatch histogram;
+    OtlpArrowBatch exp_histogram;
+} OtlpMetricsArrowBatches;
+
+/**
  * @brief Opaque parser handle for streaming OTLP data.
  *
  * This handle maintains state for parsing OTLP data and producing Arrow batches.
@@ -236,6 +258,26 @@ OtlpStatus otlp_transform(
     size_t len,
     struct ArrowArray* out_array,
     struct ArrowSchema* out_schema
+);
+
+/**
+ * @brief Transform OTLP metric bytes to all metric Arrow batches in one parse.
+ *
+ * @param format Input format (OTLP_FORMAT_AUTO for auto-detection)
+ * @param data Input bytes
+ * @param len Length of input bytes
+ * @param out_batches Output: optional batches for gauge/sum/histogram/exp_histogram
+ * @return OTLP_OK on success, error code otherwise
+ *
+ * @note Caller should zero-initialize out_batches before calling.
+ * @note For each output with present != 0, caller must release array and schema.
+ * @note Outputs with present == 0 must not be released.
+ */
+OtlpStatus otlp_transform_metrics_all(
+    OtlpInputFormat format,
+    const uint8_t* data,
+    size_t len,
+    OtlpMetricsArrowBatches* out_batches
 );
 
 /* ============================================================================
