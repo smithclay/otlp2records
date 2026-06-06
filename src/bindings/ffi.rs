@@ -87,12 +87,8 @@ pub enum OtlpStatus {
     InvalidArgument = 1,
     /// Parse failed (C: OTLP_ERROR_PARSE_FAILED)
     ParseFailed = 2,
-    /// Invalid format (C: OTLP_ERROR_INVALID_FORMAT)
-    InvalidFormat = 3,
-    /// Out of memory (C: OTLP_ERROR_OUT_OF_MEMORY)
-    OutOfMemory = 4,
     /// Internal error (C: OTLP_ERROR_INTERNAL)
-    Internal = 5,
+    Internal = 3,
 }
 
 /// One optional Arrow batch returned by `otlp_transform_metrics_all`.
@@ -181,6 +177,11 @@ unsafe fn export_record_batch(
     let array_data = struct_array.into_data();
     let ffi_array = FFI_ArrowArray::new(&array_data);
 
+    // Both FFI structs are fully built above; these two writes must stay adjacent and
+    // panic-free. The C++ contract is "OK => both out-params written; non-OK => nothing to
+    // release" (callers treat any non-OK status as no batch present). A panic landing between
+    // the writes would return Internal with out_schema written but out_array not, leaking the
+    // schema's private_data. Do not insert fallible work between them.
     std::ptr::write(out_schema, ffi_schema);
     std::ptr::write(out_array, ffi_array);
 
@@ -351,16 +352,12 @@ pub extern "C" fn otlp_status_message(status: OtlpStatus) -> *const c_char {
     static OK: &[u8] = b"Success\0";
     static INVALID_ARG: &[u8] = b"Invalid argument\0";
     static PARSE_FAILED: &[u8] = b"Parse failed\0";
-    static INVALID_FORMAT: &[u8] = b"Invalid format\0";
-    static OOM: &[u8] = b"Out of memory\0";
     static INTERNAL: &[u8] = b"Internal error\0";
 
     let msg = match status {
         OtlpStatus::Ok => OK,
         OtlpStatus::InvalidArgument => INVALID_ARG,
         OtlpStatus::ParseFailed => PARSE_FAILED,
-        OtlpStatus::InvalidFormat => INVALID_FORMAT,
-        OtlpStatus::OutOfMemory => OOM,
         OtlpStatus::Internal => INTERNAL,
     };
 

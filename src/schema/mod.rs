@@ -1,7 +1,6 @@
-//! Schema ownership for Arrow batches and public schema inspection.
+//! Schema ownership for Arrow batches.
 
 mod arrow;
-mod defs;
 mod otap;
 
 pub use arrow::{
@@ -11,7 +10,6 @@ pub(crate) use arrow::{
     exp_histogram_schema_arc, gauge_schema_arc, histogram_schema_arc, logs_schema_arc,
     sum_schema_arc, traces_schema_arc,
 };
-pub use defs::{schema_def, schema_defs, FieldType, SchemaDef, SchemaField};
 // The OTAP `pub fn otap_*_schema()` accessors are intentionally not re-exported
 // here or at the crate root (see lib.rs and S8). Internal builders use the
 // `_arc` variants so a single `Lazy<Arc<Schema>>` static is shared by reference
