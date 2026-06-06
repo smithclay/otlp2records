@@ -64,8 +64,7 @@ pub use error::{Error, Result};
 pub use output::to_parquet;
 pub use output::{to_ipc, to_json};
 pub use schema::{
-    exp_histogram_schema, gauge_schema, histogram_schema, logs_schema, schema_def, schema_defs,
-    sum_schema, traces_schema, FieldType, SchemaDef, SchemaField,
+    exp_histogram_schema, gauge_schema, histogram_schema, logs_schema, sum_schema, traces_schema,
 };
 
 // OTAP star Arrow schemas are not re-exported at the crate root. They are

@@ -97,12 +97,8 @@ typedef enum OtlpStatus {
     OTLP_ERROR_INVALID_ARGUMENT = 1,
     /** Parse failed (invalid OTLP data) */
     OTLP_ERROR_PARSE_FAILED = 2,
-    /** Invalid format (format detection failed) */
-    OTLP_ERROR_INVALID_FORMAT = 3,
-    /** Out of memory */
-    OTLP_ERROR_OUT_OF_MEMORY = 4,
     /** Internal error (panic caught, unexpected state) */
-    OTLP_ERROR_INTERNAL = 5,
+    OTLP_ERROR_INTERNAL = 3,
 } OtlpStatus;
 
 /**

@@ -1,6 +1,6 @@
 [package]
 name = "otlp2records"
-version = "0.8.4"
+version = "0.9.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "Transform OTLP telemetry to flattened records"
@@ -60,15 +60,9 @@ required-features = ["parquet"]
 default = []
 parquet = ["dep:parquet"]
 wasm = ["getrandom/js", "dep:wasm-bindgen"]
-ffi = ["dep:cbindgen"]  # Enable C FFI bindings with header generation
-
-[build-dependencies]
-cbindgen = { version = "0.27", optional = true }
-
-[package.metadata.cbindgen]
-language = "C"
-cpp_compat = true
-include_guard = "OTLP2RECORDS_FFI_H"
+# Enable the C FFI bindings module. The C ABI is the hand-written, canonical
+# include/otlp2records.h; there is no generated header.
+ffi = []
 
 [profile.release]
 opt-level = 3
