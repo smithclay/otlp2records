@@ -177,13 +177,13 @@ unsafe fn export_record_batch(
     let array_data = struct_array.into_data();
     let ffi_array = FFI_ArrowArray::new(&array_data);
 
-    // Both FFI structs are fully built above; these two writes must stay adjacent and
-    // panic-free. The C++ contract is "OK => both out-params written; non-OK => nothing to
-    // release" (callers treat any non-OK status as no batch present). A panic landing between
-    // the writes would return Internal with out_schema written but out_array not, leaking the
-    // schema's private_data. Do not insert fallible work between them.
-    std::ptr::write(out_schema, ffi_schema);
+    // Both FFI structs are fully built above; the only remaining work is two infallible
+    // `ptr::write`s. Write the array first, then the schema: the Arrow C Data Interface
+    // convention is array-before-schema, and keeping the final write infallible means no
+    // fallible call can land between them. The C++ contract is "OK => both out-params written;
+    // non-OK => nothing to release" (callers treat any non-OK status as no batch present).
     std::ptr::write(out_array, ffi_array);
+    std::ptr::write(out_schema, ffi_schema);
 
     Ok(())
 }
@@ -202,6 +202,31 @@ unsafe fn export_optional_metric_batch(
         (*out_batch).present = 1;
     }
     Ok(())
+}
+
+/// Release an already-exported batch, restoring the "nothing to release" invariant.
+///
+/// If `present` is non-zero, the batch's `array`/`schema` were written by
+/// `export_optional_metric_batch` and own C Data Interface resources. We swap each field for an
+/// `empty()` FFI struct (whose `release` callback is null) and drop the old value, which invokes
+/// its release callback — the same way the `arrow` crate frees an exported
+/// `FFI_ArrowArray`/`FFI_ArrowSchema` anywhere else. Swapping (rather than reading and leaving
+/// stale bytes) means a later drop of the field is a harmless no-op, so there is no risk of a
+/// double-release. `present` is reset to 0 so the caller never observes a released batch.
+unsafe fn release_exported_metric_batch(out_batch: *mut OtlpArrowBatch) {
+    if (*out_batch).present != 0 {
+        let old_array = std::ptr::replace(
+            std::ptr::addr_of_mut!((*out_batch).array),
+            FFI_ArrowArray::empty(),
+        );
+        let old_schema = std::ptr::replace(
+            std::ptr::addr_of_mut!((*out_batch).schema),
+            FFI_ArrowSchema::empty(),
+        );
+        (*out_batch).present = 0;
+        drop(old_array);
+        drop(old_schema);
+    }
 }
 
 /// Transform OTLP bytes to Arrow in one call (non-streaming).
@@ -313,21 +338,26 @@ pub unsafe extern "C" fn otlp_transform_metrics_all(
         };
         let skipped = batches.skipped;
 
-        if export_optional_metric_batch(batches.gauge, std::ptr::addr_of_mut!((*out_batches).gauge))
-            .is_err()
-            || export_optional_metric_batch(batches.sum, std::ptr::addr_of_mut!((*out_batches).sum))
-                .is_err()
-            || export_optional_metric_batch(
-                batches.histogram,
-                std::ptr::addr_of_mut!((*out_batches).histogram),
-            )
-            .is_err()
-            || export_optional_metric_batch(
-                batches.exp_histogram,
-                std::ptr::addr_of_mut!((*out_batches).exp_histogram),
-            )
-            .is_err()
-        {
+        // Export each shape in order. If any export fails mid-sequence, release every batch
+        // already exported (present == 1) so we honor the C contract: "non-OK => no batch is
+        // present; nothing to release." Without this, an earlier success (e.g. gauge) would
+        // leak its array/schema private_data when a later shape (e.g. sum) fails, because the
+        // C++ caller trusts that contract and does not inspect present flags on failure.
+        let gauge_ptr = std::ptr::addr_of_mut!((*out_batches).gauge);
+        let sum_ptr = std::ptr::addr_of_mut!((*out_batches).sum);
+        let histogram_ptr = std::ptr::addr_of_mut!((*out_batches).histogram);
+        let exp_histogram_ptr = std::ptr::addr_of_mut!((*out_batches).exp_histogram);
+
+        let export_result = export_optional_metric_batch(batches.gauge, gauge_ptr)
+            .and_then(|_| export_optional_metric_batch(batches.sum, sum_ptr))
+            .and_then(|_| export_optional_metric_batch(batches.histogram, histogram_ptr))
+            .and_then(|_| export_optional_metric_batch(batches.exp_histogram, exp_histogram_ptr));
+
+        if export_result.is_err() {
+            release_exported_metric_batch(gauge_ptr);
+            release_exported_metric_batch(sum_ptr);
+            release_exported_metric_batch(histogram_ptr);
+            release_exported_metric_batch(exp_histogram_ptr);
             return OtlpStatus::Internal;
         }
 
@@ -552,6 +582,79 @@ mod tests {
             assert_eq!(batches.skipped_nan_values, 1);
             assert_eq!(batches.skipped_infinity_values, 1);
             assert_eq!(batches.skipped_missing_values, 1);
+        }
+    }
+
+    fn create_test_gauge_bytes() -> Vec<u8> {
+        let request = ExportMetricsServiceRequest {
+            resource_metrics: vec![ResourceMetrics {
+                resource: Some(Resource {
+                    attributes: vec![KeyValue {
+                        key: "service.name".to_string(),
+                        value: Some(AnyValue {
+                            value: Some(any_value::Value::StringValue("test-service".to_string())),
+                        }),
+                    }],
+                    ..Default::default()
+                }),
+                scope_metrics: vec![ScopeMetrics {
+                    scope: Some(InstrumentationScope {
+                        name: "test-lib".to_string(),
+                        ..Default::default()
+                    }),
+                    metrics: vec![Metric {
+                        name: "valid_gauge".to_string(),
+                        data: Some(metric::Data::Gauge(Gauge {
+                            data_points: vec![NumberDataPoint {
+                                time_unix_nano: 1_700_000_000_000_000_000,
+                                value: Some(number_data_point::Value::AsDouble(42.0)),
+                                ..Default::default()
+                            }],
+                        })),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+        request.encode_to_vec()
+    }
+
+    /// C1 regression: `release_exported_metric_batch` must invoke the C Data Interface
+    /// release callbacks of an exported batch and clear `present`, restoring the
+    /// "nothing to release" invariant. This is the path taken when a later metric shape's
+    /// export fails after an earlier shape was already exported.
+    #[test]
+    fn test_release_exported_metric_batch_releases_and_clears() {
+        let bytes = create_test_gauge_bytes();
+
+        unsafe {
+            let mut batches = std::mem::zeroed::<OtlpMetricsArrowBatches>();
+            let status = otlp_transform_metrics_all(
+                OtlpInputFormat::Protobuf,
+                bytes.as_ptr(),
+                bytes.len(),
+                &mut batches,
+            );
+            assert_eq!(status, OtlpStatus::Ok);
+            // Valid gauge data must produce a present gauge batch with live FFI resources.
+            assert_eq!(batches.gauge.present, 1);
+
+            // Releasing the present batch invokes the release callbacks (drop) and clears present.
+            release_exported_metric_batch(std::ptr::addr_of_mut!(batches.gauge));
+            assert_eq!(batches.gauge.present, 0);
+
+            // Idempotent: releasing an already-released (or never-present) batch is a no-op and
+            // must not double-free. The other shapes were absent for this payload.
+            release_exported_metric_batch(std::ptr::addr_of_mut!(batches.gauge));
+            release_exported_metric_batch(std::ptr::addr_of_mut!(batches.sum));
+            release_exported_metric_batch(std::ptr::addr_of_mut!(batches.histogram));
+            release_exported_metric_batch(std::ptr::addr_of_mut!(batches.exp_histogram));
+            assert_eq!(batches.gauge.present, 0);
+            assert_eq!(batches.sum.present, 0);
+            assert_eq!(batches.histogram.present, 0);
+            assert_eq!(batches.exp_histogram.present, 0);
         }
     }
 
