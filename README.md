@@ -2,7 +2,8 @@
 
 [![Crates.io](https://img.shields.io/crates/v/otlp2records.svg)](https://crates.io/crates/otlp2records)
 
-Transform OTLP telemetry (logs, traces, metrics) into Arrow RecordBatches.
+Transform OTLP and native OTAP telemetry (logs, traces, metrics) into Arrow
+RecordBatches.
 
 A high-performance, WASM-compatible library for converting OpenTelemetry Protocol (OTLP) data to Apache Arrow format for efficient storage and querying.
 
@@ -14,12 +15,15 @@ Currently consumed by [duckdb-otlp](https://github.com/smithclay/duckdb-otlp), [
 - **No async**: Pure synchronous transforms
 - **WASM-first**: All dependencies compile to wasm32
 - **Arrow-native**: RecordBatch is the canonical output format
-- **Shared log normalization**: OTLP logs traverse semantic view traits
-  compatible with OpenTelemetry Arrow `pdata-views`
+- **Shared telemetry normalization**: OTLP and native OTAP logs, traces, and
+  metrics converge through semantic view traits compatible with OpenTelemetry
+  Arrow `pdata-views`
 
 ## Features
 
 - Transform OTLP logs, traces, and metrics to Arrow RecordBatches
+- Decode native OTAP logs, traces, and univariate metrics to the same normalized
+  Arrow outputs
 - Support for both Protobuf and JSON input formats
 - Output to NDJSON, Arrow IPC, or Parquet
 - Direct OTLP-to-Arrow hot path for high-throughput ingestion
