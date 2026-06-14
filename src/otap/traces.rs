@@ -1,10 +1,6 @@
-use std::{
-    collections::{BTreeMap, HashMap},
-    sync::Arc,
-};
+use std::{collections::BTreeMap, sync::Arc};
 
-use arrow_array::{Array, ArrayRef, RecordBatch, StructArray, UInt16Array, UInt32Array};
-use arrow_schema::{Field, Schema};
+use arrow_array::{Array, RecordBatch, StructArray, UInt32Array};
 
 use crate::{
     batch::transform_traces_view,
@@ -16,12 +12,13 @@ use crate::{
 };
 
 use super::logs::{
-    bool_at, bytes_at, decode_attr_parent_ids, decode_root_ids, duration_nanos_at, f64_at, i32_at,
-    i64_at, is_plain, nested_string, nested_u16, nested_u32_value, parse_nested_columns,
-    same_attribute_value, string_at, table_value, timestamp, u16_at, u32_at, u8_at, validate_attrs,
-    value_u16, AttributeTable, OtapAttribute, OwnedValue,
+    bool_at, build_groups, bytes_at, column_string, column_u16, column_u32, decode_attr_parent_ids,
+    decode_quasi_delta, decode_root_ids, duration_nanos_at, f64_at, i32_at, i64_at, id, index_u16,
+    is_plain, nested_string, nested_u32_value, replace, same_attribute_value, string_at, timestamp,
+    u16_at, u32_at, u8_at, validate_attrs, Attr16Iter, Attr32Iter, AttributeTable,
+    AttributeTable32, OtapAttribute, ResourceGroup, ScopeGroup,
 };
-use super::schema::{validate, PayloadSchema};
+use super::validation::{validate, PayloadSchema};
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn normalize(
@@ -69,17 +66,6 @@ pub(super) fn normalize(
             validate(payload, name, batch)?;
         }
     }
-    require_columns(
-        "spans",
-        &spans,
-        &[
-            "start_time_unix_nano",
-            "duration_time_unix_nano",
-            "trace_id",
-            "span_id",
-            "name",
-        ],
-    )?;
     for (name, batch) in [
         ("resource attributes", resource_attrs.as_ref()),
         ("scope attributes", scope_attrs.as_ref()),
@@ -116,52 +102,6 @@ pub(super) fn normalize(
     transform_traces_view(&view, input_bytes)
 }
 
-struct ResourceGroup {
-    id: Option<u16>,
-    representative: usize,
-    scopes: Vec<ScopeGroup>,
-}
-
-struct ScopeGroup {
-    id: Option<u16>,
-    representative: usize,
-    rows: Vec<usize>,
-}
-
-pub(super) struct AttributeTable32 {
-    batch: RecordBatch,
-    by_parent: BTreeMap<u32, Vec<usize>>,
-    nested: Vec<Option<OwnedValue>>,
-}
-
-impl AttributeTable32 {
-    pub(super) fn new(batch: RecordBatch) -> Result<Self> {
-        require_columns("32-bit attributes", &batch, &["parent_id", "key", "type"])?;
-        let parent = batch
-            .column_by_name("parent_id")
-            .ok_or_else(|| Error::Otap("attribute parent_id is missing".into()))?;
-        let mut by_parent = BTreeMap::<u32, Vec<usize>>::new();
-        for row in 0..batch.num_rows() {
-            let id = u32_at(parent, row)
-                .ok_or_else(|| Error::Otap("attribute parent_id contains null".into()))?;
-            by_parent.entry(id).or_default().push(row);
-        }
-        let nested = parse_nested_columns(&batch)?;
-        Ok(Self {
-            batch,
-            by_parent,
-            nested,
-        })
-    }
-
-    fn rows(&self, parent: Option<u32>) -> &[usize] {
-        parent
-            .and_then(|id| self.by_parent.get(&id))
-            .map(Vec::as_slice)
-            .unwrap_or_default()
-    }
-}
-
 struct OtapTracesView {
     spans: RecordBatch,
     resource_attrs: Option<AttributeTable>,
@@ -189,8 +129,16 @@ impl OtapTracesView {
         link_attrs: Option<RecordBatch>,
     ) -> Result<Self> {
         let resources = build_groups(&spans)?;
-        let events_by_parent = index_u16(events.as_ref(), "parent_id")?;
-        let links_by_parent = index_u16(links.as_ref(), "parent_id")?;
+        let events_by_parent = events
+            .as_ref()
+            .map(|batch| index_u16(batch, "parent_id"))
+            .transpose()?
+            .unwrap_or_default();
+        let links_by_parent = links
+            .as_ref()
+            .map(|batch| index_u16(batch, "parent_id"))
+            .transpose()?
+            .unwrap_or_default();
         Ok(Self {
             spans,
             resource_attrs: resource_attrs.map(AttributeTable::new).transpose()?,
@@ -205,41 +153,6 @@ impl OtapTracesView {
             links_by_parent,
         })
     }
-}
-
-fn build_groups(batch: &RecordBatch) -> Result<Vec<ResourceGroup>> {
-    let resource_ids = nested_u16(batch, "resource", "id")?;
-    let scope_ids = nested_u16(batch, "scope", "id")?;
-    let mut resources = Vec::<ResourceGroup>::new();
-    let mut positions = HashMap::<Option<u16>, usize>::new();
-    for row in 0..batch.num_rows() {
-        let resource_id = value_u16(resource_ids, row);
-        let position = *positions.entry(resource_id).or_insert_with(|| {
-            let position = resources.len();
-            resources.push(ResourceGroup {
-                id: resource_id,
-                representative: row,
-                scopes: Vec::new(),
-            });
-            position
-        });
-        let scope_id = value_u16(scope_ids, row);
-        let resource = &mut resources[position];
-        if let Some(scope) = resource
-            .scopes
-            .iter_mut()
-            .find(|scope| scope.id == scope_id)
-        {
-            scope.rows.push(row);
-        } else {
-            resource.scopes.push(ScopeGroup {
-                id: scope_id,
-                representative: row,
-                rows: vec![row],
-            });
-        }
-    }
-    Ok(resources)
 }
 
 impl TracesView for OtapTracesView {
@@ -735,125 +648,6 @@ impl LinkView for OtapLink<'_> {
     }
 }
 
-pub(super) struct Attr16Iter<'a> {
-    table: Option<&'a AttributeTable>,
-    rows: std::slice::Iter<'a, usize>,
-}
-
-impl<'a> Attr16Iter<'a> {
-    pub(super) fn new(table: Option<&'a AttributeTable>, parent: Option<u16>) -> Self {
-        Self {
-            table,
-            rows: table
-                .map(|table| table.rows(parent))
-                .unwrap_or_default()
-                .iter(),
-        }
-    }
-}
-
-impl<'a> Iterator for Attr16Iter<'a> {
-    type Item = OtapAttribute<'a>;
-    fn next(&mut self) -> Option<Self::Item> {
-        let row = *self.rows.next()?;
-        let table = self.table?;
-        Some(OtapAttribute {
-            key: table
-                .batch
-                .column_by_name("key")
-                .and_then(|array| string_at(array, row))?,
-            value: table_value(table, row),
-        })
-    }
-}
-
-pub(super) struct Attr32Iter<'a> {
-    table: Option<&'a AttributeTable32>,
-    rows: std::slice::Iter<'a, usize>,
-}
-
-impl<'a> Attr32Iter<'a> {
-    pub(super) fn new(table: Option<&'a AttributeTable32>, parent: Option<u32>) -> Self {
-        Self {
-            table,
-            rows: table
-                .map(|table| table.rows(parent))
-                .unwrap_or_default()
-                .iter(),
-        }
-    }
-}
-
-impl<'a> Iterator for Attr32Iter<'a> {
-    type Item = OtapAttribute<'a>;
-    fn next(&mut self) -> Option<Self::Item> {
-        let row = *self.rows.next()?;
-        let table = self.table?;
-        Some(OtapAttribute {
-            key: table
-                .batch
-                .column_by_name("key")
-                .and_then(|array| string_at(array, row))?,
-            value: super::logs::row_value(
-                &table.batch,
-                row,
-                table.nested.get(row).and_then(Option::as_ref),
-            ),
-        })
-    }
-}
-
-fn require_columns(name: &str, batch: &RecordBatch, columns: &[&str]) -> Result<()> {
-    for column in columns {
-        if batch.column_by_name(column).is_none() {
-            return Err(Error::Otap(format!("{name} payload is missing {column}")));
-        }
-    }
-    Ok(())
-}
-
-fn index_u16(batch: Option<&RecordBatch>, column: &str) -> Result<BTreeMap<u16, Vec<usize>>> {
-    let mut result = BTreeMap::<u16, Vec<usize>>::new();
-    let Some(batch) = batch else {
-        return Ok(result);
-    };
-    let values = batch
-        .column_by_name(column)
-        .ok_or_else(|| Error::Otap(format!("{column} is missing")))?;
-    for row in 0..batch.num_rows() {
-        let value = u16_at(values, row)
-            .ok_or_else(|| Error::Otap(format!("{column} contains null at row {row}")))?;
-        result.entry(value).or_default().push(row);
-    }
-    Ok(result)
-}
-
-fn column_string<'a>(batch: &'a RecordBatch, name: &str, row: usize) -> Option<&'a [u8]> {
-    batch
-        .column_by_name(name)
-        .and_then(|array| string_at(array, row))
-}
-
-fn column_u16(batch: &RecordBatch, name: &str, row: usize) -> Option<u16> {
-    batch
-        .column_by_name(name)
-        .and_then(|array| u16_at(array, row))
-}
-
-fn column_u32(batch: &RecordBatch, name: &str, row: usize) -> Option<u32> {
-    batch
-        .column_by_name(name)
-        .and_then(|array| u32_at(array, row))
-}
-
-fn id<'a, const N: usize>(batch: &'a RecordBatch, name: &str, row: usize) -> Option<&'a [u8; N]> {
-    batch
-        .column_by_name(name)
-        .and_then(|array| bytes_at(array, row))
-        .filter(|value| value.iter().any(|byte| *byte != 0))
-        .and_then(|value| value.try_into().ok())
-}
-
 fn decode_child(mut batch: RecordBatch, equal_columns: &[&str]) -> Result<RecordBatch> {
     batch = decode_delta_u32(batch, "id")?;
     decode_quasi_u16(batch, "parent_id", equal_columns)
@@ -887,62 +681,15 @@ pub(super) fn decode_delta_u32(batch: RecordBatch, name: &str) -> Result<RecordB
 }
 
 fn decode_quasi_u16(batch: RecordBatch, name: &str, equal_columns: &[&str]) -> Result<RecordBatch> {
-    let index = batch
-        .schema()
-        .index_of(name)
-        .map_err(|_| Error::Otap(format!("{name} is missing")))?;
-    if is_plain(batch.schema().field(index)) {
-        return Ok(batch);
-    }
-    let array = batch
-        .column(index)
-        .as_any()
-        .downcast_ref::<UInt16Array>()
-        .ok_or_else(|| Error::Otap(format!("{name} must be UInt16")))?;
-    let mut decoded = Vec::<u16>::with_capacity(array.len());
-    for row in 0..array.len() {
-        if array.is_null(row) {
-            return Err(Error::Otap(format!("{name} contains null at row {row}")));
-        }
-        let raw = array.value(row);
-        let same = row > 0
-            && equal_columns
-                .iter()
-                .all(|column| values_equal(&batch, column, row - 1, row));
-        decoded.push(if same {
-            decoded[row - 1]
-                .checked_add(raw)
-                .ok_or_else(|| Error::Otap(format!("{name} quasi-delta overflows at row {row}")))?
-        } else {
-            raw
-        });
-    }
-    replace(&batch, index, Arc::new(UInt16Array::from(decoded)))
+    decode_quasi_delta::<u16>(batch, name, |batch, left, right| {
+        equal_columns
+            .iter()
+            .all(|column| values_equal(batch, column, left, right))
+    })
 }
 
 pub(super) fn decode_attr_parent_ids_u32(batch: RecordBatch) -> Result<RecordBatch> {
-    let index = batch
-        .schema()
-        .index_of("parent_id")
-        .map_err(|_| Error::Otap("attribute parent_id is missing".into()))?;
-    if is_plain(batch.schema().field(index)) {
-        return Ok(batch);
-    }
-    let array = batch.column(index);
-    let mut decoded = Vec::<u32>::with_capacity(array.len());
-    for row in 0..array.len() {
-        let raw = u32_at(array, row)
-            .ok_or_else(|| Error::Otap(format!("attribute parent_id is null at row {row}")))?;
-        let same = row > 0 && same_attribute_value(&batch, row - 1, row);
-        decoded.push(if same {
-            decoded[row - 1]
-                .checked_add(raw)
-                .ok_or_else(|| Error::Otap(format!("attribute parent_id overflows at row {row}")))?
-        } else {
-            raw
-        });
-    }
-    replace(&batch, index, Arc::new(UInt32Array::from(decoded)))
+    decode_quasi_delta::<u32>(batch, "parent_id", same_attribute_value)
 }
 
 pub(super) fn values_equal(batch: &RecordBatch, name: &str, left: usize, right: usize) -> bool {
@@ -982,31 +729,10 @@ pub(super) fn values_equal(batch: &RecordBatch, name: &str, left: usize, right: 
     false
 }
 
-pub(super) fn replace(batch: &RecordBatch, index: usize, array: ArrayRef) -> Result<RecordBatch> {
-    let mut columns = batch.columns().to_vec();
-    columns[index] = array.clone();
-    let old_schema = batch.schema();
-    let mut fields = old_schema.fields().iter().cloned().collect::<Vec<_>>();
-    let old = old_schema.field(index);
-    if old.data_type() != array.data_type() {
-        let mut metadata = old.metadata().clone();
-        let _ = metadata.insert("encoding".into(), "plain".into());
-        fields[index] = Arc::new(
-            Field::new(old.name(), array.data_type().clone(), old.is_nullable())
-                .with_metadata(metadata),
-        );
-    }
-    let schema = Arc::new(Schema::new_with_metadata(
-        fields,
-        old_schema.metadata().clone(),
-    ));
-    RecordBatch::try_new(schema, columns).map_err(Into::into)
-}
-
 #[cfg(test)]
 mod transport_tests {
     use arrow_array::{BinaryArray, StringArray, UInt8Array};
-    use arrow_schema::{DataType, Field};
+    use arrow_schema::{DataType, Field, Schema};
 
     use super::*;
 

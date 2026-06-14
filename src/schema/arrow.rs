@@ -2,8 +2,13 @@
 
 use std::sync::Arc;
 
-use arrow_schema::{DataType, Field, Schema, TimeUnit};
+use arrow_schema::Schema;
 use once_cell::sync::Lazy;
+
+use super::field::{
+    bool_field, duration_ns, f64_field, f64_list, fixed, i32_field, i64_field, ts_ns, u32_field,
+    u64_field, u64_list, utf8,
+};
 
 static LOGS_SCHEMA: Lazy<Arc<Schema>> = Lazy::new(|| {
     Arc::new(Schema::new(vec![
@@ -210,69 +215,10 @@ pub(crate) fn exp_histogram_schema_arc() -> Arc<Schema> {
     Arc::clone(&EXP_HISTOGRAM_SCHEMA)
 }
 
-fn ts_ns(name: &str, nullable: bool) -> Field {
-    Field::new(
-        name,
-        DataType::Timestamp(TimeUnit::Nanosecond, None),
-        nullable,
-    )
-}
-
-fn duration_ns(name: &str, nullable: bool) -> Field {
-    Field::new(name, DataType::Duration(TimeUnit::Nanosecond), nullable)
-}
-
-fn utf8(name: &str, nullable: bool) -> Field {
-    Field::new(name, DataType::Utf8, nullable)
-}
-
-fn i64_field(name: &str, nullable: bool) -> Field {
-    Field::new(name, DataType::Int64, nullable)
-}
-
-fn i32_field(name: &str, nullable: bool) -> Field {
-    Field::new(name, DataType::Int32, nullable)
-}
-
-fn u32_field(name: &str, nullable: bool) -> Field {
-    Field::new(name, DataType::UInt32, nullable)
-}
-
-fn u64_field(name: &str, nullable: bool) -> Field {
-    Field::new(name, DataType::UInt64, nullable)
-}
-
-fn fixed(name: &str, size: i32, nullable: bool) -> Field {
-    Field::new(name, DataType::FixedSizeBinary(size), nullable)
-}
-
-fn f64_field(name: &str, nullable: bool) -> Field {
-    Field::new(name, DataType::Float64, nullable)
-}
-
-fn bool_field(name: &str, nullable: bool) -> Field {
-    Field::new(name, DataType::Boolean, nullable)
-}
-
-fn u64_list(name: &str, nullable: bool) -> Field {
-    Field::new(
-        name,
-        DataType::List(Field::new("item", DataType::UInt64, true).into()),
-        nullable,
-    )
-}
-
-fn f64_list(name: &str, nullable: bool) -> Field {
-    Field::new(
-        name,
-        DataType::List(Field::new("item", DataType::Float64, true).into()),
-        nullable,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow_schema::{DataType, Field, TimeUnit};
 
     #[test]
     fn logs_schema_has_expected_fields() {

@@ -1,6 +1,9 @@
 use arrow_array::{Array, ArrayRef, RecordBatch, StructArray};
 use arrow_schema::{DataType, TimeUnit};
 
+use super::wire::{
+    ATTR_BOOL, ATTR_BYTES, ATTR_DOUBLE, ATTR_INT, ATTR_KEY, ATTR_SER, ATTR_STR, ATTR_TYPE,
+};
 use crate::{Error, Result};
 
 #[derive(Clone, Copy)]
@@ -46,14 +49,14 @@ struct Column {
 }
 
 macro_rules! column {
-    ($name:literal, $expected:expr, required) => {
+    ($name:expr, $expected:expr, required) => {
         Column {
             name: $name,
             expected: $expected,
             required: true,
         }
     };
-    ($name:literal, $expected:expr) => {
+    ($name:expr, $expected:expr) => {
         Column {
             name: $name,
             expected: $expected,
@@ -93,26 +96,26 @@ const STATUS: &[Column] = &[
 
 const ATTRS_16: &[Column] = &[
     column!("parent_id", simple(Simple::UInt16), required),
-    column!("key", dict(KeySize::U8, Simple::Utf8), required),
-    column!("type", simple(Simple::UInt8), required),
-    column!("str", dict(KeySize::U16, Simple::Utf8)),
-    column!("int", dict(KeySize::U16, Simple::Int64)),
-    column!("double", simple(Simple::Float64)),
-    column!("bool", simple(Simple::Boolean)),
-    column!("bytes", dict(KeySize::U16, Simple::Binary)),
-    column!("ser", dict(KeySize::U16, Simple::Binary)),
+    column!(ATTR_KEY, dict(KeySize::U8, Simple::Utf8), required),
+    column!(ATTR_TYPE, simple(Simple::UInt8), required),
+    column!(ATTR_STR, dict(KeySize::U16, Simple::Utf8)),
+    column!(ATTR_INT, dict(KeySize::U16, Simple::Int64)),
+    column!(ATTR_DOUBLE, simple(Simple::Float64)),
+    column!(ATTR_BOOL, simple(Simple::Boolean)),
+    column!(ATTR_BYTES, dict(KeySize::U16, Simple::Binary)),
+    column!(ATTR_SER, dict(KeySize::U16, Simple::Binary)),
 ];
 
 const ATTRS_32: &[Column] = &[
     column!("parent_id", dict(KeySize::U8, Simple::UInt32), required),
-    column!("key", dict(KeySize::U8, Simple::Utf8), required),
-    column!("type", simple(Simple::UInt8), required),
-    column!("str", dict(KeySize::U16, Simple::Utf8)),
-    column!("int", dict(KeySize::U16, Simple::Int64)),
-    column!("double", simple(Simple::Float64)),
-    column!("bool", simple(Simple::Boolean)),
-    column!("bytes", dict(KeySize::U16, Simple::Binary)),
-    column!("ser", dict(KeySize::U16, Simple::Binary)),
+    column!(ATTR_KEY, dict(KeySize::U8, Simple::Utf8), required),
+    column!(ATTR_TYPE, simple(Simple::UInt8), required),
+    column!(ATTR_STR, dict(KeySize::U16, Simple::Utf8)),
+    column!(ATTR_INT, dict(KeySize::U16, Simple::Int64)),
+    column!(ATTR_DOUBLE, simple(Simple::Float64)),
+    column!(ATTR_BOOL, simple(Simple::Boolean)),
+    column!(ATTR_BYTES, dict(KeySize::U16, Simple::Binary)),
+    column!(ATTR_SER, dict(KeySize::U16, Simple::Binary)),
 ];
 
 const SPANS: &[Column] = &[

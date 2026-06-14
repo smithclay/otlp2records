@@ -1,6 +1,7 @@
 //! Schema ownership for Arrow batches.
 
 mod arrow;
+mod field;
 mod otap;
 
 pub use arrow::{

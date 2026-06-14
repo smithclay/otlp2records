@@ -10,9 +10,13 @@ use arrow_array::{
     FixedSizeBinaryArray, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray,
     StructArray, TimestampNanosecondArray, UInt16Array, UInt32Array, UInt8Array,
 };
-use arrow_schema::{DataType, Field, Fields, TimeUnit};
+use arrow_schema::{DataType, Field, Fields, Schema, TimeUnit};
 use ciborium::Value;
 
+use super::wire::{
+    ATTR_BOOL, ATTR_BYTES, ATTR_DOUBLE, ATTR_INT, ATTR_KEY, ATTR_SER, ATTR_STR, ATTR_TYPE,
+    VALUE_BOOL, VALUE_BYTES, VALUE_EMPTY, VALUE_F64, VALUE_I64, VALUE_MAP, VALUE_SLICE, VALUE_STR,
+};
 use crate::{
     batch::transform_logs_view,
     views::pdata::{
@@ -60,22 +64,29 @@ struct OtapLogsView {
     body_nested: Vec<Option<OwnedValue>>,
 }
 
-pub(super) struct AttributeTable {
-    pub(super) batch: RecordBatch,
-    pub(super) by_parent: BTreeMap<u16, Vec<usize>>,
-    pub(super) nested: Vec<Option<OwnedValue>>,
+/// Side table of attributes keyed by parent row id. OTAP stores attributes in
+/// a separate record joined back to the owning rows by `parent_id`; the key
+/// width is `u16` for resource/scope/record attributes and `u32` for the
+/// higher-cardinality data-point and exemplar attributes.
+pub(super) struct AttributeTable<K: OtapInt + Ord = u16> {
+    batch: RecordBatch,
+    by_parent: BTreeMap<K, Vec<usize>>,
+    nested: Vec<Option<OwnedValue>>,
 }
 
-struct ResourceGroup {
-    id: Option<u16>,
-    representative: usize,
-    scopes: Vec<ScopeGroup>,
+/// 32-bit-keyed attribute side table (data-point / exemplar attributes).
+pub(super) type AttributeTable32 = AttributeTable<u32>;
+
+pub(super) struct ResourceGroup {
+    pub(super) id: Option<u16>,
+    pub(super) representative: usize,
+    pub(super) scopes: Vec<ScopeGroup>,
 }
 
-struct ScopeGroup {
-    id: Option<u16>,
-    representative: usize,
-    rows: Vec<usize>,
+pub(super) struct ScopeGroup {
+    pub(super) id: Option<u16>,
+    pub(super) representative: usize,
+    pub(super) rows: Vec<usize>,
 }
 
 impl OtapLogsView {
@@ -98,14 +109,14 @@ impl OtapLogsView {
     }
 }
 
-impl AttributeTable {
+impl<K: OtapInt + Ord> AttributeTable<K> {
     pub(super) fn new(batch: RecordBatch) -> Result<Self> {
-        let parent = required_u16(&batch, "parent_id")?;
-        let mut by_parent = BTreeMap::<u16, Vec<usize>>::new();
+        let parent = batch
+            .column_by_name("parent_id")
+            .ok_or_else(|| Error::Otap("attribute parent_id is missing".into()))?;
+        let mut by_parent = BTreeMap::<K, Vec<usize>>::new();
         for row in 0..batch.num_rows() {
-            let id = parent
-                .is_valid(row)
-                .then(|| parent.value(row))
+            let id = K::at(parent, row)
                 .ok_or_else(|| Error::Otap("attribute parent_id contains null".into()))?;
             by_parent.entry(id).or_default().push(row);
         }
@@ -117,48 +128,96 @@ impl AttributeTable {
         })
     }
 
-    pub(super) fn rows(&self, parent: Option<u16>) -> &[usize] {
+    fn rows(&self, parent: Option<K>) -> &[usize] {
         parent
             .and_then(|id| self.by_parent.get(&id))
             .map(Vec::as_slice)
             .unwrap_or_default()
     }
+
+    fn value(&self, row: usize) -> OtapValue<'_> {
+        row_value(
+            &self.batch,
+            row,
+            self.nested.get(row).and_then(Option::as_ref),
+        )
+    }
 }
 
-fn build_groups(batch: &RecordBatch) -> Result<Vec<ResourceGroup>> {
+/// Iterates the attributes attached to one parent row, yielding `OtapAttribute`
+/// for the [`AttributeView`] interface. Rows with no readable `key` are skipped.
+/// One implementation serves every signal; only the key width `K` varies.
+pub(super) struct AttrIter<'a, K: OtapInt + Ord = u16> {
+    table: Option<&'a AttributeTable<K>>,
+    rows: std::slice::Iter<'a, usize>,
+}
+
+/// 16-bit-keyed attribute iterator (resource / scope / record attributes).
+pub(super) type Attr16Iter<'a> = AttrIter<'a, u16>;
+/// 32-bit-keyed attribute iterator (data-point / exemplar attributes).
+pub(super) type Attr32Iter<'a> = AttrIter<'a, u32>;
+
+impl<'a, K: OtapInt + Ord> AttrIter<'a, K> {
+    pub(super) fn new(table: Option<&'a AttributeTable<K>>, parent: Option<K>) -> Self {
+        let rows = table
+            .map(|table| table.rows(parent))
+            .unwrap_or_default()
+            .iter();
+        Self { table, rows }
+    }
+}
+
+impl<'a, K: OtapInt + Ord> Iterator for AttrIter<'a, K> {
+    type Item = OtapAttribute<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let row = *self.rows.next()?;
+            let table = self.table?;
+            let key = table
+                .batch
+                .column_by_name(ATTR_KEY)
+                .and_then(|array| string_at(array, row));
+            if let Some(key) = key {
+                return Some(OtapAttribute {
+                    key,
+                    value: table.value(row),
+                });
+            }
+        }
+    }
+}
+
+pub(super) fn build_groups(batch: &RecordBatch) -> Result<Vec<ResourceGroup>> {
     let resource_ids = nested_u16(batch, "resource", "id")?;
     let scope_ids = nested_u16(batch, "scope", "id")?;
     let mut resources = Vec::<ResourceGroup>::new();
-    let mut resource_positions = HashMap::<Option<u16>, usize>::new();
-
+    let mut positions = HashMap::<Option<u16>, usize>::new();
     for row in 0..batch.num_rows() {
         let resource_id = value_u16(resource_ids, row);
-        let resource_pos = match resource_positions.get(&resource_id) {
-            Some(position) => *position,
-            None => {
-                let position = resources.len();
-                resources.push(ResourceGroup {
-                    id: resource_id,
-                    representative: row,
-                    scopes: Vec::new(),
-                });
-                let _ = resource_positions.insert(resource_id, position);
-                position
-            }
-        };
+        let position = *positions.entry(resource_id).or_insert_with(|| {
+            let position = resources.len();
+            resources.push(ResourceGroup {
+                id: resource_id,
+                representative: row,
+                scopes: Vec::new(),
+            });
+            position
+        });
         let scope_id = value_u16(scope_ids, row);
-        let resource = &mut resources[resource_pos];
-        match resource
+        let resource = &mut resources[position];
+        if let Some(scope) = resource
             .scopes
             .iter_mut()
             .find(|scope| scope.id == scope_id)
         {
-            Some(scope) => scope.rows.push(row),
-            None => resource.scopes.push(ScopeGroup {
+            scope.rows.push(row);
+        } else {
+            resource.scopes.push(ScopeGroup {
                 id: scope_id,
                 representative: row,
                 rows: vec![row],
-            }),
+            });
         }
     }
     Ok(resources)
@@ -330,12 +389,12 @@ impl ResourceView for OtapResource<'_> {
     where
         Self: 'a;
     type AttributesIter<'a>
-        = AttributeIter<'a>
+        = Attr16Iter<'a>
     where
         Self: 'a;
 
     fn attributes(&self) -> Self::AttributesIter<'_> {
-        AttributeIter::new(self.view.resource_attrs.as_ref(), self.id)
+        Attr16Iter::new(self.view.resource_attrs.as_ref(), self.id)
     }
 
     fn dropped_attributes_count(&self) -> u32 {
@@ -361,7 +420,7 @@ impl InstrumentationScopeView for OtapScope<'_> {
     where
         Self: 'a;
     type AttributeIter<'a>
-        = AttributeIter<'a>
+        = Attr16Iter<'a>
     where
         Self: 'a;
 
@@ -375,7 +434,7 @@ impl InstrumentationScopeView for OtapScope<'_> {
     }
 
     fn attributes(&self) -> Self::AttributeIter<'_> {
-        AttributeIter::new(self.view.scope_attrs.as_ref(), self.id)
+        Attr16Iter::new(self.view.scope_attrs.as_ref(), self.id)
     }
 
     fn dropped_attributes_count(&self) -> u32 {
@@ -400,7 +459,7 @@ impl LogRecordView for OtapLogRecord<'_> {
     where
         Self: 'a;
     type AttributeIter<'a>
-        = AttributeIter<'a>
+        = Attr16Iter<'a>
     where
         Self: 'a;
     type Body<'a>
@@ -447,7 +506,7 @@ impl LogRecordView for OtapLogRecord<'_> {
             .logs
             .column_by_name("id")
             .and_then(|array| u16_at(array, self.row));
-        AttributeIter::new(self.view.log_attrs.as_ref(), id)
+        Attr16Iter::new(self.view.log_attrs.as_ref(), id)
     }
 
     fn dropped_attributes_count(&self) -> u32 {
@@ -490,42 +549,6 @@ impl LogRecordView for OtapLogRecord<'_> {
             .column_by_name("event_name")
             .and_then(|array| string_at(array, self.row))
             .filter(|value| !value.is_empty())
-    }
-}
-
-struct AttributeIter<'a> {
-    table: Option<&'a AttributeTable>,
-    rows: std::slice::Iter<'a, usize>,
-}
-
-impl<'a> AttributeIter<'a> {
-    fn new(table: Option<&'a AttributeTable>, parent: Option<u16>) -> Self {
-        let rows = table
-            .map(|table| table.rows(parent))
-            .unwrap_or_default()
-            .iter();
-        Self { table, rows }
-    }
-}
-
-impl<'a> Iterator for AttributeIter<'a> {
-    type Item = OtapAttribute<'a>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            let row = *self.rows.next()?;
-            let table = self.table?;
-            let key = table
-                .batch
-                .column_by_name("key")
-                .and_then(|array| string_at(array, row));
-            if let Some(key) = key {
-                return Some(OtapAttribute {
-                    key,
-                    value: table_value(table, row),
-                });
-            }
-        }
     }
 }
 
@@ -675,14 +698,6 @@ pub(super) enum OwnedValue {
     Map(Vec<(Vec<u8>, OwnedValue)>),
 }
 
-pub(super) fn table_value<'a>(table: &'a AttributeTable, row: usize) -> OtapValue<'a> {
-    row_value(
-        &table.batch,
-        row,
-        table.nested.get(row).and_then(Option::as_ref),
-    )
-}
-
 fn struct_value<'a>(
     batch: &'a RecordBatch,
     name: &str,
@@ -703,7 +718,7 @@ pub(super) fn row_value<'a>(
     nested: Option<&'a OwnedValue>,
 ) -> OtapValue<'a> {
     let value_type = batch
-        .column_by_name("type")
+        .column_by_name(ATTR_TYPE)
         .and_then(|array| u8_at(array, row));
     row_value_columns(|name| batch.column_by_name(name), value_type, row, nested)
 }
@@ -714,7 +729,7 @@ fn row_value_struct<'a>(
     nested: Option<&'a OwnedValue>,
 ) -> OtapValue<'a> {
     let value_type = values
-        .column_by_name("type")
+        .column_by_name(ATTR_TYPE)
         .and_then(|array| u8_at(array, row));
     row_value_columns(|name| values.column_by_name(name), value_type, row, nested)
 }
@@ -726,25 +741,25 @@ fn row_value_columns<'a>(
     nested: Option<&'a OwnedValue>,
 ) -> OtapValue<'a> {
     match value_type {
-        None | Some(0) => OtapValue::Empty,
-        Some(1) => column("str")
+        None | Some(VALUE_EMPTY) => OtapValue::Empty,
+        Some(VALUE_STR) => column(ATTR_STR)
             .and_then(|array| string_at(array, row))
             .map(OtapValue::String)
             .unwrap_or(OtapValue::Empty),
-        Some(2) => column("int")
+        Some(VALUE_I64) => column(ATTR_INT)
             .and_then(|array| i64_at(array, row))
             .map(OtapValue::Int)
             .unwrap_or(OtapValue::Empty),
-        Some(3) => column("double")
+        Some(VALUE_F64) => column(ATTR_DOUBLE)
             .and_then(|array| f64_at(array, row))
             .map(OtapValue::Double)
             .unwrap_or(OtapValue::Empty),
-        Some(4) => column("bool")
+        Some(VALUE_BOOL) => column(ATTR_BOOL)
             .and_then(|array| bool_at(array, row))
             .map(OtapValue::Bool)
             .unwrap_or(OtapValue::Empty),
-        Some(5 | 6) => nested.map(OtapValue::Owned).unwrap_or(OtapValue::Empty),
-        Some(7) => column("bytes")
+        Some(VALUE_MAP | VALUE_SLICE) => nested.map(OtapValue::Owned).unwrap_or(OtapValue::Empty),
+        Some(VALUE_BYTES) => column(ATTR_BYTES)
             .and_then(|array| bytes_at(array, row))
             .map(OtapValue::Bytes)
             .unwrap_or(OtapValue::Empty),
@@ -761,9 +776,9 @@ fn parse_nested_struct(batch: &RecordBatch, name: &str) -> Result<Vec<Option<Own
     };
     parse_nested(
         values
-            .column_by_name("type")
+            .column_by_name(ATTR_TYPE)
             .ok_or_else(|| Error::Otap(format!("{name}.type is missing")))?,
-        values.column_by_name("ser"),
+        values.column_by_name(ATTR_SER),
         batch.num_rows(),
         name,
     )
@@ -772,9 +787,9 @@ fn parse_nested_struct(batch: &RecordBatch, name: &str) -> Result<Vec<Option<Own
 pub(super) fn parse_nested_columns(batch: &RecordBatch) -> Result<Vec<Option<OwnedValue>>> {
     parse_nested(
         batch
-            .column_by_name("type")
+            .column_by_name(ATTR_TYPE)
             .ok_or_else(|| Error::Otap("attribute type is missing".into()))?,
-        batch.column_by_name("ser"),
+        batch.column_by_name(ATTR_SER),
         batch.num_rows(),
         "attribute",
     )
@@ -788,7 +803,7 @@ fn parse_nested(
 ) -> Result<Vec<Option<OwnedValue>>> {
     let mut result = Vec::with_capacity(rows);
     for row in 0..rows {
-        if matches!(u8_at(types, row), Some(5 | 6)) {
+        if matches!(u8_at(types, row), Some(VALUE_MAP | VALUE_SLICE)) {
             let bytes = serialized
                 .and_then(|array| bytes_at(array, row))
                 .ok_or_else(|| Error::Otap(format!("{context} row {row} has no CBOR value")))?;
@@ -891,7 +906,7 @@ fn decode_nested_delta(batch: RecordBatch, outer: &str, inner: &str) -> Result<R
     RecordBatch::try_new(batch.schema(), columns).map_err(Into::into)
 }
 
-fn decode_delta(array: &UInt16Array, name: &str) -> Result<UInt16Array> {
+pub(super) fn decode_delta(array: &UInt16Array, name: &str) -> Result<UInt16Array> {
     let mut accumulator = 0u16;
     let mut values = Vec::with_capacity(array.len());
     for row in 0..array.len() {
@@ -907,62 +922,123 @@ fn decode_delta(array: &UInt16Array, name: &str) -> Result<UInt16Array> {
     Ok(UInt16Array::from(values))
 }
 
-pub(super) fn decode_attr_parent_ids(batch: RecordBatch) -> Result<RecordBatch> {
+/// Unsigned integer widths used by OTAP id / parent-id columns. Backs both
+/// delta decoding (`checked_add`, `into_array`) and attribute-table keying
+/// (`at` + the `Ord` bound at use sites).
+pub(super) trait OtapInt: Copy {
+    fn at(array: &ArrayRef, row: usize) -> Option<Self>;
+    fn checked_add(self, rhs: Self) -> Option<Self>;
+    fn into_array(values: Vec<Self>) -> ArrayRef;
+}
+
+impl OtapInt for u16 {
+    fn at(array: &ArrayRef, row: usize) -> Option<Self> {
+        u16_at(array, row)
+    }
+    fn checked_add(self, rhs: Self) -> Option<Self> {
+        u16::checked_add(self, rhs)
+    }
+    fn into_array(values: Vec<Self>) -> ArrayRef {
+        Arc::new(UInt16Array::from(values))
+    }
+}
+
+impl OtapInt for u32 {
+    fn at(array: &ArrayRef, row: usize) -> Option<Self> {
+        u32_at(array, row)
+    }
+    fn checked_add(self, rhs: Self) -> Option<Self> {
+        u32::checked_add(self, rhs)
+    }
+    fn into_array(values: Vec<Self>) -> ArrayRef {
+        Arc::new(UInt32Array::from(values))
+    }
+}
+
+/// Decode a quasi-delta-encoded id column in place: a value is a delta from the
+/// previous row when `same(prev, cur)` holds, otherwise an absolute value.
+/// Columns already marked `encoding=plain` are returned unchanged. This is the
+/// shared engine behind every per-signal parent-id decoder (logs, traces,
+/// metrics) — only the integer width and the equality predicate vary.
+pub(super) fn decode_quasi_delta<T: OtapInt>(
+    batch: RecordBatch,
+    name: &str,
+    same: impl Fn(&RecordBatch, usize, usize) -> bool,
+) -> Result<RecordBatch> {
     let index = batch
         .schema()
-        .index_of("parent_id")
-        .map_err(|_| Error::Otap("attribute parent_id is missing".into()))?;
+        .index_of(name)
+        .map_err(|_| Error::Otap(format!("{name} is missing")))?;
     if is_plain(batch.schema().field(index)) {
         return Ok(batch);
     }
-    let parent = batch
-        .column(index)
-        .as_any()
-        .downcast_ref::<UInt16Array>()
-        .ok_or_else(|| Error::Otap("attribute parent_id must be UInt16".into()))?;
-    let mut decoded = Vec::<u16>::with_capacity(parent.len());
-    for row in 0..parent.len() {
-        if parent.is_null(row) {
-            return Err(Error::Otap("attribute parent_id contains null".into()));
-        }
-        let raw = parent.value(row);
-        let value = if row > 0 && same_attribute_value(&batch, row - 1, row) {
-            decoded[row - 1].checked_add(raw).ok_or_else(|| {
-                Error::Otap(format!("attribute parent_id overflows UInt16 at row {row}"))
-            })?
+    let array = batch.column(index);
+    let mut decoded = Vec::<T>::with_capacity(array.len());
+    for row in 0..array.len() {
+        let raw =
+            T::at(array, row).ok_or_else(|| Error::Otap(format!("{name} is null at row {row}")))?;
+        let value = if row > 0 && same(&batch, row - 1, row) {
+            decoded[row - 1]
+                .checked_add(raw)
+                .ok_or_else(|| Error::Otap(format!("{name} delta overflows at row {row}")))?
         } else {
             raw
         };
         decoded.push(value);
     }
+    replace(&batch, index, T::into_array(decoded))
+}
+
+pub(super) fn decode_attr_parent_ids(batch: RecordBatch) -> Result<RecordBatch> {
+    decode_quasi_delta::<u16>(batch, "parent_id", same_attribute_value)
+}
+
+/// Swap a decoded column into `batch` at `index`, marking the field
+/// `encoding=plain` when decoding changed its Arrow data type.
+pub(super) fn replace(batch: &RecordBatch, index: usize, array: ArrayRef) -> Result<RecordBatch> {
     let mut columns = batch.columns().to_vec();
-    columns[index] = Arc::new(UInt16Array::from(decoded));
-    RecordBatch::try_new(batch.schema(), columns).map_err(Into::into)
+    columns[index] = array.clone();
+    let old_schema = batch.schema();
+    let mut fields = old_schema.fields().iter().cloned().collect::<Vec<_>>();
+    let old = old_schema.field(index);
+    if old.data_type() != array.data_type() {
+        let mut metadata = old.metadata().clone();
+        let _ = metadata.insert(ENCODING.into(), PLAIN.into());
+        fields[index] = Arc::new(
+            Field::new(old.name(), array.data_type().clone(), old.is_nullable())
+                .with_metadata(metadata),
+        );
+    }
+    let schema = Arc::new(Schema::new_with_metadata(
+        fields,
+        old_schema.metadata().clone(),
+    ));
+    RecordBatch::try_new(schema, columns).map_err(Into::into)
 }
 
 pub(super) fn same_attribute_value(batch: &RecordBatch, left: usize, right: usize) -> bool {
-    let Some(types) = batch.column_by_name("type") else {
+    let Some(types) = batch.column_by_name(ATTR_TYPE) else {
         return false;
     };
     let left_type = u8_at(types, left);
     if left_type != u8_at(types, right) {
         return false;
     }
-    let Some(keys) = batch.column_by_name("key") else {
+    let Some(keys) = batch.column_by_name(ATTR_KEY) else {
         return false;
     };
     if string_at(keys, left) != string_at(keys, right) {
         return false;
     }
     match left_type {
-        Some(1) => equal_at(batch.column_by_name("str"), left, right, string_at),
-        Some(2) => equal_at(batch.column_by_name("int"), left, right, i64_at),
-        Some(3) => batch.column_by_name("double").is_some_and(|array| {
+        Some(VALUE_STR) => equal_at(batch.column_by_name(ATTR_STR), left, right, string_at),
+        Some(VALUE_I64) => equal_at(batch.column_by_name(ATTR_INT), left, right, i64_at),
+        Some(VALUE_F64) => batch.column_by_name(ATTR_DOUBLE).is_some_and(|array| {
             let left = f64_at(array, left).map(f64::to_bits);
             left.is_some() && left == f64_at(array, right).map(f64::to_bits)
         }),
-        Some(4) => equal_at(batch.column_by_name("bool"), left, right, bool_at),
-        Some(7) => equal_at(batch.column_by_name("bytes"), left, right, bytes_at),
+        Some(VALUE_BOOL) => equal_at(batch.column_by_name(ATTR_BOOL), left, right, bool_at),
+        Some(VALUE_BYTES) => equal_at(batch.column_by_name(ATTR_BYTES), left, right, bytes_at),
         _ => false,
     }
 }
@@ -1050,7 +1126,7 @@ fn validate_any_struct(field: &Field) -> Result<()> {
 }
 
 pub(super) fn validate_attrs(name: &str, batch: &RecordBatch) -> Result<()> {
-    for required in ["parent_id", "key", "type"] {
+    for required in ["parent_id", ATTR_KEY, ATTR_TYPE] {
         if batch.schema().field_with_name(required).is_err() {
             return Err(Error::Otap(format!(
                 "{name} missing required {required} column"
@@ -1063,11 +1139,11 @@ pub(super) fn validate_attrs(name: &str, batch: &RecordBatch) -> Result<()> {
         &DataType::UInt16,
     )?;
     expect_dict_or(
-        batch.schema().field_with_name("key").unwrap(),
+        batch.schema().field_with_name(ATTR_KEY).unwrap(),
         &DataType::Utf8,
         &[8, 16],
     )?;
-    for required in ["parent_id", "key", "type"] {
+    for required in ["parent_id", ATTR_KEY, ATTR_TYPE] {
         if batch.column_by_name(required).unwrap().null_count() != 0 {
             return Err(Error::Otap(format!(
                 "{name} required column {required} contains nulls"
@@ -1088,7 +1164,7 @@ fn validate_any_rows<'a>(
     is_present: impl Fn(usize) -> bool,
     context: &str,
 ) -> Result<()> {
-    let types = column("type")
+    let types = column(ATTR_TYPE)
         .ok_or_else(|| Error::Otap(format!("{context} missing required type column")))?;
     for row in 0..rows {
         if !is_present(row) {
@@ -1097,21 +1173,23 @@ fn validate_any_rows<'a>(
         let value_type = u8_at(types, row)
             .ok_or_else(|| Error::Otap(format!("{context} type is null at row {row}")))?;
         let value_present = match value_type {
-            0 => true,
-            1 => column("str")
+            VALUE_EMPTY => true,
+            VALUE_STR => column(ATTR_STR)
                 .and_then(|array| string_at(array, row))
                 .is_some(),
-            2 => column("int").and_then(|array| i64_at(array, row)).is_some(),
-            3 => column("double")
+            VALUE_I64 => column(ATTR_INT)
+                .and_then(|array| i64_at(array, row))
+                .is_some(),
+            VALUE_F64 => column(ATTR_DOUBLE)
                 .and_then(|array| f64_at(array, row))
                 .is_some(),
-            4 => column("bool")
+            VALUE_BOOL => column(ATTR_BOOL)
                 .and_then(|array| bool_at(array, row))
                 .is_some(),
-            5 | 6 => column("ser")
+            VALUE_MAP | VALUE_SLICE => column(ATTR_SER)
                 .and_then(|array| bytes_at(array, row))
                 .is_some(),
-            7 => column("bytes")
+            VALUE_BYTES => column(ATTR_BYTES)
                 .and_then(|array| bytes_at(array, row))
                 .is_some(),
             other => {
@@ -1132,13 +1210,13 @@ fn validate_any_rows<'a>(
 fn validate_any_fields(fields: &Fields, context: &str) -> Result<()> {
     for field in fields {
         match field.name().as_str() {
-            "parent_id" | "key" => {}
-            "type" => expect(field, &DataType::UInt8)?,
-            "str" => expect_dict_or(field, &DataType::Utf8, &[8, 16])?,
-            "int" => expect_dict_or(field, &DataType::Int64, &[8, 16])?,
-            "double" => expect(field, &DataType::Float64)?,
-            "bool" => expect(field, &DataType::Boolean)?,
-            "bytes" | "ser" => expect_dict_or(field, &DataType::Binary, &[8, 16])?,
+            "parent_id" | ATTR_KEY => {}
+            ATTR_TYPE => expect(field, &DataType::UInt8)?,
+            ATTR_STR => expect_dict_or(field, &DataType::Utf8, &[8, 16])?,
+            ATTR_INT => expect_dict_or(field, &DataType::Int64, &[8, 16])?,
+            ATTR_DOUBLE => expect(field, &DataType::Float64)?,
+            ATTR_BOOL => expect(field, &DataType::Boolean)?,
+            ATTR_BYTES | ATTR_SER => expect_dict_or(field, &DataType::Binary, &[8, 16])?,
             name => {
                 return Err(Error::Otap(format!(
                     "unknown {context} value column {name:?}"
@@ -1146,7 +1224,7 @@ fn validate_any_fields(fields: &Fields, context: &str) -> Result<()> {
             }
         }
     }
-    if fields.iter().all(|field| field.name() != "type") {
+    if fields.iter().all(|field| field.name() != ATTR_TYPE) {
         return Err(Error::Otap(format!(
             "{context} missing required type column"
         )));
@@ -1189,11 +1267,63 @@ fn expect_dict_or(field: &Field, expected: &DataType, key_widths: &[u8]) -> Resu
     }
 }
 
-fn required_u16<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a UInt16Array> {
+pub(super) fn column_string<'a>(
+    batch: &'a RecordBatch,
+    name: &str,
+    row: usize,
+) -> Option<&'a [u8]> {
     batch
         .column_by_name(name)
-        .and_then(|array| array.as_any().downcast_ref())
-        .ok_or_else(|| Error::Otap(format!("{name} must be UInt16")))
+        .and_then(|array| string_at(array, row))
+}
+
+pub(super) fn column_u16(batch: &RecordBatch, name: &str, row: usize) -> Option<u16> {
+    batch
+        .column_by_name(name)
+        .and_then(|array| u16_at(array, row))
+}
+
+pub(super) fn column_u32(batch: &RecordBatch, name: &str, row: usize) -> Option<u32> {
+    batch
+        .column_by_name(name)
+        .and_then(|array| u32_at(array, row))
+}
+
+pub(super) fn id<'a, const N: usize>(
+    batch: &'a RecordBatch,
+    name: &str,
+    row: usize,
+) -> Option<&'a [u8; N]> {
+    batch
+        .column_by_name(name)
+        .and_then(|array| bytes_at(array, row))
+        .filter(|value| value.iter().any(|byte| *byte != 0))
+        .and_then(|value| value.try_into().ok())
+}
+
+pub(super) fn index_u16(batch: &RecordBatch, name: &str) -> Result<BTreeMap<u16, Vec<usize>>> {
+    index_by_parent(batch, name, u16_at)
+}
+
+pub(super) fn index_u32(batch: &RecordBatch, name: &str) -> Result<BTreeMap<u32, Vec<usize>>> {
+    index_by_parent(batch, name, u32_at)
+}
+
+fn index_by_parent<K: Ord>(
+    batch: &RecordBatch,
+    name: &str,
+    value: impl Fn(&ArrayRef, usize) -> Option<K>,
+) -> Result<BTreeMap<K, Vec<usize>>> {
+    let array = batch
+        .column_by_name(name)
+        .ok_or_else(|| Error::Otap(format!("{name} is missing")))?;
+    let mut result = BTreeMap::<K, Vec<usize>>::new();
+    for row in 0..batch.num_rows() {
+        let key = value(array, row)
+            .ok_or_else(|| Error::Otap(format!("{name} contains null at row {row}")))?;
+        result.entry(key).or_default().push(row);
+    }
+    Ok(result)
 }
 
 pub(super) fn nested_u16<'a>(

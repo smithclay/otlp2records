@@ -6,9 +6,13 @@
 mod decoder;
 mod logs;
 mod metrics;
-mod schema;
 mod traces;
+mod validation;
 mod wire;
 
 pub use decoder::OtapDecoder;
 pub use wire::{ArrowPayload, ArrowPayloadType, BatchArrowRecords};
+pub(crate) use wire::{
+    ATTR_BOOL, ATTR_BYTES, ATTR_DOUBLE, ATTR_INT, ATTR_KEY, ATTR_SER, ATTR_STR, ATTR_TYPE,
+    VALUE_BOOL, VALUE_BYTES, VALUE_EMPTY, VALUE_F64, VALUE_I64, VALUE_MAP, VALUE_SLICE, VALUE_STR,
+};

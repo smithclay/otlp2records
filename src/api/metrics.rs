@@ -1,15 +1,14 @@
 //! Public metric transform orchestration.
 
-use std::time::Instant;
-
 use crate::{
     api::{
-        auto::auto_dispatch, optional_batch_to_json_values, JsonMetricBatches, MetricBatches,
-        MetricsOutput, SchemaOutput,
+        auto::{auto_dispatch, decode_json_observed},
+        optional_batch_to_json_values, JsonMetricBatches, MetricBatches, MetricsOutput,
+        SchemaOutput,
     },
-    batch::{self, TransformObserver, TransformPhase, TransformSignal},
-    decode::{decode_metrics_json_request, decode_metrics_jsonl_request, DecodeError, InputFormat},
-    Error, Result,
+    batch::{self, TransformObserver, TransformSignal},
+    decode::{decode_metrics_json_request, decode_metrics_jsonl_request, InputFormat},
+    Result,
 };
 
 /// Transform OTLP metrics to Arrow RecordBatches.
@@ -149,34 +148,15 @@ fn transform_metrics_otap_json_observed(
     format: InputFormat,
     observer: &mut Option<&mut dyn TransformObserver>,
 ) -> Result<crate::api::OtapMetricsBatches> {
-    let start = Instant::now();
-    let request = match format {
-        InputFormat::Json => {
-            let request = decode_metrics_json_request(bytes)?;
-            batch::observe_phase(
-                observer,
-                TransformSignal::Metrics,
-                TransformPhase::JsonDecode,
-                start.elapsed(),
-            );
-            request
-        }
-        InputFormat::Jsonl => {
-            let request = decode_metrics_jsonl_request(bytes)?;
-            batch::observe_phase(
-                observer,
-                TransformSignal::Metrics,
-                TransformPhase::JsonlDecode,
-                start.elapsed(),
-            );
-            request
-        }
-        _ => {
-            return Err(Error::Decode(DecodeError::Unsupported(
-                "expected JSON or JSONL metrics input".to_string(),
-            )));
-        }
-    };
+    let request = decode_json_observed(
+        bytes,
+        format,
+        TransformSignal::Metrics,
+        observer,
+        decode_metrics_json_request,
+        decode_metrics_jsonl_request,
+        "metrics",
+    )?;
     batch::transform_metrics_request_otap_observed(request, observer)
 }
 
@@ -185,34 +165,15 @@ fn transform_metrics_json_arrow_observed(
     format: InputFormat,
     observer: &mut Option<&mut dyn TransformObserver>,
 ) -> Result<MetricBatches> {
-    let start = Instant::now();
-    let request = match format {
-        InputFormat::Json => {
-            let request = decode_metrics_json_request(bytes)?;
-            batch::observe_phase(
-                observer,
-                TransformSignal::Metrics,
-                TransformPhase::JsonDecode,
-                start.elapsed(),
-            );
-            request
-        }
-        InputFormat::Jsonl => {
-            let request = decode_metrics_jsonl_request(bytes)?;
-            batch::observe_phase(
-                observer,
-                TransformSignal::Metrics,
-                TransformPhase::JsonlDecode,
-                start.elapsed(),
-            );
-            request
-        }
-        _ => {
-            return Err(Error::Decode(DecodeError::Unsupported(
-                "expected JSON or JSONL metrics input".to_string(),
-            )));
-        }
-    };
+    let request = decode_json_observed(
+        bytes,
+        format,
+        TransformSignal::Metrics,
+        observer,
+        decode_metrics_json_request,
+        decode_metrics_jsonl_request,
+        "metrics",
+    )?;
     batch::transform_metrics_request_observed(request, observer)
 }
 

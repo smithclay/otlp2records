@@ -29,6 +29,38 @@ pub struct ArrowPayload {
     pub record: Vec<u8>,
 }
 
+/// OTLP `AnyValue` discriminants as encoded in the OTAP attribute `type`
+/// column (otel-arrow `AttributeValueType`).
+///
+/// `Map` (5) and `Slice` (6) payloads are CBOR-serialized into the `ser`
+/// column; the remaining variants map to their like-named typed columns. These
+/// are shared by the OTAP encoder (`batch::otap`) and decoder (`otap::logs`) so
+/// the two directions cannot disagree on the numbering.
+pub(crate) const VALUE_EMPTY: u8 = 0;
+pub(crate) const VALUE_STR: u8 = 1;
+pub(crate) const VALUE_I64: u8 = 2;
+pub(crate) const VALUE_F64: u8 = 3;
+pub(crate) const VALUE_BOOL: u8 = 4;
+pub(crate) const VALUE_MAP: u8 = 5;
+pub(crate) const VALUE_SLICE: u8 = 6;
+pub(crate) const VALUE_BYTES: u8 = 7;
+
+/// Column names of an OTAP `AnyValue` record — the `type` discriminator plus
+/// the typed payload columns, which line up 1:1 with the `VALUE_*` constants
+/// above (`VALUE_STR` → `ATTR_STR`, etc.) — together with the attribute `key`.
+/// This same column layout backs attribute records and the log `body` struct.
+/// Shared by the star schema (`schema::otap`), the structural validator
+/// (`otap::validation`), and the decoder (`otap::logs`) so a rename cannot
+/// silently desync one of the three from the others.
+pub(crate) const ATTR_KEY: &str = "key";
+pub(crate) const ATTR_TYPE: &str = "type";
+pub(crate) const ATTR_STR: &str = "str";
+pub(crate) const ATTR_INT: &str = "int";
+pub(crate) const ATTR_DOUBLE: &str = "double";
+pub(crate) const ATTR_BOOL: &str = "bool";
+pub(crate) const ATTR_BYTES: &str = "bytes";
+pub(crate) const ATTR_SER: &str = "ser";
+
 /// Canonical OTAP payload type numbers.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, prost::Enumeration)]

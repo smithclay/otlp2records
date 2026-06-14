@@ -8,85 +8,84 @@
 
 use std::sync::Arc;
 
-use arrow_schema::{DataType, Field, Schema, TimeUnit};
+use arrow_schema::{DataType, Field, Schema};
 use once_cell::sync::Lazy;
 
+use super::field::{
+    binary, bool_field, duration_ns, f64_field, f64_list, fixed, i32_field, i64_field, ts_ns,
+    u16_field, u32_field, u64_field, u64_list, u8_field, utf8,
+};
+use crate::otap::{
+    ATTR_BOOL, ATTR_BYTES, ATTR_DOUBLE, ATTR_INT, ATTR_KEY, ATTR_SER, ATTR_STR, ATTR_TYPE,
+};
+
 static OTAP_LOGS_SCHEMA: Lazy<Arc<Schema>> = Lazy::new(|| {
-    Arc::new(Schema::new(vec![
-        u16_field("id", false),
-        u16_field("resource_id", true),
-        utf8("resource_schema_url", true),
-        u32_field("resource_dropped_attributes_count", true),
-        u16_field("scope_id", true),
-        utf8("scope_name", true),
-        utf8("scope_version", true),
-        u32_field("scope_dropped_attributes_count", true),
-        utf8("schema_url", true),
-        ts_ns("time_unix_nano", true),
-        ts_ns("observed_time_unix_nano", true),
-        fixed("trace_id", 16, true),
-        fixed("span_id", 8, true),
-        i32_field("severity_number", true),
-        utf8("severity_text", true),
-        utf8("event_name", true),
-        u8_field("body_type", false),
-        utf8("body_str", true),
-        i64_field("body_int", true),
-        f64_field("body_double", true),
-        bool_field("body_bool", true),
-        binary("body_bytes", true),
-        binary("body_ser", true),
-        u32_field("dropped_attributes_count", true),
-        u32_field("flags", true),
-    ]))
+    Arc::new(Schema::new(
+        [
+            resource_scope_header(),
+            vec![
+                ts_ns("time_unix_nano", true),
+                ts_ns("observed_time_unix_nano", true),
+                fixed("trace_id", 16, true),
+                fixed("span_id", 8, true),
+                i32_field("severity_number", true),
+                utf8("severity_text", true),
+                utf8("event_name", true),
+                u8_field("body_type", false),
+                utf8("body_str", true),
+                i64_field("body_int", true),
+                f64_field("body_double", true),
+                bool_field("body_bool", true),
+                binary("body_bytes", true),
+                binary("body_ser", true),
+                u32_field("dropped_attributes_count", true),
+                u32_field("flags", true),
+            ],
+        ]
+        .concat(),
+    ))
 });
 
 static OTAP_SPANS_SCHEMA: Lazy<Arc<Schema>> = Lazy::new(|| {
-    Arc::new(Schema::new(vec![
-        u16_field("id", false),
-        u16_field("resource_id", true),
-        utf8("resource_schema_url", true),
-        u32_field("resource_dropped_attributes_count", true),
-        u16_field("scope_id", true),
-        utf8("scope_name", true),
-        utf8("scope_version", true),
-        u32_field("scope_dropped_attributes_count", true),
-        utf8("schema_url", true),
-        ts_ns("start_time_unix_nano", false),
-        duration_ns("duration_time_unix_nano", false),
-        fixed("trace_id", 16, false),
-        fixed("span_id", 8, false),
-        utf8("trace_state", true),
-        fixed("parent_span_id", 8, true),
-        utf8("name", false),
-        i32_field("kind", true),
-        u32_field("dropped_attributes_count", true),
-        u32_field("dropped_events_count", true),
-        u32_field("dropped_links_count", true),
-        i32_field("status_code", true),
-        utf8("status_status_message", true),
-        u32_field("flags", true),
-    ]))
+    Arc::new(Schema::new(
+        [
+            resource_scope_header(),
+            vec![
+                ts_ns("start_time_unix_nano", false),
+                duration_ns("duration_time_unix_nano", false),
+                fixed("trace_id", 16, false),
+                fixed("span_id", 8, false),
+                utf8("trace_state", true),
+                fixed("parent_span_id", 8, true),
+                utf8("name", false),
+                i32_field("kind", true),
+                u32_field("dropped_attributes_count", true),
+                u32_field("dropped_events_count", true),
+                u32_field("dropped_links_count", true),
+                i32_field("status_code", true),
+                utf8("status_status_message", true),
+                u32_field("flags", true),
+            ],
+        ]
+        .concat(),
+    ))
 });
 
 static OTAP_METRICS_SCHEMA: Lazy<Arc<Schema>> = Lazy::new(|| {
-    Arc::new(Schema::new(vec![
-        u16_field("id", false),
-        u16_field("resource_id", true),
-        utf8("resource_schema_url", true),
-        u32_field("resource_dropped_attributes_count", true),
-        u16_field("scope_id", true),
-        utf8("scope_name", true),
-        utf8("scope_version", true),
-        u32_field("scope_dropped_attributes_count", true),
-        utf8("schema_url", true),
-        u8_field("metric_type", false),
-        utf8("name", false),
-        utf8("description", true),
-        utf8("unit", true),
-        i32_field("aggregation_temporality", true),
-        bool_field("is_monotonic", true),
-    ]))
+    Arc::new(Schema::new(
+        [
+            resource_scope_header(),
+            vec![
+                u8_field("metric_type", false),
+                utf8("name", false),
+                utf8("description", true),
+                utf8("unit", true),
+                i32_field("aggregation_temporality", true),
+                bool_field("is_monotonic", true),
+            ],
+        ]
+        .concat(),
+    ))
 });
 
 static OTAP_ATTRS_U16_SCHEMA: Lazy<Arc<Schema>> =
@@ -95,15 +94,17 @@ static OTAP_ATTRS_U32_SCHEMA: Lazy<Arc<Schema>> =
     Lazy::new(|| Arc::new(attrs_schema(DataType::UInt32)));
 
 static OTAP_NUMBER_DPS_SCHEMA: Lazy<Arc<Schema>> = Lazy::new(|| {
-    Arc::new(Schema::new(vec![
-        u32_field("id", false),
-        u16_field("parent_id", false),
-        ts_ns("start_time_unix_nano", true),
-        ts_ns("time_unix_nano", false),
-        i64_field("int_value", true),
-        f64_field("double_value", true),
-        u32_field("flags", true),
-    ]))
+    Arc::new(Schema::new(
+        [
+            data_point_prefix(),
+            vec![
+                i64_field("int_value", true),
+                f64_field("double_value", true),
+                u32_field("flags", true),
+            ],
+        ]
+        .concat(),
+    ))
 });
 
 static OTAP_EXEMPLARS_SCHEMA: Lazy<Arc<Schema>> = Lazy::new(|| {
@@ -122,15 +123,17 @@ static OTAP_EXEMPLARS_SCHEMA: Lazy<Arc<Schema>> = Lazy::new(|| {
 // review notes). Keeping a single representation avoids forcing consumers to
 // dedupe between an embedded list and the relational table.
 static OTAP_SUMMARY_DPS_SCHEMA: Lazy<Arc<Schema>> = Lazy::new(|| {
-    Arc::new(Schema::new(vec![
-        u32_field("id", false),
-        u16_field("parent_id", false),
-        ts_ns("start_time_unix_nano", true),
-        ts_ns("time_unix_nano", false),
-        u64_field("count", true),
-        f64_field("sum", true),
-        u32_field("flags", true),
-    ]))
+    Arc::new(Schema::new(
+        [
+            data_point_prefix(),
+            vec![
+                u64_field("count", true),
+                f64_field("sum", true),
+                u32_field("flags", true),
+            ],
+        ]
+        .concat(),
+    ))
 });
 
 static OTAP_QUANTILE_SCHEMA: Lazy<Arc<Schema>> = Lazy::new(|| {
@@ -142,40 +145,44 @@ static OTAP_QUANTILE_SCHEMA: Lazy<Arc<Schema>> = Lazy::new(|| {
 });
 
 static OTAP_HISTOGRAM_DPS_SCHEMA: Lazy<Arc<Schema>> = Lazy::new(|| {
-    Arc::new(Schema::new(vec![
-        u32_field("id", false),
-        u16_field("parent_id", false),
-        ts_ns("start_time_unix_nano", true),
-        ts_ns("time_unix_nano", false),
-        u64_field("count", true),
-        f64_field("sum", true),
-        u64_list("bucket_counts", true),
-        f64_list("explicit_bounds", true),
-        u32_field("flags", true),
-        f64_field("min", true),
-        f64_field("max", true),
-    ]))
+    Arc::new(Schema::new(
+        [
+            data_point_prefix(),
+            vec![
+                u64_field("count", true),
+                f64_field("sum", true),
+                u64_list("bucket_counts", true),
+                f64_list("explicit_bounds", true),
+                u32_field("flags", true),
+                f64_field("min", true),
+                f64_field("max", true),
+            ],
+        ]
+        .concat(),
+    ))
 });
 
 static OTAP_EXP_HISTOGRAM_DPS_SCHEMA: Lazy<Arc<Schema>> = Lazy::new(|| {
-    Arc::new(Schema::new(vec![
-        u32_field("id", false),
-        u16_field("parent_id", false),
-        ts_ns("start_time_unix_nano", true),
-        ts_ns("time_unix_nano", false),
-        u64_field("count", true),
-        f64_field("sum", true),
-        i32_field("scale", true),
-        u64_field("zero_count", true),
-        i32_field("positive_offset", true),
-        u64_list("positive_bucket_counts", true),
-        i32_field("negative_offset", true),
-        u64_list("negative_bucket_counts", true),
-        u32_field("flags", true),
-        f64_field("min", true),
-        f64_field("max", true),
-        f64_field("zero_threshold", true),
-    ]))
+    Arc::new(Schema::new(
+        [
+            data_point_prefix(),
+            vec![
+                u64_field("count", true),
+                f64_field("sum", true),
+                i32_field("scale", true),
+                u64_field("zero_count", true),
+                i32_field("positive_offset", true),
+                u64_list("positive_bucket_counts", true),
+                i32_field("negative_offset", true),
+                u64_list("negative_bucket_counts", true),
+                u32_field("flags", true),
+                f64_field("min", true),
+                f64_field("max", true),
+                f64_field("zero_threshold", true),
+            ],
+        ]
+        .concat(),
+    ))
 });
 
 static OTAP_SPAN_EVENTS_SCHEMA: Lazy<Arc<Schema>> = Lazy::new(|| {
@@ -320,85 +327,42 @@ pub(crate) fn otap_span_links_schema_arc() -> Arc<Schema> {
 fn attrs_schema(parent_type: DataType) -> Schema {
     Schema::new(vec![
         Field::new("parent_id", parent_type, false),
-        utf8("key", false),
-        u8_field("type", false),
-        utf8("str", true),
-        i64_field("int", true),
-        f64_field("double", true),
-        bool_field("bool", true),
-        binary("bytes", true),
-        binary("ser", true),
+        utf8(ATTR_KEY, false),
+        u8_field(ATTR_TYPE, false),
+        utf8(ATTR_STR, true),
+        i64_field(ATTR_INT, true),
+        f64_field(ATTR_DOUBLE, true),
+        bool_field(ATTR_BOOL, true),
+        binary(ATTR_BYTES, true),
+        binary(ATTR_SER, true),
     ])
 }
 
-fn ts_ns(name: &str, nullable: bool) -> Field {
-    Field::new(
-        name,
-        DataType::Timestamp(TimeUnit::Nanosecond, None),
-        nullable,
-    )
+/// Leading resource/scope identity columns shared by every top-level OTAP star
+/// table (logs, spans, metrics). Builders in `batch::otap` populate these
+/// positionally, so this order is load-bearing and must stay first.
+fn resource_scope_header() -> Vec<Field> {
+    vec![
+        u16_field("id", false),
+        u16_field("resource_id", true),
+        utf8("resource_schema_url", true),
+        u32_field("resource_dropped_attributes_count", true),
+        u16_field("scope_id", true),
+        utf8("scope_name", true),
+        utf8("scope_version", true),
+        u32_field("scope_dropped_attributes_count", true),
+        utf8("schema_url", true),
+    ]
 }
 
-fn duration_ns(name: &str, nullable: bool) -> Field {
-    Field::new(name, DataType::Duration(TimeUnit::Nanosecond), nullable)
-}
-
-fn utf8(name: &str, nullable: bool) -> Field {
-    Field::new(name, DataType::Utf8, nullable)
-}
-
-fn binary(name: &str, nullable: bool) -> Field {
-    Field::new(name, DataType::Binary, nullable)
-}
-
-fn fixed(name: &str, size: i32, nullable: bool) -> Field {
-    Field::new(name, DataType::FixedSizeBinary(size), nullable)
-}
-
-fn u8_field(name: &str, nullable: bool) -> Field {
-    Field::new(name, DataType::UInt8, nullable)
-}
-
-fn u16_field(name: &str, nullable: bool) -> Field {
-    Field::new(name, DataType::UInt16, nullable)
-}
-
-fn u32_field(name: &str, nullable: bool) -> Field {
-    Field::new(name, DataType::UInt32, nullable)
-}
-
-fn u64_field(name: &str, nullable: bool) -> Field {
-    Field::new(name, DataType::UInt64, nullable)
-}
-
-fn i32_field(name: &str, nullable: bool) -> Field {
-    Field::new(name, DataType::Int32, nullable)
-}
-
-fn i64_field(name: &str, nullable: bool) -> Field {
-    Field::new(name, DataType::Int64, nullable)
-}
-
-fn f64_field(name: &str, nullable: bool) -> Field {
-    Field::new(name, DataType::Float64, nullable)
-}
-
-fn bool_field(name: &str, nullable: bool) -> Field {
-    Field::new(name, DataType::Boolean, nullable)
-}
-
-fn u64_list(name: &str, nullable: bool) -> Field {
-    Field::new(
-        name,
-        DataType::List(Field::new("item", DataType::UInt64, true).into()),
-        nullable,
-    )
-}
-
-fn f64_list(name: &str, nullable: bool) -> Field {
-    Field::new(
-        name,
-        DataType::List(Field::new("item", DataType::Float64, true).into()),
-        nullable,
-    )
+/// Leading id/parent/time columns shared by every metric data-point table
+/// (number, summary, histogram, exponential histogram). Like
+/// [`resource_scope_header`], the order is positionally load-bearing.
+fn data_point_prefix() -> Vec<Field> {
+    vec![
+        u32_field("id", false),
+        u16_field("parent_id", false),
+        ts_ns("start_time_unix_nano", true),
+        ts_ns("time_unix_nano", false),
+    ]
 }

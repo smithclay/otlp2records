@@ -30,6 +30,10 @@ use prost::Message;
 
 use crate::{
     api::{OtapLogsBatches, OtapMetricsBatches, OtapTracesBatches, SkippedMetrics},
+    otap::{
+        VALUE_BOOL, VALUE_BYTES, VALUE_EMPTY, VALUE_F64, VALUE_I64, VALUE_MAP, VALUE_SLICE,
+        VALUE_STR,
+    },
     schema::{
         otap_attrs_u16_schema_arc, otap_attrs_u32_schema_arc, otap_exemplars_schema_arc,
         otap_exp_histogram_data_points_schema_arc, otap_histogram_data_points_schema_arc,
@@ -49,15 +53,6 @@ use super::util::{
     append_f64_list, append_finite_opt, append_fixed_or_null, append_fixed_required,
     append_opt_ts_ns, append_required_ts_ns, append_u64_list, array, record_batch, u64_to_i64,
 };
-
-const VALUE_EMPTY: u8 = 0;
-const VALUE_STR: u8 = 1;
-const VALUE_I64: u8 = 2;
-const VALUE_F64: u8 = 3;
-const VALUE_BOOL: u8 = 4;
-const VALUE_MAP: u8 = 5;
-const VALUE_SLICE: u8 = 6;
-const VALUE_BYTES: u8 = 7;
 
 const METRIC_GAUGE: u8 = 1;
 const METRIC_SUM: u8 = 2;

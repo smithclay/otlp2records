@@ -1,14 +1,15 @@
 //! Public log transform orchestration.
 
-use std::time::Instant;
-
 use arrow_array::RecordBatch;
 
 use crate::{
-    api::{auto::auto_dispatch, batch_to_json_values, LogsOutput, SchemaOutput},
-    batch::{self, TransformObserver, TransformPhase, TransformSignal},
-    decode::{decode_logs_json_request, decode_logs_jsonl_request, DecodeError, InputFormat},
-    Error, Result,
+    api::{
+        auto::{auto_dispatch, decode_json_observed},
+        batch_to_json_values, LogsOutput, SchemaOutput,
+    },
+    batch::{self, TransformObserver, TransformSignal},
+    decode::{decode_logs_json_request, decode_logs_jsonl_request, InputFormat},
+    Result,
 };
 
 /// Transform OTLP logs to Arrow RecordBatch.
@@ -138,34 +139,15 @@ fn transform_logs_otap_json_observed(
     format: InputFormat,
     observer: &mut Option<&mut dyn TransformObserver>,
 ) -> Result<crate::api::OtapLogsBatches> {
-    let start = Instant::now();
-    let request = match format {
-        InputFormat::Json => {
-            let request = decode_logs_json_request(bytes)?;
-            batch::observe_phase(
-                observer,
-                TransformSignal::Logs,
-                TransformPhase::JsonDecode,
-                start.elapsed(),
-            );
-            request
-        }
-        InputFormat::Jsonl => {
-            let request = decode_logs_jsonl_request(bytes)?;
-            batch::observe_phase(
-                observer,
-                TransformSignal::Logs,
-                TransformPhase::JsonlDecode,
-                start.elapsed(),
-            );
-            request
-        }
-        _ => {
-            return Err(Error::Decode(DecodeError::Unsupported(
-                "expected JSON or JSONL logs input".to_string(),
-            )));
-        }
-    };
+    let request = decode_json_observed(
+        bytes,
+        format,
+        TransformSignal::Logs,
+        observer,
+        decode_logs_json_request,
+        decode_logs_jsonl_request,
+        "logs",
+    )?;
     batch::transform_logs_request_otap_observed(request, observer)
 }
 
@@ -174,34 +156,15 @@ fn transform_logs_json_arrow_observed(
     format: InputFormat,
     observer: &mut Option<&mut dyn TransformObserver>,
 ) -> Result<RecordBatch> {
-    let start = Instant::now();
-    let request = match format {
-        InputFormat::Json => {
-            let request = decode_logs_json_request(bytes)?;
-            batch::observe_phase(
-                observer,
-                TransformSignal::Logs,
-                TransformPhase::JsonDecode,
-                start.elapsed(),
-            );
-            request
-        }
-        InputFormat::Jsonl => {
-            let request = decode_logs_jsonl_request(bytes)?;
-            batch::observe_phase(
-                observer,
-                TransformSignal::Logs,
-                TransformPhase::JsonlDecode,
-                start.elapsed(),
-            );
-            request
-        }
-        _ => {
-            return Err(Error::Decode(DecodeError::Unsupported(
-                "expected JSON or JSONL logs input".to_string(),
-            )));
-        }
-    };
+    let request = decode_json_observed(
+        bytes,
+        format,
+        TransformSignal::Logs,
+        observer,
+        decode_logs_json_request,
+        decode_logs_jsonl_request,
+        "logs",
+    )?;
     batch::transform_logs_request_observed(request, bytes.len(), observer)
 }
 
