@@ -13,13 +13,6 @@ use arrow_array::{
 use crate::{DecodeError, Error, Result};
 
 #[inline]
-pub(super) fn non_empty_str(value: Option<&str>) -> Option<String> {
-    value
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-}
-
-#[inline]
 pub(super) fn append_opt_n(builder: &mut StringBuilder, value: Option<&str>, n: usize) {
     match value {
         Some(value) => {

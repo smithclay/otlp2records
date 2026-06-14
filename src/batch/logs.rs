@@ -7,25 +7,26 @@ use arrow_array::{
     },
     RecordBatch,
 };
-use opentelemetry_proto::tonic::{
-    collector::logs::v1::ExportLogsServiceRequest,
-    logs::v1::{LogRecord, ResourceLogs, ScopeLogs},
-};
+use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use prost::Message;
 
-use crate::{schema::logs_schema_arc, Result};
+use crate::{
+    schema::logs_schema_arc,
+    views::pdata::{LogRecordView, LogsDataView, ResourceLogsView, ScopeLogsView},
+    Result,
+};
 
 use super::{
     context::{ContextDuplicateTracker, ResourceContext, ScopeContext},
-    json::{append_attrs_json, append_log_body},
     profile::{
         finish_phase, measure_phase, measure_result, observe_counter, phase_start,
         TransformCounter, TransformObserver, TransformPhase, TransformSignal,
     },
     util::{
-        append_empty_as_null, append_fixed_or_null, append_opt_n, append_opt_ts_ns,
-        append_required_service_name_n, array, record_batch, string_builder_bytes,
+        append_fixed_or_null, append_opt_n, append_required_service_name_n, array, record_batch,
+        string_builder_bytes, u64_to_i64,
     },
+    view_json,
 };
 
 pub fn transform_logs_protobuf(bytes: &[u8]) -> Result<RecordBatch> {
@@ -59,18 +60,24 @@ pub fn transform_logs_request_observed(
     input_bytes: usize,
     observer: &mut Option<&mut dyn TransformObserver>,
 ) -> Result<RecordBatch> {
+    transform_logs_view_observed(&request, input_bytes, observer)
+}
+
+fn transform_logs_view_observed<V: LogsDataView>(
+    view: &V,
+    input_bytes: usize,
+    observer: &mut Option<&mut dyn TransformObserver>,
+) -> Result<RecordBatch> {
     let rows = measure_phase(
         observer,
         TransformSignal::Logs,
         TransformPhase::RowCount,
         || {
-            request
-                .resource_logs
-                .iter()
-                .map(|rl| {
-                    rl.scope_logs
-                        .iter()
-                        .map(|sl| sl.log_records.len())
+            view.resources()
+                .map(|resource| {
+                    resource
+                        .scopes()
+                        .map(|scope| scope.log_records().count())
                         .sum::<usize>()
                 })
                 .sum()
@@ -90,7 +97,7 @@ pub fn transform_logs_request_observed(
     );
     let mut duplicates = observer.is_some().then(ContextDuplicateTracker::default);
 
-    for resource_logs in request.resource_logs {
+    for resource_logs in view.resources() {
         append_resource_logs_observed(resource_logs, &mut builders, observer, duplicates.as_mut())?;
     }
 
@@ -102,30 +109,30 @@ pub fn transform_logs_request_observed(
     )
 }
 
-fn append_resource_logs_observed(
-    resource_logs: ResourceLogs,
+pub(crate) fn transform_logs_view<V: LogsDataView>(
+    view: &V,
+    input_bytes: usize,
+) -> Result<RecordBatch> {
+    let mut observer = None;
+    transform_logs_view_observed(view, input_bytes, &mut observer)
+}
+
+fn append_resource_logs_observed<R: ResourceLogsView>(
+    resource_logs: R,
     builders: &mut LogBuilders,
     observer: &mut Option<&mut dyn TransformObserver>,
     mut duplicates: Option<&mut ContextDuplicateTracker>,
 ) -> Result<()> {
     let resource_phase_start = phase_start(observer);
-    let ResourceLogs {
-        resource,
-        scope_logs,
-        ..
-    } = resource_logs;
-    let resource_attrs = resource
-        .as_ref()
-        .map(|r| r.attributes.as_slice())
-        .unwrap_or(&[]);
-    let resource = ResourceContext::from_attrs_observed(
-        resource_attrs,
+    let resource_view = resource_logs.resource();
+    let resource = ResourceContext::from_view_observed(
+        resource_view.as_ref(),
         TransformSignal::Logs,
         observer,
         duplicates.as_deref_mut(),
     );
 
-    for scope_logs in scope_logs {
+    for scope_logs in resource_logs.scopes() {
         append_scope_logs_observed(
             scope_logs,
             builders,
@@ -144,32 +151,22 @@ fn append_resource_logs_observed(
     Ok(())
 }
 
-fn append_scope_logs_observed(
-    scope_logs: ScopeLogs,
+fn append_scope_logs_observed<S: ScopeLogsView>(
+    scope_logs: S,
     builders: &mut LogBuilders,
     resource: &ResourceContext,
     observer: &mut Option<&mut dyn TransformObserver>,
     duplicates: Option<&mut ContextDuplicateTracker>,
 ) -> Result<()> {
     let scope_phase_start = phase_start(observer);
-    let ScopeLogs {
-        scope, log_records, ..
-    } = scope_logs;
-    let scope_name = scope.as_ref().map(|s| s.name.as_str());
-    let scope_version = scope.as_ref().map(|s| s.version.as_str());
-    let scope_attrs = scope
-        .as_ref()
-        .map(|s| s.attributes.as_slice())
-        .unwrap_or(&[]);
-    let scope = ScopeContext::new_observed(
-        scope_name,
-        scope_version,
-        scope_attrs,
+    let scope_view = scope_logs.scope();
+    let scope = ScopeContext::from_view_observed(
+        scope_view.as_ref(),
         TransformSignal::Logs,
         observer,
         duplicates,
     );
-    let record_count = log_records.len();
+    let record_count = scope_logs.log_records().count();
     if record_count > 0 {
         let context_phase_start = phase_start(observer);
         builders.append_context_observed(record_count, resource, &scope, observer);
@@ -181,7 +178,7 @@ fn append_scope_logs_observed(
         );
     }
 
-    for record in log_records {
+    for record in scope_logs.log_records() {
         append_log_record_observed(record, builders, observer)?;
     }
 
@@ -194,8 +191,8 @@ fn append_scope_logs_observed(
     Ok(())
 }
 
-fn append_log_record_observed(
-    record: LogRecord,
+fn append_log_record_observed<R: LogRecordView>(
+    record: R,
     builders: &mut LogBuilders,
     observer: &mut Option<&mut dyn TransformObserver>,
 ) -> Result<()> {
@@ -259,7 +256,7 @@ impl LogBuilders {
 
     fn append_observed(
         &mut self,
-        record: &LogRecord,
+        record: &impl LogRecordView,
         observer: &mut Option<&mut dyn TransformObserver>,
     ) -> Result<()> {
         measure_result(
@@ -267,28 +264,37 @@ impl LogBuilders {
             TransformSignal::Logs,
             TransformPhase::ArrowAppend,
             || {
-                append_opt_ts_ns(
-                    &mut self.time_unix_nano,
-                    record.time_unix_nano,
-                    "log.time_unix_nano",
-                )?;
-                append_opt_ts_ns(
-                    &mut self.observed_time_unix_nano,
-                    record.observed_time_unix_nano,
-                    "log.observed_time_unix_nano",
-                )?;
-                append_fixed_or_null(&mut self.trace_id, &record.trace_id, 16)?;
-                append_fixed_or_null(&mut self.span_id, &record.span_id, 8)?;
-                if record.severity_number == 0 {
-                    self.severity_number.append_null();
-                } else {
-                    self.severity_number.append_value(record.severity_number);
+                match record.time_unix_nano() {
+                    Some(value) => self
+                        .time_unix_nano
+                        .append_value(u64_to_i64(value, "log.time_unix_nano")?),
+                    None => self.time_unix_nano.append_null(),
                 }
-                append_empty_as_null(&mut self.severity_text, &record.severity_text);
-                append_empty_as_null(&mut self.event_name, &record.event_name);
+                match record.observed_time_unix_nano() {
+                    Some(value) => self
+                        .observed_time_unix_nano
+                        .append_value(u64_to_i64(value, "log.observed_time_unix_nano")?),
+                    None => self.observed_time_unix_nano.append_null(),
+                }
+                append_fixed_or_null(
+                    &mut self.trace_id,
+                    record.trace_id().map(|id| id.as_slice()).unwrap_or(&[]),
+                    16,
+                )?;
+                append_fixed_or_null(
+                    &mut self.span_id,
+                    record.span_id().map(|id| id.as_slice()).unwrap_or(&[]),
+                    8,
+                )?;
+                match record.severity_number() {
+                    Some(value) => self.severity_number.append_value(value),
+                    None => self.severity_number.append_null(),
+                }
+                append_view_text(&mut self.severity_text, record.severity_text());
+                append_view_text(&mut self.event_name, record.event_name());
                 self.dropped_attributes_count
-                    .append_value(record.dropped_attributes_count);
-                self.flags.append_value(record.flags);
+                    .append_value(record.dropped_attributes_count());
+                self.flags.append_value(record.flags().unwrap_or_default());
                 Ok::<(), crate::Error>(())
             },
         )?;
@@ -297,7 +303,7 @@ impl LogBuilders {
             observer,
             TransformSignal::Logs,
             TransformPhase::BodyAppend,
-            || append_log_body(&mut self.body, record.body.as_ref()),
+            || view_json::append_body(&mut self.body, record.body()),
         )?;
 
         measure_result(
@@ -305,9 +311,9 @@ impl LogBuilders {
             TransformSignal::Logs,
             TransformPhase::LogAttributesJson,
             || {
-                append_attrs_json(
+                view_json::append_attributes(
                     &mut self.log_attributes,
-                    &record.attributes,
+                    record.attributes(),
                     &mut self.json_scratch,
                 )
             },
@@ -438,5 +444,14 @@ impl LogBuilders {
                 array(self.flags.finish()),
             ],
         )
+    }
+}
+
+fn append_view_text(builder: &mut StringBuilder, value: Option<&[u8]>) {
+    match value {
+        Some(value) if !value.is_empty() => {
+            builder.append_value(String::from_utf8_lossy(value).as_ref())
+        }
+        _ => builder.append_null(),
     }
 }

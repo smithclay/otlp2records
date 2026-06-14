@@ -2,6 +2,7 @@
 name = "otlp2records"
 version = "0.9.1"
 edition = "2021"
+rust-version = "1.86"
 license = "Apache-2.0"
 description = "Transform OTLP telemetry to flattened records"
 keywords = ["opentelemetry", "otlp", "arrow", "observability"]
@@ -9,6 +10,7 @@ categories = ["data-structures", "encoding"]
 repository = "https://github.com/smithclay/otlp2records"
 homepage = "https://github.com/smithclay/otlp2records"
 documentation = "https://docs.rs/otlp2records"
+exclude = ["tools/otap-fixture-gen"]
 
 [dependencies]
 # Decoding
@@ -24,10 +26,11 @@ serde_json = "1"
 bytes = "1"
 ordered-float = "4"
 base64 = "0.22"
+ciborium = "0.2"
 
 # Arrow
 arrow-array = { version = "58", features = ["ffi"] }
-arrow-ipc = "58"
+arrow-ipc = { version = "58", features = ["lz4"] }
 arrow-json = "58"
 arrow-schema = { version = "58", features = ["ffi"] }
 arrow-select = "58"
@@ -47,6 +50,10 @@ features = ["arrow"]
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 getrandom = { version = "0.2", features = ["js"] }
+# opentelemetry_sdk pulls rand 0.9/getrandom 0.3 through the OTLP signal
+# features. Enable its browser backend; .cargo/config.toml selects it only for
+# wasm32-unknown-unknown.
+getrandom_03 = { package = "getrandom", version = "0.3", features = ["wasm_js"] }
 wasm-bindgen = { version = "0.2", optional = true }
 
 [lib]
@@ -63,6 +70,9 @@ wasm = ["getrandom/js", "dep:wasm-bindgen"]
 # Enable the C FFI bindings module. The C ABI is the hand-written, canonical
 # include/otlp2records.h; there is no generated header.
 ffi = []
+# Upstream Producer defaults to Zstandard. Arrow's Zstandard backend compiles
+# bundled C and therefore needs a wasm-capable C toolchain for wasm32 builds.
+otap-zstd = ["arrow-ipc/zstd"]
 
 [profile.release]
 opt-level = 3

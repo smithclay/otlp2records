@@ -280,14 +280,14 @@ fn point_attrs(idx: usize, seed: usize) -> Vec<KeyValue> {
             STATUS_CODES[idx % STATUS_CODES.len()],
         ),
         string_kv("cloud.region", REGIONS[(idx + seed * 2) % REGIONS.len()]),
-        bool_kv("feature.enabled", (idx + seed).is_multiple_of(2)),
+        bool_kv("feature.enabled", (idx + seed) % 2 == 0),
         int_kv("shard", ((idx + seed) % 64) as i64),
         string_kv("customer.tier", TIERS[(idx + seed) % TIERS.len()]),
     ]
 }
 
 fn exemplars(idx: usize) -> Vec<Exemplar> {
-    if !idx.is_multiple_of(16) {
+    if idx % 16 != 0 {
         return Vec::new();
     }
 

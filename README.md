@@ -14,6 +14,8 @@ Currently consumed by [duckdb-otlp](https://github.com/smithclay/duckdb-otlp), [
 - **No async**: Pure synchronous transforms
 - **WASM-first**: All dependencies compile to wasm32
 - **Arrow-native**: RecordBatch is the canonical output format
+- **Shared log normalization**: OTLP logs traverse semantic view traits
+  compatible with OpenTelemetry Arrow `pdata-views`
 
 ## Features
 
@@ -90,6 +92,15 @@ Build with the `wasm` feature for browser/Node.js environments:
 
 ```bash
 cargo build --target wasm32-unknown-unknown --features wasm
+```
+
+Crates.io consumers should select the `getrandom 0.3` browser backend in the
+top-level workspace (dependency-local Cargo config is not inherited):
+
+```toml
+# .cargo/config.toml
+[target.wasm32-unknown-unknown]
+rustflags = ['--cfg', 'getrandom_backend="wasm_js"']
 ```
 
 ```javascript
@@ -386,6 +397,16 @@ Exponential histograms use the common metric context fields above, plus
 | `default` | Core functionality | Yes |
 | `parquet` | Enable Parquet output | No |
 | `wasm` | Enable WASM bindings | No |
+| `otap-zstd` | Add upstream-default Zstandard OTAP IPC support | No |
+
+## Native OTAP Input
+
+Canonical `BatchArrowRecords` logs, traces, and univariate metrics decode
+through a stateful `OtapDecoder` into the existing normalized schemas. Enable
+`otap-zstd` for the upstream Producer's default compression. Uncompressed/LZ4
+decoding remains WASM-compatible; Zstandard requires a platform C toolchain. See
+[docs/otap-input.md](docs/otap-input.md) for the API, protocol coverage,
+provenance, and remaining protocol boundaries.
 
 ## Performance
 

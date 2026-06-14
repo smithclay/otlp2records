@@ -1,6 +1,18 @@
-/target
-rust-toolchain.toml
+# Rust build output, including nested helper crates.
+target/
+**/target/
+
+# This library intentionally does not pin application dependency resolution.
 Cargo.lock
 
-# Parquet outputs from examples
+# Local toolchains and editor/OS state.
+rust-toolchain.toml
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Parquet outputs from examples.
 testdata/output/

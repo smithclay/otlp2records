@@ -28,9 +28,11 @@ mod batch;
 mod decode;
 mod error;
 pub mod fixtures;
+pub mod otap;
 mod output;
 pub mod proto_output;
 mod schema;
+mod views;
 
 #[cfg(feature = "ffi")]
 #[path = "bindings/ffi.rs"]

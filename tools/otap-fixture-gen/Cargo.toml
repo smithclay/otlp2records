@@ -1,0 +1,10 @@
+[package]
+name = "otap-fixture-gen"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+arrow-ipc = "58"
+otap-df-pdata = { path = "../../../otel-arrow/rust/otap-dataflow/crates/pdata" }
+prost = "0.14"

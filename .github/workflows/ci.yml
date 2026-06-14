@@ -12,6 +12,23 @@ env:
   RUSTFLAGS: -Dwarnings
 
 jobs:
+  msrv:
+    name: Rust 1.86 and WASM
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust 1.86
+        uses: dtolnay/rust-toolchain@1.86
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Check MSRV
+        run: cargo check --all-features
+
+      - name: Check WASM, including native OTAP
+        run: cargo check --target wasm32-unknown-unknown --features wasm
+
   test:
     name: Test
     runs-on: ubuntu-latest
