@@ -136,31 +136,6 @@ const arrowIpc = transform_logs_wasm(otlpBytes, "protobuf");
 | `transform_traces(bytes, format)` | Transform OTLP traces to Arrow RecordBatch |
 | `transform_metrics(bytes, format)` | Transform OTLP metrics to MetricBatches |
 
-### Schema Output Selection
-
-The default output is `SchemaOutput::Normalized`, the flattened ClickStack-compatible
-schema used by the existing `transform_logs`, `transform_traces`, and
-`transform_metrics` APIs. The aliases `"normalized"`, `"clickstack"`,
-`"clickstack-mode"`, `""`, and `"default"` all parse to this default.
-
-Rust callers can opt into `SchemaOutput::OtapStar` with explicit APIs:
-
-| Function | Description |
-|----------|-------------|
-| `transform_logs_with_schema(bytes, format, schema_output)` | Transform logs to `LogsOutput::Normalized` or `LogsOutput::OtapStar` |
-| `transform_traces_with_schema(bytes, format, schema_output)` | Transform traces to `TracesOutput::Normalized` or `TracesOutput::OtapStar` |
-| `transform_metrics_with_schema(bytes, format, schema_output)` | Transform metrics to `MetricsOutput::Normalized` or `MetricsOutput::OtapStar` |
-
-`otap-star` / `otap_star` emits multi-table Arrow batches modeled after the
-OpenTelemetry otel-arrow data model. Instead of flattened JSON columns such as
-`events_json`, `links_json`, `metric_attributes`, or `exemplars_json`, child
-entities are emitted as separate tables keyed by deterministic `id` and
-`parent_id` columns. Use `iter_named_batches()` on `OtapLogsBatches`,
-`OtapTracesBatches`, or `OtapMetricsBatches` to serialize each named table.
-
-The FFI and WASM bindings continue to expose the normalized single-batch shape in
-this release. `otap-star` is Rust API only to avoid changing those ABIs.
-
 ### Breaking Changes In 0.8.0
 
 The 0.7 to 0.8 release intentionally changes the default normalized schema. The
@@ -188,8 +163,7 @@ Key normalized-schema changes:
 
 The flattened JSON convenience columns remain for now: `resource_attributes`,
 `scope_attributes`, signal attribute JSON columns, `events_json`, `links_json`,
-and `exemplars_json`. The new `otap-star` output is the more relational
-multi-table shape for callers that want child tables instead of flattened JSON.
+and `exemplars_json`.
 
 ### Transform Observation
 
@@ -205,24 +179,6 @@ Implement `TransformObserver` to receive `TransformPhaseTiming` and `TransformCo
 events. Counters include duplicate resource/scope context hits and misses plus repeated
 resource/scope attribute row-copy counts and bytes.
 
-To observe an OTAP star transform, use the `*_with_schema_and_observer` entry
-points, which route to either schema and thread the observer through:
-
-| Function | Description |
-|----------|-------------|
-| `transform_logs_with_schema_and_observer(bytes, format, schema_output, observer)` | Logs transform with both schema selection and observer |
-| `transform_traces_with_schema_and_observer(bytes, format, schema_output, observer)` | Traces transform with both schema selection and observer |
-| `transform_metrics_with_schema_and_observer(bytes, format, schema_output, observer)` | Metrics transform with both schema selection and observer |
-
-The OTAP path emits the same phase enum (`ProtobufDecode`, `JsonDecode`,
-`JsonlDecode`, `BuilderInit`, `ResourceLogsBuild` / `ResourceSpansBuild` /
-`ResourceMetricsBuild`, the matching `Scope*Build` and per-record
-`LogRecordBuild` / `SpanBuild` / `MetricBuild`, and `ArrowFinalize`) plus the
-`OutputRows`, `Resource/ScopeContextDuplicateHit`, and
-`Resource/ScopeContextDuplicateMiss` counters. The
-`Resource/ScopeAttributesRowCopies*` counters are normalized-only — OTAP
-emits attributes as their own child tables, so no row replication happens.
-
 ### Output Functions
 
 | Function | Description |
@@ -231,8 +187,7 @@ emits attributes as their own child tables, so no row replication happens.
 | `to_ipc(&batch)` | Convert RecordBatch to Arrow IPC format |
 | `to_parquet(&batch)` | Convert RecordBatch to Parquet (requires feature) |
 
-These serializers operate on one `RecordBatch` at a time. For `otap-star`, call
-them per table by iterating named batches.
+These serializers operate on one `RecordBatch` at a time.
 
 ### Schemas
 
@@ -292,10 +247,9 @@ them per table by iterating named batches.
 
 ## Output Schemas
 
-`SchemaOutput::Normalized` is the default flattened schema. In 0.8.0 it uses
+The transform APIs emit a flattened, normalized schema. In 0.8.0 it uses
 OTAP-compatible field names and high-value Arrow physical types while keeping
-the flattened resource/scope/attribute convenience columns. The `clickstack`
-and `clickstack-mode` schema aliases still select this normalized output.
+the flattened resource/scope/attribute convenience columns.
 
 ### Logs Schema
 

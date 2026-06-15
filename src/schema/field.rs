@@ -24,20 +24,8 @@ pub(crate) fn utf8(name: &str, nullable: bool) -> Field {
     Field::new(name, DataType::Utf8, nullable)
 }
 
-pub(crate) fn binary(name: &str, nullable: bool) -> Field {
-    Field::new(name, DataType::Binary, nullable)
-}
-
 pub(crate) fn fixed(name: &str, size: i32, nullable: bool) -> Field {
     Field::new(name, DataType::FixedSizeBinary(size), nullable)
-}
-
-pub(crate) fn u8_field(name: &str, nullable: bool) -> Field {
-    Field::new(name, DataType::UInt8, nullable)
-}
-
-pub(crate) fn u16_field(name: &str, nullable: bool) -> Field {
-    Field::new(name, DataType::UInt16, nullable)
 }
 
 pub(crate) fn u32_field(name: &str, nullable: bool) -> Field {

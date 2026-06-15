@@ -44,13 +44,10 @@ pub mod wasm;
 
 pub use api::{
     transform_logs, transform_logs_json, transform_logs_partitioned, transform_logs_with_observer,
-    transform_logs_with_schema, transform_logs_with_schema_and_observer, transform_metrics,
-    transform_metrics_json, transform_metrics_partitioned, transform_metrics_with_observer,
-    transform_metrics_with_schema, transform_metrics_with_schema_and_observer, transform_traces,
-    transform_traces_json, transform_traces_partitioned, transform_traces_with_observer,
-    transform_traces_with_schema, transform_traces_with_schema_and_observer, JsonMetricBatches,
-    LogsOutput, MetricBatches, MetricsOutput, OtapLogsBatches, OtapMetricsBatches,
-    OtapTracesBatches, SchemaOutput, SkippedMetrics, TracesOutput,
+    transform_metrics, transform_metrics_json, transform_metrics_partitioned,
+    transform_metrics_with_observer, transform_traces, transform_traces_json,
+    transform_traces_partitioned, transform_traces_with_observer, JsonMetricBatches, MetricBatches,
+    SkippedMetrics,
 };
 pub use arrow::{
     extract_min_timestamp_micros, extract_service_name, group_batch_by_service, PartitionedBatch,
@@ -68,9 +65,3 @@ pub use output::{to_ipc, to_json};
 pub use schema::{
     exp_histogram_schema, gauge_schema, histogram_schema, logs_schema, sum_schema, traces_schema,
 };
-
-// OTAP star Arrow schemas are not re-exported at the crate root. They are
-// available via the corresponding `RecordBatch::schema()` on the tables inside
-// `OtapLogsBatches`, `OtapTracesBatches`, and `OtapMetricsBatches` — that is
-// the supported way to inspect OTAP types. Adding 13 free-standing schema
-// accessors doubled the public surface without adding capability.

@@ -812,7 +812,7 @@ mod transport_tests {
             vec![
                 Arc::new(UInt32Array::from(vec![1])),
                 Arc::new(StringArray::from(vec!["k"])),
-                Arc::new(UInt8Array::from(vec![super::super::VALUE_STR])),
+                Arc::new(UInt8Array::from(vec![super::super::wire::VALUE_STR])),
                 Arc::new(StringArray::from(vec![None::<&str>])),
             ],
         )

@@ -6,8 +6,6 @@ use std::{
     hash::{Hash, Hasher},
 };
 
-use opentelemetry_proto::tonic::common::v1::{any_value, AnyValue, KeyValue};
-
 use crate::views::pdata::{
     AnyValueView, AttributeView, InstrumentationScopeView, ResourceView, ValueType,
 };
@@ -149,53 +147,6 @@ impl ScopeContext {
             name,
             version,
             attributes_json,
-        }
-    }
-}
-
-pub(super) fn hash_attrs(attrs: &[KeyValue], hasher: &mut impl Hasher) {
-    attrs.len().hash(hasher);
-    for attr in attrs {
-        attr.key.hash(hasher);
-        hash_any_value(attr.value.as_ref(), hasher);
-    }
-}
-
-pub(super) fn hash_any_value(value: Option<&AnyValue>, hasher: &mut impl Hasher) {
-    match value.and_then(|value| value.value.as_ref()) {
-        Some(any_value::Value::StringValue(value)) => {
-            1_u8.hash(hasher);
-            value.hash(hasher);
-        }
-        Some(any_value::Value::BoolValue(value)) => {
-            2_u8.hash(hasher);
-            value.hash(hasher);
-        }
-        Some(any_value::Value::IntValue(value)) => {
-            3_u8.hash(hasher);
-            value.hash(hasher);
-        }
-        Some(any_value::Value::DoubleValue(value)) => {
-            4_u8.hash(hasher);
-            value.to_bits().hash(hasher);
-        }
-        Some(any_value::Value::BytesValue(value)) => {
-            5_u8.hash(hasher);
-            value.hash(hasher);
-        }
-        Some(any_value::Value::ArrayValue(value)) => {
-            6_u8.hash(hasher);
-            value.values.len().hash(hasher);
-            for value in &value.values {
-                hash_any_value(Some(value), hasher);
-            }
-        }
-        Some(any_value::Value::KvlistValue(value)) => {
-            7_u8.hash(hasher);
-            hash_attrs(&value.values, hasher);
-        }
-        None => {
-            0_u8.hash(hasher);
         }
     }
 }

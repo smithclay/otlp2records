@@ -33,9 +33,10 @@ pub struct ArrowPayload {
 /// column (otel-arrow `AttributeValueType`).
 ///
 /// `Map` (5) and `Slice` (6) payloads are CBOR-serialized into the `ser`
-/// column; the remaining variants map to their like-named typed columns. These
-/// are shared by the OTAP encoder (`batch::otap`) and decoder (`otap::logs`) so
-/// the two directions cannot disagree on the numbering.
+/// column; the remaining variants map to their like-named typed columns. They
+/// are shared by the decoder (`otap::logs`) and the structural validator
+/// (`otap::validation`) so the column reader and validator cannot disagree on
+/// the numbering.
 pub(crate) const VALUE_EMPTY: u8 = 0;
 pub(crate) const VALUE_STR: u8 = 1;
 pub(crate) const VALUE_I64: u8 = 2;
@@ -49,9 +50,9 @@ pub(crate) const VALUE_BYTES: u8 = 7;
 /// the typed payload columns, which line up 1:1 with the `VALUE_*` constants
 /// above (`VALUE_STR` → `ATTR_STR`, etc.) — together with the attribute `key`.
 /// This same column layout backs attribute records and the log `body` struct.
-/// Shared by the star schema (`schema::otap`), the structural validator
-/// (`otap::validation`), and the decoder (`otap::logs`) so a rename cannot
-/// silently desync one of the three from the others.
+/// Shared by the structural validator (`otap::validation`) and the decoder
+/// (`otap::logs`) so a rename cannot silently desync the validator from the
+/// reader.
 pub(crate) const ATTR_KEY: &str = "key";
 pub(crate) const ATTR_TYPE: &str = "type";
 pub(crate) const ATTR_STR: &str = "str";

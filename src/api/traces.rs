@@ -5,7 +5,7 @@ use arrow_array::RecordBatch;
 use crate::{
     api::{
         auto::{auto_dispatch, decode_json_observed},
-        batch_to_json_values, SchemaOutput, TracesOutput,
+        batch_to_json_values,
     },
     batch::{self, TransformObserver, TransformSignal},
     decode::{decode_traces_json_request, decode_traces_jsonl_request, InputFormat},
@@ -24,19 +24,6 @@ pub fn transform_traces(bytes: &[u8], format: InputFormat) -> Result<RecordBatch
     }
 }
 
-/// Transform OTLP traces using an explicit schema output.
-pub fn transform_traces_with_schema(
-    bytes: &[u8],
-    format: InputFormat,
-    schema_output: SchemaOutput,
-) -> Result<TracesOutput> {
-    match schema_output {
-        SchemaOutput::Normalized => transform_traces(bytes, format).map(TracesOutput::Normalized),
-        SchemaOutput::OtapStar => transform_traces_otap(bytes, format)
-            .map(|batches| TracesOutput::OtapStar(Box::new(batches))),
-    }
-}
-
 /// Transform OTLP traces while reporting phase timings to an observer.
 pub fn transform_traces_with_observer(
     bytes: &[u8],
@@ -45,27 +32,6 @@ pub fn transform_traces_with_observer(
 ) -> Result<RecordBatch> {
     let mut observer = Some(observer);
     transform_traces_observed(bytes, format, &mut observer)
-}
-
-/// Transform OTLP traces with both explicit schema selection and observer
-/// instrumentation. Routes through the normalized or OTAP star pipeline based
-/// on `schema_output`; both paths emit phase timings and counters via
-/// `observer`. OTAP currently surfaces `OutputRows` plus the resource/scope
-/// dedup hit/miss counters.
-pub fn transform_traces_with_schema_and_observer(
-    bytes: &[u8],
-    format: InputFormat,
-    schema_output: SchemaOutput,
-    observer: &mut dyn TransformObserver,
-) -> Result<TracesOutput> {
-    let mut observer = Some(observer);
-    match schema_output {
-        SchemaOutput::Normalized => {
-            transform_traces_observed(bytes, format, &mut observer).map(TracesOutput::Normalized)
-        }
-        SchemaOutput::OtapStar => transform_traces_otap_observed(bytes, format, &mut observer)
-            .map(|batches| TracesOutput::OtapStar(Box::new(batches))),
-    }
 }
 
 fn transform_traces_observed(
@@ -85,79 +51,6 @@ fn transform_traces_observed(
 fn transform_traces_json_arrow(bytes: &[u8], format: InputFormat) -> Result<RecordBatch> {
     let mut observer = None;
     transform_traces_json_arrow_observed(bytes, format, &mut observer)
-}
-
-fn transform_traces_otap(
-    bytes: &[u8],
-    format: InputFormat,
-) -> Result<crate::api::OtapTracesBatches> {
-    match format {
-        InputFormat::Protobuf => batch::transform_traces_protobuf_otap(bytes),
-        InputFormat::Auto => transform_traces_otap_auto(bytes),
-        InputFormat::Json => {
-            batch::transform_traces_request_otap(decode_traces_json_request(bytes)?)
-        }
-        InputFormat::Jsonl => {
-            batch::transform_traces_request_otap(decode_traces_jsonl_request(bytes)?)
-        }
-    }
-}
-
-fn transform_traces_otap_auto(bytes: &[u8]) -> Result<crate::api::OtapTracesBatches> {
-    auto_dispatch(
-        bytes,
-        &mut (),
-        |b, _| transform_traces_otap(b, InputFormat::Json),
-        |b, _| transform_traces_otap(b, InputFormat::Jsonl),
-        |b, _| batch::transform_traces_protobuf_otap(b),
-    )
-}
-
-fn transform_traces_otap_observed(
-    bytes: &[u8],
-    format: InputFormat,
-    observer: &mut Option<&mut dyn TransformObserver>,
-) -> Result<crate::api::OtapTracesBatches> {
-    match format {
-        InputFormat::Protobuf => batch::transform_traces_protobuf_otap_observed(bytes, observer),
-        InputFormat::Auto => transform_traces_otap_auto_observed(bytes, observer),
-        InputFormat::Json => {
-            transform_traces_otap_json_observed(bytes, InputFormat::Json, observer)
-        }
-        InputFormat::Jsonl => {
-            transform_traces_otap_json_observed(bytes, InputFormat::Jsonl, observer)
-        }
-    }
-}
-
-fn transform_traces_otap_auto_observed(
-    bytes: &[u8],
-    observer: &mut Option<&mut dyn TransformObserver>,
-) -> Result<crate::api::OtapTracesBatches> {
-    auto_dispatch(
-        bytes,
-        observer,
-        |b, obs| transform_traces_otap_json_observed(b, InputFormat::Json, obs),
-        |b, obs| transform_traces_otap_json_observed(b, InputFormat::Jsonl, obs),
-        |b, obs| batch::transform_traces_protobuf_otap_observed(b, obs),
-    )
-}
-
-fn transform_traces_otap_json_observed(
-    bytes: &[u8],
-    format: InputFormat,
-    observer: &mut Option<&mut dyn TransformObserver>,
-) -> Result<crate::api::OtapTracesBatches> {
-    let request = decode_json_observed(
-        bytes,
-        format,
-        TransformSignal::Traces,
-        observer,
-        decode_traces_json_request,
-        decode_traces_jsonl_request,
-        "traces",
-    )?;
-    batch::transform_traces_request_otap_observed(request, observer)
 }
 
 fn transform_traces_json_arrow_observed(

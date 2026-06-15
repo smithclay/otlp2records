@@ -45,7 +45,7 @@ enable `otap-zstd` to accept that output:
 
 ```toml
 otlp2records = {
-  version = "0.9",
+  version = "0.10",
   features = ["otap-zstd"]
 }
 ```
