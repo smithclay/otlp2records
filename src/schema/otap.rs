@@ -1,10 +1,10 @@
 //! OTAP star Arrow schema accessors.
 //!
-//! The `otap_*_schema()` functions are preserved for parity with the normalized
-//! schema accessors (and so external consumers can reintroduce them at the
-//! crate root if needed). Internal call sites use the `_arc` variants instead
-//! so the cached `Lazy<Arc<Schema>>` is shared by reference, eliminating the
-//! per-call `Schema::clone` + `Arc::new` pair from each `record_batch` build.
+//! The `pub(crate)` `otap_*_schema()` functions are preserved for parity with
+//! the normalized schema accessors. Internal call sites use the `_arc` variants
+//! instead so the cached `Lazy<Arc<Schema>>` is shared by reference,
+//! eliminating the per-call `Schema::clone` + `Arc::new` pair from each
+//! `record_batch` build.
 
 use std::sync::Arc;
 
@@ -119,9 +119,9 @@ static OTAP_EXEMPLARS_SCHEMA: Lazy<Arc<Schema>> = Lazy::new(|| {
     ]))
 });
 
-// Quantile values live in the separate `quantile` child table (see B3 in the
-// review notes). Keeping a single representation avoids forcing consumers to
-// dedupe between an embedded list and the relational table.
+// Quantile values live in the separate `quantile` child table. Keeping a single
+// representation avoids forcing consumers to dedupe between an embedded list and
+// the relational table.
 static OTAP_SUMMARY_DPS_SCHEMA: Lazy<Arc<Schema>> = Lazy::new(|| {
     Arc::new(Schema::new(
         [
@@ -208,67 +208,67 @@ static OTAP_SPAN_LINKS_SCHEMA: Lazy<Arc<Schema>> = Lazy::new(|| {
 });
 
 #[allow(dead_code)]
-pub fn otap_logs_schema() -> Schema {
+pub(crate) fn otap_logs_schema() -> Schema {
     (**OTAP_LOGS_SCHEMA).clone()
 }
 
 #[allow(dead_code)]
-pub fn otap_spans_schema() -> Schema {
+pub(crate) fn otap_spans_schema() -> Schema {
     (**OTAP_SPANS_SCHEMA).clone()
 }
 
 #[allow(dead_code)]
-pub fn otap_metrics_schema() -> Schema {
+pub(crate) fn otap_metrics_schema() -> Schema {
     (**OTAP_METRICS_SCHEMA).clone()
 }
 
 #[allow(dead_code)]
-pub fn otap_attrs_u16_schema() -> Schema {
+pub(crate) fn otap_attrs_u16_schema() -> Schema {
     (**OTAP_ATTRS_U16_SCHEMA).clone()
 }
 
 #[allow(dead_code)]
-pub fn otap_attrs_u32_schema() -> Schema {
+pub(crate) fn otap_attrs_u32_schema() -> Schema {
     (**OTAP_ATTRS_U32_SCHEMA).clone()
 }
 
 #[allow(dead_code)]
-pub fn otap_number_data_points_schema() -> Schema {
+pub(crate) fn otap_number_data_points_schema() -> Schema {
     (**OTAP_NUMBER_DPS_SCHEMA).clone()
 }
 
 #[allow(dead_code)]
-pub fn otap_exemplars_schema() -> Schema {
+pub(crate) fn otap_exemplars_schema() -> Schema {
     (**OTAP_EXEMPLARS_SCHEMA).clone()
 }
 
 #[allow(dead_code)]
-pub fn otap_summary_data_points_schema() -> Schema {
+pub(crate) fn otap_summary_data_points_schema() -> Schema {
     (**OTAP_SUMMARY_DPS_SCHEMA).clone()
 }
 
 #[allow(dead_code)]
-pub fn otap_quantile_schema() -> Schema {
+pub(crate) fn otap_quantile_schema() -> Schema {
     (**OTAP_QUANTILE_SCHEMA).clone()
 }
 
 #[allow(dead_code)]
-pub fn otap_histogram_data_points_schema() -> Schema {
+pub(crate) fn otap_histogram_data_points_schema() -> Schema {
     (**OTAP_HISTOGRAM_DPS_SCHEMA).clone()
 }
 
 #[allow(dead_code)]
-pub fn otap_exp_histogram_data_points_schema() -> Schema {
+pub(crate) fn otap_exp_histogram_data_points_schema() -> Schema {
     (**OTAP_EXP_HISTOGRAM_DPS_SCHEMA).clone()
 }
 
 #[allow(dead_code)]
-pub fn otap_span_events_schema() -> Schema {
+pub(crate) fn otap_span_events_schema() -> Schema {
     (**OTAP_SPAN_EVENTS_SCHEMA).clone()
 }
 
 #[allow(dead_code)]
-pub fn otap_span_links_schema() -> Schema {
+pub(crate) fn otap_span_links_schema() -> Schema {
     (**OTAP_SPAN_LINKS_SCHEMA).clone()
 }
 

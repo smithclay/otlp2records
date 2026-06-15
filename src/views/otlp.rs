@@ -1,7 +1,8 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Zero-allocation OTLP Prost adapters for the semantic logs views.
+//! Zero-allocation OTLP Prost adapters for the semantic logs, traces, and
+//! metrics views.
 
 use std::{marker::PhantomData, slice};
 
@@ -22,10 +23,10 @@ use opentelemetry_proto::tonic::{
 };
 
 use super::pdata::{
-    AggregationTemporality, AnyValueView, AttributeView, BucketsView, DataPointFlags, DataType,
-    DataView, EventView, ExemplarView, ExponentialHistogramDataPointView, ExponentialHistogramView,
-    GaugeView, HistogramDataPointView, HistogramView, InstrumentationScopeView, LinkView,
-    LogRecordView, LogsDataView, MetricView, MetricsView, NumberDataPointView, ResourceLogsView,
+    AnyValueView, AttributeView, BucketsView, DataPointFlags, DataType, DataView, EventView,
+    ExemplarView, ExponentialHistogramDataPointView, ExponentialHistogramView, GaugeView,
+    HistogramDataPointView, HistogramView, InstrumentationScopeView, LinkView, LogRecordView,
+    LogsDataView, MetricView, MetricsView, NumberDataPointView, ResourceLogsView,
     ResourceMetricsView, ResourceSpansView, ResourceView, ScopeLogsView, ScopeMetricsView,
     ScopeSpansView, SpanId, SpanView, StatusView, Str, SumView, SummaryDataPointView, SummaryView,
     TraceId, TracesView, Value, ValueAtQuantileView, ValueType,
@@ -687,8 +688,8 @@ impl SumView for Obj<'_, Sum> {
         ObjIter::new(self.inner.data_points.iter())
     }
 
-    fn aggregation_temporality(&self) -> AggregationTemporality {
-        (self.inner.aggregation_temporality as u32).into()
+    fn aggregation_temporality(&self) -> i32 {
+        self.inner.aggregation_temporality
     }
 
     fn is_monotonic(&self) -> bool {
@@ -792,8 +793,8 @@ impl HistogramView for Obj<'_, Histogram> {
         ObjIter::new(self.inner.data_points.iter())
     }
 
-    fn aggregation_temporality(&self) -> AggregationTemporality {
-        (self.inner.aggregation_temporality as u32).into()
+    fn aggregation_temporality(&self) -> i32 {
+        self.inner.aggregation_temporality
     }
 }
 
@@ -872,8 +873,8 @@ impl ExponentialHistogramView for Obj<'_, ExponentialHistogram> {
         ObjIter::new(self.inner.data_points.iter())
     }
 
-    fn aggregation_temporality(&self) -> AggregationTemporality {
-        (self.inner.aggregation_temporality as u32).into()
+    fn aggregation_temporality(&self) -> i32 {
+        self.inner.aggregation_temporality
     }
 }
 

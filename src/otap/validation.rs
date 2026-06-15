@@ -1,4 +1,4 @@
-use arrow_array::{Array, ArrayRef, RecordBatch, StructArray};
+use arrow_array::{Array, ArrayRef, ListArray, RecordBatch, StructArray};
 use arrow_schema::{DataType, TimeUnit};
 
 use super::wire::{
@@ -270,6 +270,7 @@ const EXEMPLARS: &[Column] = &[
     column!("trace_id", dict(KeySize::U8, Simple::FixedSizeBinary(16))),
 ];
 
+#[derive(Clone, Copy)]
 pub(super) enum PayloadSchema {
     Attrs16,
     Attrs32,
@@ -348,12 +349,19 @@ fn matches_expected(array: &ArrayRef, expected: Expected) -> Result<bool> {
         } => match array.data_type() {
             data_type if value_type.matches(data_type) => true,
             DataType::Dictionary(key, value) => {
+                // Accept signed and unsigned keys at each width to match the
+                // decoder's `expect_dict_or`/`dictionary_value!` handling, so a
+                // legitimate `Dictionary(Int8, ...)` producer is not rejected
+                // here only to be decoded successfully elsewhere.
                 value_type.matches(value)
                     && matches!(
                         (min_key_size, key.as_ref()),
                         (KeySize::U8, DataType::UInt8)
+                            | (KeySize::U8, DataType::Int8)
                             | (KeySize::U8, DataType::UInt16)
+                            | (KeySize::U8, DataType::Int16)
                             | (KeySize::U16, DataType::UInt16)
+                            | (KeySize::U16, DataType::Int16)
                     )
             }
             _ => false,
@@ -374,7 +382,25 @@ fn matches_expected(array: &ArrayRef, expected: Expected) -> Result<bool> {
             let DataType::List(field) = array.data_type() else {
                 return Ok(false);
             };
-            simple.matches(field.data_type())
+            if !simple.matches(field.data_type()) {
+                return Ok(false);
+            }
+            // Canonical OTAP repeated scalar columns (histogram bucket counts and
+            // explicit bounds, exponential bucket counts, summary quantile values)
+            // never carry null elements. A null element would shorten the decoded
+            // Vec and misalign bucket counts against their bounds, so reject it
+            // here rather than letting the view layer silently drop it.
+            if let Some(list) = array.as_any().downcast_ref::<ListArray>() {
+                for row in 0..list.len() {
+                    if list.is_valid(row) && list.value(row).null_count() > 0 {
+                        return Err(Error::Otap(
+                            "an OTAP list column contains a null element, which is not canonical OTAP"
+                                .into(),
+                        ));
+                    }
+                }
+            }
+            true
         }
         Expected::ListStruct(columns) => {
             let DataType::List(field) = array.data_type() else {
@@ -425,7 +451,9 @@ impl Simple {
 mod tests {
     use std::sync::Arc;
 
-    use arrow_array::{Int64Array, RecordBatch, UInt16Array, UInt64Array};
+    use arrow_array::{
+        types::UInt64Type, Int64Array, ListArray, RecordBatch, UInt16Array, UInt64Array,
+    };
     use arrow_schema::{Field, Schema};
 
     use super::*;
@@ -473,6 +501,28 @@ mod tests {
             vec![
                 Arc::new(UInt16Array::from(vec![1])),
                 Arc::new(UInt64Array::from(vec![1])),
+            ],
+        )
+        .unwrap();
+
+        assert!(validate(PayloadSchema::HistogramPoints, "histogram points", &batch).is_err());
+    }
+
+    #[test]
+    fn rejects_null_element_in_histogram_bucket_counts() {
+        let bucket_counts = ListArray::from_iter_primitive::<UInt64Type, _, _>(vec![Some(vec![
+            Some(1u64),
+            None,
+            Some(3u64),
+        ])]);
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("parent_id", DataType::UInt16, false),
+                Field::new("bucket_counts", bucket_counts.data_type().clone(), true),
+            ])),
+            vec![
+                Arc::new(UInt16Array::from(vec![1])),
+                Arc::new(bucket_counts),
             ],
         )
         .unwrap();

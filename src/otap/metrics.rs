@@ -8,7 +8,7 @@ use crate::{
     api::MetricBatches,
     batch::transform_metrics_view,
     views::pdata::{
-        AggregationTemporality, BucketsView, DataPointFlags, DataType, DataView, ExemplarView,
+        BucketsView, DataPointFlags, DataType, DataView, ExemplarView,
         ExponentialHistogramDataPointView, ExponentialHistogramView, GaugeView,
         HistogramDataPointView, HistogramView, InstrumentationScopeView, MetricView, MetricsView,
         NumberDataPointView, ResourceMetricsView, ResourceView, ScopeMetricsView, SpanId, Str,
@@ -22,8 +22,9 @@ use super::{
     logs::{
         bool_at, build_groups, column_string, column_u16, column_u32, decode_attr_parent_ids,
         decode_delta, decode_quasi_delta, decode_root_ids, f64_at, i32_at, i64_at, id, index_u16,
-        index_u32, nested_string, nested_u32_value, replace, timestamp, validate_attrs, Attr16Iter,
-        Attr32Iter, AttributeTable, AttributeTable32, OtapAttribute, ResourceGroup, ScopeGroup,
+        index_u32, nested_string, nested_u32_value, replace, timestamp, validate_attr_value_rows,
+        validate_attrs, Attr16Iter, Attr32Iter, AttributeTable, AttributeTable32, OtapAttribute,
+        ResourceGroup, ScopeGroup,
     },
     traces::{decode_attr_parent_ids_u32, decode_delta_u32},
 };
@@ -50,6 +51,7 @@ pub(super) fn normalize(
     exp_histogram_exemplar_attrs: Option<RecordBatch>,
 ) -> Result<MetricBatches> {
     validate(PayloadSchema::Metrics, "metrics", &metrics)?;
+    validate_metric_types(&metrics)?;
     for (payload, name, batch) in [
         (
             PayloadSchema::Attrs16,
@@ -139,6 +141,9 @@ pub(super) fn normalize(
     ] {
         if let Some(batch) = batch {
             validate(payload, name, batch)?;
+            if matches!(payload, PayloadSchema::Attrs32) {
+                validate_attr_value_rows(name, batch)?;
+            }
         }
     }
     for (name, batch) in [
@@ -579,8 +584,7 @@ impl MetricView for OtapMetric<'_> {
             .metrics
             .column_by_name("aggregation_temporality")
             .and_then(|array| i32_at(array, self.row))
-            .map(|value| AggregationTemporality::from(value as u32))
-            .unwrap_or(AggregationTemporality::Unspecified);
+            .unwrap_or(0);
         let monotonic = self
             .view
             .metrics
@@ -717,7 +721,7 @@ impl GaugeView for NumberSet<'_> {
 struct SumSet<'a> {
     view: &'a OtapMetricsView,
     metric_id: u16,
-    temporality: AggregationTemporality,
+    temporality: i32,
     monotonic: bool,
 }
 
@@ -733,7 +737,7 @@ impl SumView for SumSet<'_> {
     fn data_points(&self) -> Self::NumberDataPointIter<'_> {
         NumberPointIter::new(self.view, self.metric_id)
     }
-    fn aggregation_temporality(&self) -> AggregationTemporality {
+    fn aggregation_temporality(&self) -> i32 {
         self.temporality
     }
     fn is_monotonic(&self) -> bool {
@@ -848,7 +852,7 @@ impl NumberPoint<'_> {
 struct HistogramSet<'a> {
     view: &'a OtapMetricsView,
     metric_id: u16,
-    temporality: AggregationTemporality,
+    temporality: i32,
 }
 
 impl HistogramView for HistogramSet<'_> {
@@ -863,7 +867,7 @@ impl HistogramView for HistogramSet<'_> {
     fn data_points(&self) -> Self::HistogramDataPointIter<'_> {
         HistogramPointIter::new(self.view, self.metric_id)
     }
-    fn aggregation_temporality(&self) -> AggregationTemporality {
+    fn aggregation_temporality(&self) -> i32 {
         self.temporality
     }
 }
@@ -988,7 +992,7 @@ impl HistogramPoint<'_> {
 struct ExpHistogramSet<'a> {
     view: &'a OtapMetricsView,
     metric_id: u16,
-    temporality: AggregationTemporality,
+    temporality: i32,
 }
 
 impl ExponentialHistogramView for ExpHistogramSet<'_> {
@@ -1003,7 +1007,7 @@ impl ExponentialHistogramView for ExpHistogramSet<'_> {
     fn data_points(&self) -> Self::ExponentialHistogramDataPointIter<'_> {
         ExpHistogramPointIter::new(self.view, self.metric_id)
     }
-    fn aggregation_temporality(&self) -> AggregationTemporality {
+    fn aggregation_temporality(&self) -> i32 {
         self.temporality
     }
 }
@@ -1408,6 +1412,28 @@ fn column_f64(batch: &RecordBatch, name: &str, row: usize) -> Option<f64> {
         .and_then(|array| f64_at(array, row))
 }
 
+/// Rejects metrics whose `metric_type` discriminant is outside the canonical
+/// 1..=5 range. The structural validator only guarantees a non-null `UInt8`;
+/// without this check an unrecognized type byte makes `MetricView::data()`
+/// return `None` and the whole metric is silently dropped with no skip counter.
+fn validate_metric_types(metrics: &RecordBatch) -> Result<()> {
+    let Some(types) = metrics.column_by_name("metric_type") else {
+        return Err(Error::Otap(
+            "metrics missing required metric_type column".into(),
+        ));
+    };
+    for row in 0..metrics.num_rows() {
+        let value = super::logs::u8_at(types, row)
+            .ok_or_else(|| Error::Otap(format!("metrics metric_type is null at row {row}")))?;
+        if DataType::from_u8(value).is_none() {
+            return Err(Error::Otap(format!(
+                "metrics has unknown metric_type {value} at row {row}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn list_u64(batch: &RecordBatch, name: &str, row: usize) -> Vec<u64> {
     batch
         .column_by_name(name)
@@ -1458,7 +1484,7 @@ fn buckets<'a>(batch: &'a RecordBatch, name: &str, row: usize) -> Option<OtapBuc
 mod transport_tests {
     use std::sync::Arc;
 
-    use arrow_array::{Float64Array, Int64Array, UInt32Array};
+    use arrow_array::{Float64Array, Int64Array, UInt32Array, UInt8Array};
     use arrow_schema::{DataType, Field, Schema};
 
     use super::*;
@@ -1487,5 +1513,26 @@ mod transport_tests {
             .downcast_ref::<UInt32Array>()
             .unwrap();
         assert_eq!(parent_ids.values(), &[3, 5]);
+    }
+
+    #[test]
+    fn rejects_unknown_metric_type() {
+        // An out-of-range metric_type discriminant must error rather than make
+        // MetricView::data() return None and silently drop the whole metric.
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "metric_type",
+                DataType::UInt8,
+                false,
+            )])),
+            vec![Arc::new(UInt8Array::from(vec![99u8]))],
+        )
+        .unwrap();
+
+        let error = validate_metric_types(&batch).unwrap_err();
+        assert!(
+            error.to_string().contains("unknown metric_type 99"),
+            "unexpected error: {error}"
+        );
     }
 }

@@ -207,7 +207,7 @@ pub(crate) fn transform_metrics_view_observed<V: MetricsView>(
                                         sum.append(
                                             &point,
                                             value,
-                                            data.aggregation_temporality() as i32,
+                                            data.aggregation_temporality(),
                                             data.is_monotonic(),
                                             meta,
                                         )
@@ -237,13 +237,7 @@ pub(crate) fn transform_metrics_view_observed<V: MetricsView>(
                                 observer,
                                 TransformSignal::Metrics,
                                 TransformPhase::ArrowAppend,
-                                || {
-                                    histogram.append(
-                                        &point,
-                                        data.aggregation_temporality() as i32,
-                                        meta,
-                                    )
-                                },
+                                || histogram.append(&point, data.aggregation_temporality(), meta),
                             )?;
                         }
                         let appended = histogram.rows - rows_before;
@@ -269,7 +263,7 @@ pub(crate) fn transform_metrics_view_observed<V: MetricsView>(
                                 || {
                                     exp_histogram.append(
                                         &point,
-                                        data.aggregation_temporality() as i32,
+                                        data.aggregation_temporality(),
                                         meta,
                                     )
                                 },
@@ -1098,5 +1092,53 @@ fn metric_point_value(
             skipped.missing_values += 1;
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use arrow_array::{Array, Int32Array};
+    use opentelemetry_proto::tonic::metrics::v1::{
+        metric, number_data_point, Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics, Sum,
+    };
+
+    use super::*;
+
+    #[test]
+    fn preserves_out_of_spec_aggregation_temporality() {
+        // Proto3 open enums can carry values outside 0..=2. The normalized
+        // Int32 column must pass the raw discriminant through rather than clamp
+        // it to Unspecified.
+        let request = ExportMetricsServiceRequest {
+            resource_metrics: vec![ResourceMetrics {
+                scope_metrics: vec![ScopeMetrics {
+                    metrics: vec![Metric {
+                        name: "m".into(),
+                        data: Some(metric::Data::Sum(Sum {
+                            data_points: vec![NumberDataPoint {
+                                time_unix_nano: 1,
+                                value: Some(number_data_point::Value::AsInt(5)),
+                                ..Default::default()
+                            }],
+                            aggregation_temporality: 3,
+                            is_monotonic: true,
+                        })),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+
+        let batches = transform_metrics_request(request).unwrap();
+        let sum = batches.sum.expect("sum batch present");
+        let temporality = sum
+            .column_by_name("aggregation_temporality")
+            .expect("aggregation_temporality column")
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("Int32 temporality column");
+        assert_eq!(temporality.value(0), 3);
     }
 }

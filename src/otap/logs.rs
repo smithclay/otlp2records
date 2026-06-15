@@ -46,6 +46,14 @@ pub(super) fn normalize(
             validate_attrs(name, batch)?;
         }
     }
+    // Log attributes are joined back to their log record by the logs `id`
+    // column (see `OtapLogRecord::attributes`). Without it every attribute
+    // would be silently orphaned, so require the column when attributes exist.
+    if log_attrs.is_some() && logs.column_by_name("id").is_none() {
+        return Err(Error::Otap(
+            "logs payload has a log attributes payload but no id column to join them".into(),
+        ));
+    }
 
     let logs = decode_root_ids(logs)?;
     let resource_attrs = resource_attrs.map(decode_attr_parent_ids).transpose()?;
@@ -67,14 +75,17 @@ struct OtapLogsView {
 /// Side table of attributes keyed by parent row id. OTAP stores attributes in
 /// a separate record joined back to the owning rows by `parent_id`; the key
 /// width is `u16` for resource/scope/record attributes and `u32` for the
-/// higher-cardinality data-point and exemplar attributes.
+/// higher-cardinality child attributes (data point, exemplar, span event, span
+/// link). The 32-bit `parent_id` arrives dictionary-encoded on the wire and is
+/// decoded to a plain `u32` column during normalization.
 pub(super) struct AttributeTable<K: OtapInt + Ord = u16> {
     batch: RecordBatch,
     by_parent: BTreeMap<K, Vec<usize>>,
     nested: Vec<Option<OwnedValue>>,
 }
 
-/// 32-bit-keyed attribute side table (data-point / exemplar attributes).
+/// 32-bit-keyed attribute side table (data point, exemplar, span event, span
+/// link attributes).
 pub(super) type AttributeTable32 = AttributeTable<u32>;
 
 pub(super) struct ResourceGroup {
@@ -154,7 +165,8 @@ pub(super) struct AttrIter<'a, K: OtapInt + Ord = u16> {
 
 /// 16-bit-keyed attribute iterator (resource / scope / record attributes).
 pub(super) type Attr16Iter<'a> = AttrIter<'a, u16>;
-/// 32-bit-keyed attribute iterator (data-point / exemplar attributes).
+/// 32-bit-keyed attribute iterator (data point, exemplar, span event, span
+/// link attributes).
 pub(super) type Attr32Iter<'a> = AttrIter<'a, u32>;
 
 impl<'a, K: OtapInt + Ord> AttrIter<'a, K> {
@@ -1158,6 +1170,23 @@ pub(super) fn validate_attrs(name: &str, batch: &RecordBatch) -> Result<()> {
     )
 }
 
+/// Runs the per-row `AnyValue` validation on an attribute table without the
+/// 16-bit-specific `parent_id`/`key` structural checks already covered by the
+/// `Attrs32` schema in [`super::validation`]. The 32-bit attribute tables
+/// (data point, exemplar, span event, span link) are structurally validated
+/// there but otherwise skip this scan, so call this to reject unknown type
+/// discriminants and present-but-missing payloads rather than silently
+/// coercing them to [`OtapValue::Empty`].
+pub(super) fn validate_attr_value_rows(name: &str, batch: &RecordBatch) -> Result<()> {
+    validate_any_fields(batch.schema().fields(), name)?;
+    validate_any_rows(
+        |column| batch.column_by_name(column),
+        batch.num_rows(),
+        |_| true,
+        name,
+    )
+}
+
 fn validate_any_rows<'a>(
     column: impl Fn(&str) -> Option<&'a ArrayRef>,
     rows: usize,
@@ -1494,4 +1523,49 @@ pub(super) fn bool_at(array: &ArrayRef, row: usize) -> Option<bool> {
         .as_any()
         .downcast_ref::<BooleanArray>()
         .and_then(|values| values.is_valid(row).then(|| values.value(row)))
+}
+
+#[cfg(test)]
+mod tests {
+    use arrow_array::{StringArray, TimestampNanosecondArray, UInt8Array};
+    use arrow_schema::TimeUnit;
+
+    use super::*;
+
+    fn empty_value_attrs() -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("parent_id", DataType::UInt16, false),
+                Field::new(ATTR_KEY, DataType::Utf8, false),
+                Field::new(ATTR_TYPE, DataType::UInt8, false),
+            ])),
+            vec![
+                Arc::new(UInt16Array::from(vec![0u16])),
+                Arc::new(StringArray::from(vec!["k"])),
+                Arc::new(UInt8Array::from(vec![VALUE_EMPTY])),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn requires_logs_id_column_when_log_attrs_present() {
+        // A logs batch carrying a log-attributes payload but no `id` column to
+        // join on must error, not silently drop every record's attributes.
+        let logs = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "time_unix_nano",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                false,
+            )])),
+            vec![Arc::new(TimestampNanosecondArray::from(vec![1i64]))],
+        )
+        .unwrap();
+
+        let error = normalize(logs, None, None, Some(empty_value_attrs()), 0).unwrap_err();
+        assert!(
+            error.to_string().contains("id column"),
+            "unexpected error: {error}"
+        );
+    }
 }

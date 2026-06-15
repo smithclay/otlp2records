@@ -13,7 +13,7 @@ use prost::Message;
 use crate::{
     schema::logs_schema_arc,
     views::pdata::{LogRecordView, LogsDataView, ResourceLogsView, ScopeLogsView},
-    Result,
+    DecodeError, Error, Result,
 };
 
 use super::{
@@ -60,7 +60,37 @@ pub fn transform_logs_request_observed(
     input_bytes: usize,
     observer: &mut Option<&mut dyn TransformObserver>,
 ) -> Result<RecordBatch> {
+    validate_log_ids(&request)?;
     transform_logs_view_observed(&request, input_bytes, observer)
+}
+
+/// Rejects log identifiers whose byte width is non-canonical. OTLP `trace_id`
+/// is 16 bytes (or empty) and `span_id` is 8 bytes (or empty); the fixed-width
+/// Arrow output cannot represent any other length. Empty and all-zero (but
+/// correctly sized) identifiers normalize to null, but a non-empty identifier
+/// of the wrong length signals corruption and is rejected here, restoring the
+/// strict check that existed before identifiers were routed through the
+/// semantic views' `parse_id`.
+fn validate_log_ids(request: &ExportLogsServiceRequest) -> Result<()> {
+    for resource in &request.resource_logs {
+        for scope in &resource.scope_logs {
+            for record in &scope.log_records {
+                check_id_width(&record.trace_id, 16, "log.trace_id")?;
+                check_id_width(&record.span_id, 8, "log.span_id")?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn check_id_width(id: &[u8], width: usize, field: &str) -> Result<()> {
+    if !id.is_empty() && id.len() != width {
+        return Err(Error::Decode(DecodeError::Unsupported(format!(
+            "{field} fixed binary length mismatch: expected {width}, got {}",
+            id.len()
+        ))));
+    }
+    Ok(())
 }
 
 fn transform_logs_view_observed<V: LogsDataView>(
@@ -453,5 +483,46 @@ fn append_view_text(builder: &mut StringBuilder, value: Option<&[u8]>) {
             builder.append_value(String::from_utf8_lossy(value).as_ref())
         }
         _ => builder.append_null(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use arrow_array::Array;
+    use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
+
+    use super::*;
+
+    fn request_with_trace_id(trace_id: Vec<u8>) -> ExportLogsServiceRequest {
+        ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                scope_logs: vec![ScopeLogs {
+                    log_records: vec![LogRecord {
+                        trace_id,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        }
+    }
+
+    #[test]
+    fn rejects_wrong_length_trace_id() {
+        let error = transform_logs_request(request_with_trace_id(vec![0u8; 5]), 0).unwrap_err();
+        assert!(
+            error.to_string().contains("length mismatch"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn nulls_all_zero_trace_id() {
+        // An all-zero but correctly sized id stays accepted and normalizes to
+        // null rather than erroring.
+        let batch = transform_logs_request(request_with_trace_id(vec![0u8; 16]), 0).unwrap();
+        let trace_id = batch.column_by_name("trace_id").expect("trace_id column");
+        assert!(trace_id.is_null(0));
     }
 }

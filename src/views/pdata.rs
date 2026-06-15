@@ -399,7 +399,10 @@ pub trait SumView {
     where
         Self: 'dp;
     fn data_points(&self) -> Self::NumberDataPointIter<'_>;
-    fn aggregation_temporality(&self) -> AggregationTemporality;
+    /// Raw OTLP `AggregationTemporality` discriminant, passed through verbatim
+    /// (including proto3 open-enum values outside 0..=2) into the normalized
+    /// Int32 column rather than clamped to a closed enum.
+    fn aggregation_temporality(&self) -> i32;
     fn is_monotonic(&self) -> bool;
 }
 
@@ -522,24 +525,6 @@ impl DataPointFlags {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u8)]
-pub enum AggregationTemporality {
-    Unspecified = 0,
-    Delta = 1,
-    Cumulative = 2,
-}
-
-impl From<u32> for AggregationTemporality {
-    fn from(value: u32) -> Self {
-        match value {
-            1 => Self::Delta,
-            2 => Self::Cumulative,
-            _ => Self::Unspecified,
-        }
-    }
-}
-
 pub trait HistogramView {
     type HistogramDataPoint<'dp>: HistogramDataPointView
     where
@@ -548,7 +533,10 @@ pub trait HistogramView {
     where
         Self: 'dp;
     fn data_points(&self) -> Self::HistogramDataPointIter<'_>;
-    fn aggregation_temporality(&self) -> AggregationTemporality;
+    /// Raw OTLP `AggregationTemporality` discriminant, passed through verbatim
+    /// (including proto3 open-enum values outside 0..=2) into the normalized
+    /// Int32 column rather than clamped to a closed enum.
+    fn aggregation_temporality(&self) -> i32;
 }
 
 pub trait HistogramDataPointView {
@@ -594,7 +582,10 @@ pub trait ExponentialHistogramView {
     where
         Self: 'edp;
     fn data_points(&self) -> Self::ExponentialHistogramDataPointIter<'_>;
-    fn aggregation_temporality(&self) -> AggregationTemporality;
+    /// Raw OTLP `AggregationTemporality` discriminant, passed through verbatim
+    /// (including proto3 open-enum values outside 0..=2) into the normalized
+    /// Int32 column rather than clamped to a closed enum.
+    fn aggregation_temporality(&self) -> i32;
 }
 
 pub trait ExponentialHistogramDataPointView {

@@ -41,6 +41,7 @@ use crate::{
         otap_quantile_schema_arc, otap_span_events_schema_arc, otap_span_links_schema_arc,
         otap_spans_schema_arc, otap_summary_data_points_schema_arc,
     },
+    views::pdata::DataType,
     DecodeError, Error, Result,
 };
 
@@ -54,11 +55,14 @@ use super::util::{
     append_opt_ts_ns, append_required_ts_ns, append_u64_list, array, record_batch, u64_to_i64,
 };
 
-const METRIC_GAUGE: u8 = 1;
-const METRIC_SUM: u8 = 2;
-const METRIC_HISTOGRAM: u8 = 3;
-const METRIC_EXP_HISTOGRAM: u8 = 4;
-const METRIC_SUMMARY: u8 = 5;
+// Derived from the decoder's `DataType` discriminants (`#[repr(u8)]`) so the
+// OTAP encoder and decoder share a single source of truth for the wire
+// `metric_type` numbering and cannot silently disagree.
+const METRIC_GAUGE: u8 = DataType::Gauge as u8;
+const METRIC_SUM: u8 = DataType::Sum as u8;
+const METRIC_HISTOGRAM: u8 = DataType::Histogram as u8;
+const METRIC_EXP_HISTOGRAM: u8 = DataType::ExponentialHistogram as u8;
+const METRIC_SUMMARY: u8 = DataType::Summary as u8;
 
 pub fn transform_logs_request_otap(request: ExportLogsServiceRequest) -> Result<OtapLogsBatches> {
     transform_logs_request_otap_observed(request, &mut None)
