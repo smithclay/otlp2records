@@ -193,6 +193,109 @@ OtlpStatus otlp_transform_metrics_all(
     OtlpMetricsArrowBatches* out_batches
 );
 
+/* ============================================================================
+ * Native OTAP Streaming API
+ *
+ * Decode canonical OTAP (BatchArrowRecords) envelopes into the same normalized
+ * Arrow batches as the one-shot OTLP API. OTAP is stateful: later messages may
+ * omit Arrow schemas/dictionaries and reuse those from earlier messages on the
+ * same decoder, so a decoder must persist across calls. Create one decoder per
+ * OTAP stream, feed it messages with the decode functions, then free it.
+ *
+ * OTAP envelopes are protobuf and are NOT auto-distinguishable from OTLP
+ * protobuf; callers must select this API explicitly (it is not part of
+ * OtlpInputFormat auto-detection).
+ *
+ * Compression: this API decodes whatever Arrow IPC compression the build links.
+ * Uncompressed and LZ4 are always available. The upstream OTAP Producer
+ * defaults to Zstandard; decoding that output requires building this crate with
+ * --features ffi,otap-zstd (native only; the Zstandard backend cannot target
+ * wasm32).
+ *
+ * Poisoning: on any non-OK return the decoder's stream state may be partially
+ * advanced and is no longer trustworthy. Free the decoder and start a new one
+ * rather than feeding it more messages; do not attempt mid-stream recovery.
+ * ============================================================================ */
+
+/** Opaque stateful OTAP decoder. One per OTAP stream; not thread-safe. */
+typedef struct OtlpOtapDecoder OtlpOtapDecoder;
+
+/**
+ * @brief Create a new stateful OTAP decoder.
+ *
+ * @return Non-null handle owned by the caller; release with
+ *         otlp_otap_decoder_free().
+ */
+OtlpOtapDecoder* otlp_otap_decoder_new(void);
+
+/**
+ * @brief Free an OTAP decoder created by otlp_otap_decoder_new().
+ *
+ * @param decoder Handle from otlp_otap_decoder_new(), or NULL.
+ *
+ * @note Passing NULL is a safe no-op. Must not be called twice on the same
+ *       handle.
+ */
+void otlp_otap_decoder_free(OtlpOtapDecoder* decoder);
+
+/**
+ * @brief Decode one OTAP message into a normalized logs Arrow batch.
+ *
+ * @param decoder Handle from otlp_otap_decoder_new()
+ * @param data Input bytes (one BatchArrowRecords envelope)
+ * @param len Length of input bytes
+ * @param out_array Output: ArrowArray with the batch data
+ * @param out_schema Output: ArrowSchema for the batch
+ * @return OTLP_OK on success, error code otherwise
+ *
+ * @note On OTLP_OK the caller must call out_array->release() and
+ *       out_schema->release(). On any non-OK status nothing is written and the
+ *       stream should be discarded (see Poisoning note above).
+ */
+OtlpStatus otlp_otap_decode_logs(
+    OtlpOtapDecoder* decoder,
+    const uint8_t* data,
+    size_t len,
+    struct ArrowArray* out_array,
+    struct ArrowSchema* out_schema
+);
+
+/**
+ * @brief Decode one OTAP message into a normalized traces Arrow batch.
+ *
+ * Identical contract to otlp_otap_decode_logs().
+ */
+OtlpStatus otlp_otap_decode_traces(
+    OtlpOtapDecoder* decoder,
+    const uint8_t* data,
+    size_t len,
+    struct ArrowArray* out_array,
+    struct ArrowSchema* out_schema
+);
+
+/**
+ * @brief Decode one OTAP message into the normalized metric Arrow batches.
+ *
+ * @param decoder Handle from otlp_otap_decoder_new()
+ * @param data Input bytes (one BatchArrowRecords envelope)
+ * @param len Length of input bytes
+ * @param out_batches Output: optional batches for gauge/sum/histogram/
+ *                     exp_histogram plus skipped metric counters
+ * @return OTLP_OK on success, error code otherwise
+ *
+ * @note Caller should zero-initialize out_batches before calling.
+ * @note For each output with present != 0, caller must release array and schema.
+ * @note Outputs with present == 0 must not be released.
+ * @note On any non-OK status no batch is present and the stream should be
+ *       discarded (see Poisoning note above).
+ */
+OtlpStatus otlp_otap_decode_metrics(
+    OtlpOtapDecoder* decoder,
+    const uint8_t* data,
+    size_t len,
+    OtlpMetricsArrowBatches* out_batches
+);
+
 /**
  * @brief Get a static message for a status code.
  *

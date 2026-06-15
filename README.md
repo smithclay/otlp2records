@@ -355,14 +355,17 @@ Exponential histograms use the common metric context fields above, plus
 | `default` | Core functionality | Yes |
 | `parquet` | Enable Parquet output | No |
 | `wasm` | Enable WASM bindings | No |
-| `otap-zstd` | Add upstream-default Zstandard OTAP IPC support | No |
+| `otap-zstd` | Add upstream-default Zstandard OTAP IPC support (native-only) | No |
 
 ## Native OTAP Input
 
 Canonical `BatchArrowRecords` logs, traces, and univariate metrics decode
-through a stateful `OtapDecoder` into the existing normalized schemas. Enable
-`otap-zstd` for the upstream Producer's default compression. Uncompressed/LZ4
-decoding remains WASM-compatible; Zstandard requires a platform C toolchain. See
+through a stateful `OtapDecoder` into the existing normalized schemas.
+Uncompressed and LZ4 Arrow IPC decode on every target, including WASM. The
+upstream Producer defaults to Zstandard; enable `otap-zstd` to accept it on
+native targets. That feature uses Arrow's bundled C backend, so it is
+native-only — combining it with a `wasm32` target is unsupported and will not
+build. See
 [docs/otap-input.md](docs/otap-input.md) for the API, protocol coverage,
 provenance, and remaining protocol boundaries.
 

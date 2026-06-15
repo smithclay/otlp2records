@@ -23,9 +23,14 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
 
+      # --all-features is intentionally native-only: `otap-zstd` pulls in Arrow's
+      # bundled C Zstandard backend, which cannot target wasm32.
       - name: Check MSRV
         run: cargo check --all-features
 
+      # WASM deliberately uses --features wasm (not --all-features) so the C
+      # Zstandard backend stays out of the wasm32 build. WASM OTAP is
+      # uncompressed/LZ4 only.
       - name: Check WASM, including native OTAP
         run: cargo check --target wasm32-unknown-unknown --features wasm
 
