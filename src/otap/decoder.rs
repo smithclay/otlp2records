@@ -79,9 +79,25 @@ impl OtapDecoder {
         self.decode_traces_envelope(envelope, bytes.len())
     }
 
+    /// Decodes one already-deserialized `BatchArrowRecords` into normalized
+    /// traces (the streaming counterpart of [`Self::decode_traces`]).
+    pub fn decode_traces_message(
+        &mut self,
+        envelope: BatchArrowRecords,
+        input_bytes: usize,
+    ) -> Result<RecordBatch> {
+        self.decode_traces_envelope(envelope, input_bytes)
+    }
+
     /// Decodes one canonical `BatchArrowRecords` message into normalized metrics.
     pub fn decode_metrics(&mut self, bytes: &[u8]) -> Result<MetricBatches> {
         let envelope = BatchArrowRecords::decode(bytes)?;
+        self.decode_metrics_envelope(envelope)
+    }
+
+    /// Decodes one already-deserialized `BatchArrowRecords` into normalized
+    /// metric shapes (the streaming counterpart of [`Self::decode_metrics`]).
+    pub fn decode_metrics_message(&mut self, envelope: BatchArrowRecords) -> Result<MetricBatches> {
         self.decode_metrics_envelope(envelope)
     }
 
