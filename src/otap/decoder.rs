@@ -59,6 +59,20 @@ impl OtapDecoder {
         self.decode_logs_envelope(envelope, bytes.len())
     }
 
+    /// Decodes one already-deserialized `BatchArrowRecords` into normalized logs,
+    /// reusing dictionary/schema state from earlier messages on this decoder.
+    ///
+    /// Used by the gRPC streaming path, where tonic has already decoded the
+    /// protobuf envelope; `input_bytes` is the wire size (for builder sizing and
+    /// admission accounting). `decode_logs` is the equivalent for raw bytes.
+    pub fn decode_logs_message(
+        &mut self,
+        envelope: BatchArrowRecords,
+        input_bytes: usize,
+    ) -> Result<RecordBatch> {
+        self.decode_logs_envelope(envelope, input_bytes)
+    }
+
     /// Decodes one canonical `BatchArrowRecords` message into normalized traces.
     pub fn decode_traces(&mut self, bytes: &[u8]) -> Result<RecordBatch> {
         let envelope = BatchArrowRecords::decode(bytes)?;

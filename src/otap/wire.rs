@@ -18,6 +18,36 @@ pub struct BatchArrowRecords {
     pub headers: Vec<u8>,
 }
 
+/// Per-batch acknowledgement the server returns on an OTAP stream: one
+/// `BatchStatus` per received [`BatchArrowRecords`], echoing its `batch_id`.
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct BatchStatus {
+    #[prost(int64, tag = "1")]
+    pub batch_id: i64,
+    #[prost(enumeration = "StatusCode", tag = "2")]
+    pub status_code: i32,
+    #[prost(string, tag = "3")]
+    pub status_message: String,
+}
+
+/// OTAP stream status codes (otel-arrow `StatusCode`), mirroring the canonical
+/// gRPC status codes. The numbering matches the proto and is intentionally
+/// non-contiguous.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, prost::Enumeration)]
+#[repr(i32)]
+pub enum StatusCode {
+    Ok = 0,
+    Canceled = 1,
+    InvalidArgument = 3,
+    DeadlineExceeded = 4,
+    PermissionDenied = 7,
+    ResourceExhausted = 8,
+    Aborted = 10,
+    Internal = 13,
+    Unavailable = 14,
+    Unauthenticated = 16,
+}
+
 /// One Arrow IPC stream fragment in a [`BatchArrowRecords`] envelope.
 #[derive(Clone, PartialEq, Eq, Hash, prost::Message)]
 pub struct ArrowPayload {

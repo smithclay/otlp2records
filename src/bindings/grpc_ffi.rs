@@ -7,13 +7,13 @@
 //! the caller starts a server and Arrow batches are pushed out as telemetry
 //! arrives over the wire.
 //!
-//! # Phase 1 scope
+//! # Scope
 //!
-//! Standard **OTLP/gRPC unary** `Export` for **logs** only. Traces and metrics
-//! services are registered later; the OTAP/Arrow bidirectional-streaming
-//! services land in a later phase. The C ABI (callback signature included) is
-//! frozen now — `stream_id`/`batch_id` are carried from the start so adding
-//! streaming does not change the header.
+//! **Logs** only, over two services on one listener: standard **OTLP/gRPC
+//! unary** `Export` and the canonical **OTAP/Arrow** bidirectional stream
+//! (`ArrowLogsService`). Traces and metrics (unary and streaming) are added
+//! later. The C ABI carries `stream_id`/`batch_id` so the unary and streaming
+//! paths share one callback signature.
 //!
 //! # Threading & ownership
 //!
@@ -29,6 +29,7 @@
 //!   returns. The callee must not call their `release` callbacks.
 
 use std::ffi::{c_char, c_int, c_void};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use arrow_array::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
@@ -37,6 +38,8 @@ use prost::Message as _;
 use tonic::metadata::MetadataMap;
 
 use crate::ffi::OtlpSignalType;
+use crate::otap::grpc_service::{ArrowLogsService, ArrowLogsServiceServer};
+use crate::otap::{BatchArrowRecords, BatchStatus, OtapDecoder, StatusCode};
 
 use opentelemetry_proto::tonic::collector::logs::v1::{
     logs_service_server::{LogsService, LogsServiceServer},
@@ -214,6 +217,106 @@ impl LogsService for LogsServiceImpl {
     }
 }
 
+/// Map a host ingest outcome to the OTAP `BatchStatus` echoed back on the stream.
+fn ingest_to_batch_status(batch_id: i64, status: OtlpIngestStatus) -> BatchStatus {
+    let (code, message) = match status {
+        OtlpIngestStatus::Ok => (StatusCode::Ok, ""),
+        OtlpIngestStatus::ResourceExhausted => {
+            (StatusCode::ResourceExhausted, "ingest buffer full")
+        }
+        OtlpIngestStatus::Invalid => (StatusCode::InvalidArgument, "invalid payload"),
+        OtlpIngestStatus::Internal => (StatusCode::Internal, "ingest error"),
+        OtlpIngestStatus::Unauthenticated => (StatusCode::Unauthenticated, "unauthorized"),
+    };
+    BatchStatus {
+        batch_id,
+        status_code: code as i32,
+        status_message: message.to_string(),
+    }
+}
+
+/// OTAP/Arrow bidirectional-streaming logs service. Each stream gets its own
+/// stateful `OtapDecoder` so later messages can reuse Arrow dictionaries/schemas
+/// established by earlier ones.
+struct ArrowLogsServiceImpl {
+    ctx: Arc<CallbackCtx>,
+    stream_counter: AtomicU64,
+}
+
+#[tonic::async_trait]
+impl ArrowLogsService for ArrowLogsServiceImpl {
+    type ArrowLogsStream =
+        tokio_stream::wrappers::ReceiverStream<Result<BatchStatus, tonic::Status>>;
+
+    async fn arrow_logs(
+        &self,
+        request: tonic::Request<tonic::Streaming<BatchArrowRecords>>,
+    ) -> Result<tonic::Response<Self::ArrowLogsStream>, tonic::Status> {
+        if !self.ctx.auth_ok(request.metadata()) {
+            return Err(tonic::Status::unauthenticated("invalid token"));
+        }
+        let stream_id = self.stream_counter.fetch_add(1, Ordering::Relaxed) + 1;
+        let ctx = self.ctx.clone();
+        let mut input = request.into_inner();
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<BatchStatus, tonic::Status>>(64);
+
+        tokio::spawn(async move {
+            // One decoder per stream: it is &mut self / not thread-safe, and it
+            // carries the cross-message dictionary state this stream depends on.
+            let mut decoder = OtapDecoder::new();
+            loop {
+                match input.message().await {
+                    Ok(Some(envelope)) => {
+                        let batch_id = envelope.batch_id;
+                        let input_bytes = envelope.encoded_len();
+                        match decoder.decode_logs_message(envelope, input_bytes) {
+                            Ok(batch) => {
+                                let ingest = ctx.deliver(
+                                    OtlpSignalType::Logs,
+                                    stream_id,
+                                    batch_id,
+                                    input_bytes as u64,
+                                    batch,
+                                );
+                                if tx
+                                    .send(Ok(ingest_to_batch_status(batch_id, ingest)))
+                                    .await
+                                    .is_err()
+                                {
+                                    break; // response stream dropped (client gone)
+                                }
+                                // The decoder is healthy; keep serving even when a batch was
+                                // nacked for backpressure (the client may slow down and retry).
+                            }
+                            Err(error) => {
+                                // A decode error leaves the stateful decoder poisoned, so nack
+                                // this batch and close the stream rather than feeding it more.
+                                let _ = tx
+                                    .send(Ok(BatchStatus {
+                                        batch_id,
+                                        status_code: StatusCode::InvalidArgument as i32,
+                                        status_message: format!("OTAP decode error: {error}"),
+                                    }))
+                                    .await;
+                                break;
+                            }
+                        }
+                    }
+                    Ok(None) => break, // client half-closed the request stream
+                    Err(status) => {
+                        let _ = tx.send(Err(status)).await;
+                        break;
+                    }
+                }
+            }
+        });
+
+        Ok(tonic::Response::new(
+            tokio_stream::wrappers::ReceiverStream::new(rx),
+        ))
+    }
+}
+
 // ============================================================================
 // Server handle + lifecycle
 // ============================================================================
@@ -306,7 +409,12 @@ pub unsafe extern "C" fn otlp_grpc_server_start(
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
+        // OTLP/gRPC unary logs + OTAP/Arrow streaming logs on the same listener.
         let logs = LogsServiceServer::new(LogsServiceImpl { ctx: ctx.clone() });
+        let arrow_logs = ArrowLogsServiceServer::new(ArrowLogsServiceImpl {
+            ctx: ctx.clone(),
+            stream_counter: AtomicU64::new(0),
+        });
 
         let join = {
             let _guard = runtime.enter();
@@ -316,6 +424,7 @@ pub unsafe extern "C" fn otlp_grpc_server_start(
             runtime.spawn(async move {
                 tonic::transport::Server::builder()
                     .add_service(logs)
+                    .add_service(arrow_logs)
                     .serve_with_incoming_shutdown(incoming, async move {
                         let _ = shutdown_rx.await;
                     })
