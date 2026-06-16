@@ -7,17 +7,17 @@ use arrow_array::{
     },
     RecordBatch,
 };
-use opentelemetry_proto::tonic::{
-    collector::trace::v1::ExportTraceServiceRequest,
-    trace::v1::{ResourceSpans, ScopeSpans, Span},
-};
+use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use prost::Message;
 
-use crate::{schema::traces_schema_arc, Result};
+use crate::{
+    schema::traces_schema_arc,
+    views::pdata::{ResourceSpansView, ScopeSpansView, SpanView, StatusView, TracesView},
+    Result,
+};
 
 use super::{
     context::{ContextDuplicateTracker, ResourceContext, ScopeContext},
-    json::{append_attrs_json, append_span_events_json, append_span_links_json},
     profile::{
         finish_phase, measure_phase, measure_result, observe_counter, phase_start,
         TransformCounter, TransformObserver, TransformPhase, TransformSignal,
@@ -27,6 +27,7 @@ use super::{
         append_required_service_name_n, append_required_ts_ns, array, record_batch,
         string_builder_bytes, u64_to_i64,
     },
+    view_json,
 };
 
 pub fn transform_traces_protobuf(bytes: &[u8]) -> Result<RecordBatch> {
@@ -60,18 +61,31 @@ pub fn transform_traces_request_observed(
     input_bytes: usize,
     observer: &mut Option<&mut dyn TransformObserver>,
 ) -> Result<RecordBatch> {
+    transform_traces_view_observed(&request, input_bytes, observer)
+}
+
+pub(crate) fn transform_traces_view<V: TracesView>(
+    view: &V,
+    input_bytes: usize,
+) -> Result<RecordBatch> {
+    transform_traces_view_observed(view, input_bytes, &mut None)
+}
+
+pub(crate) fn transform_traces_view_observed<V: TracesView>(
+    view: &V,
+    input_bytes: usize,
+    observer: &mut Option<&mut dyn TransformObserver>,
+) -> Result<RecordBatch> {
     let rows = measure_phase(
         observer,
         TransformSignal::Traces,
         TransformPhase::RowCount,
         || {
-            request
-                .resource_spans
-                .iter()
-                .map(|rs| {
-                    rs.scope_spans
-                        .iter()
-                        .map(|ss| ss.spans.len())
+            view.resources()
+                .map(|resource| {
+                    resource
+                        .scopes()
+                        .map(|scope| scope.spans().count())
                         .sum::<usize>()
                 })
                 .sum()
@@ -91,9 +105,9 @@ pub fn transform_traces_request_observed(
     );
     let mut duplicates = observer.is_some().then(ContextDuplicateTracker::default);
 
-    for resource_spans in request.resource_spans {
+    for resource_spans in view.resources() {
         append_resource_spans_observed(
-            resource_spans,
+            &resource_spans,
             &mut builders,
             observer,
             duplicates.as_mut(),
@@ -108,32 +122,24 @@ pub fn transform_traces_request_observed(
     )
 }
 
-fn append_resource_spans_observed(
-    resource_spans: ResourceSpans,
+fn append_resource_spans_observed<R: ResourceSpansView>(
+    resource_spans: &R,
     builders: &mut TraceBuilders,
     observer: &mut Option<&mut dyn TransformObserver>,
     mut duplicates: Option<&mut ContextDuplicateTracker>,
 ) -> Result<()> {
     let resource_phase_start = phase_start(observer);
-    let ResourceSpans {
-        resource,
-        scope_spans,
-        ..
-    } = resource_spans;
-    let resource_attrs = resource
-        .as_ref()
-        .map(|r| r.attributes.as_slice())
-        .unwrap_or(&[]);
-    let resource = ResourceContext::from_attrs_observed(
-        resource_attrs,
+    let resource_view = resource_spans.resource();
+    let resource = ResourceContext::from_view_observed(
+        resource_view.as_ref(),
         TransformSignal::Traces,
         observer,
         duplicates.as_deref_mut(),
     );
 
-    for scope_spans in scope_spans {
+    for scope_spans in resource_spans.scopes() {
         append_scope_spans_observed(
-            scope_spans,
+            &scope_spans,
             builders,
             &resource,
             observer,
@@ -150,30 +156,22 @@ fn append_resource_spans_observed(
     Ok(())
 }
 
-fn append_scope_spans_observed(
-    scope_spans: ScopeSpans,
+fn append_scope_spans_observed<S: ScopeSpansView>(
+    scope_spans: &S,
     builders: &mut TraceBuilders,
     resource: &ResourceContext,
     observer: &mut Option<&mut dyn TransformObserver>,
     duplicates: Option<&mut ContextDuplicateTracker>,
 ) -> Result<()> {
     let scope_phase_start = phase_start(observer);
-    let ScopeSpans { scope, spans, .. } = scope_spans;
-    let scope_name = scope.as_ref().map(|s| s.name.as_str());
-    let scope_version = scope.as_ref().map(|s| s.version.as_str());
-    let scope_attrs = scope
-        .as_ref()
-        .map(|s| s.attributes.as_slice())
-        .unwrap_or(&[]);
-    let scope = ScopeContext::new_observed(
-        scope_name,
-        scope_version,
-        scope_attrs,
+    let scope_view = scope_spans.scope();
+    let scope = ScopeContext::from_view_observed(
+        scope_view.as_ref(),
         TransformSignal::Traces,
         observer,
         duplicates,
     );
-    let span_count = spans.len();
+    let span_count = scope_spans.spans().count();
     if span_count > 0 {
         let context_phase_start = phase_start(observer);
         builders.append_context_observed(span_count, resource, &scope, observer);
@@ -185,8 +183,8 @@ fn append_scope_spans_observed(
         );
     }
 
-    for span in spans {
-        append_span_observed(span, builders, observer)?;
+    for span in scope_spans.spans() {
+        append_span_observed(&span, builders, observer)?;
     }
 
     finish_phase(
@@ -198,13 +196,13 @@ fn append_scope_spans_observed(
     Ok(())
 }
 
-fn append_span_observed(
-    span: Span,
+fn append_span_observed<S: SpanView>(
+    span: &S,
     builders: &mut TraceBuilders,
     observer: &mut Option<&mut dyn TransformObserver>,
 ) -> Result<()> {
     let phase_start = phase_start(observer);
-    builders.append_observed(&span, observer)?;
+    builders.append_observed(span, observer)?;
     finish_phase(
         observer,
         TransformSignal::Traces,
@@ -273,9 +271,9 @@ impl TraceBuilders {
         }
     }
 
-    fn append_observed(
+    fn append_observed<S: SpanView>(
         &mut self,
-        span: &Span,
+        span: &S,
         observer: &mut Option<&mut dyn TransformObserver>,
     ) -> Result<()> {
         measure_result(
@@ -283,29 +281,49 @@ impl TraceBuilders {
             TransformSignal::Traces,
             TransformPhase::ArrowAppend,
             || {
+                let start_time = span.start_time_unix_nano().unwrap_or_default();
                 append_required_ts_ns(
                     &mut self.start_time_unix_nano,
-                    span.start_time_unix_nano,
+                    start_time,
                     "span.start_time_unix_nano",
                 )?;
                 let duration = span
-                    .end_time_unix_nano
-                    .saturating_sub(span.start_time_unix_nano);
+                    .end_time_unix_nano()
+                    .unwrap_or_default()
+                    .saturating_sub(start_time);
                 self.duration_time_unix_nano
                     .append_value(u64_to_i64(duration, "span.duration_time_unix_nano")?);
-                append_fixed_required(&mut self.trace_id, &span.trace_id, 16, "span.trace_id")?;
-                append_fixed_required(&mut self.span_id, &span.span_id, 8, "span.span_id")?;
-                append_fixed_or_null(&mut self.parent_span_id, &span.parent_span_id, 8)?;
-                append_empty_as_null(&mut self.trace_state, &span.trace_state);
-                self.name.append_value(&span.name);
-                if span.kind == 0 {
+                append_fixed_required(
+                    &mut self.trace_id,
+                    span.trace_id().map_or(&[][..], |value| value.as_slice()),
+                    16,
+                    "span.trace_id",
+                )?;
+                append_fixed_required(
+                    &mut self.span_id,
+                    span.span_id().map_or(&[][..], |value| value.as_slice()),
+                    8,
+                    "span.span_id",
+                )?;
+                append_fixed_or_null(
+                    &mut self.parent_span_id,
+                    span.parent_span_id()
+                        .map_or(&[][..], |value| value.as_slice()),
+                    8,
+                )?;
+                let trace_state = String::from_utf8_lossy(span.trace_state().unwrap_or_default());
+                append_empty_as_null(&mut self.trace_state, &trace_state);
+                let name = String::from_utf8_lossy(span.name().unwrap_or_default());
+                self.name.append_value(name.as_ref());
+                if span.kind() == 0 {
                     self.kind.append_null();
                 } else {
-                    self.kind.append_value(span.kind);
+                    self.kind.append_value(span.kind());
                 }
-                if let Some(status) = span.status.as_ref() {
-                    self.status_code.append_value(status.code);
-                    append_empty_as_null(&mut self.status_status_message, &status.message);
+                if let Some(status) = span.status() {
+                    self.status_code.append_value(status.status_code());
+                    let message = String::from_utf8_lossy(status.message().unwrap_or_default());
+                    append_empty_as_null(&mut self.status_status_message, &message);
                 } else {
                     self.status_code.append_null();
                     self.status_status_message.append_null();
@@ -319,9 +337,9 @@ impl TraceBuilders {
             TransformSignal::Traces,
             TransformPhase::SpanAttributesJson,
             || {
-                append_attrs_json(
+                view_json::append_attributes(
                     &mut self.span_attributes,
-                    &span.attributes,
+                    span.attributes(),
                     &mut self.json_scratch,
                 )
             },
@@ -330,13 +348,19 @@ impl TraceBuilders {
             observer,
             TransformSignal::Traces,
             TransformPhase::EventsJson,
-            || append_span_events_json(&mut self.events_json, &span.events, &mut self.json_scratch),
+            || {
+                view_json::append_events(
+                    &mut self.events_json,
+                    span.events(),
+                    &mut self.json_scratch,
+                )
+            },
         )?;
         measure_result(
             observer,
             TransformSignal::Traces,
             TransformPhase::LinksJson,
-            || append_span_links_json(&mut self.links_json, &span.links, &mut self.json_scratch),
+            || view_json::append_links(&mut self.links_json, span.links(), &mut self.json_scratch),
         )?;
         measure_phase(
             observer,
@@ -344,12 +368,12 @@ impl TraceBuilders {
             TransformPhase::ArrowAppend,
             || {
                 self.dropped_attributes_count
-                    .append_value(span.dropped_attributes_count);
+                    .append_value(span.dropped_attributes_count());
                 self.dropped_events_count
-                    .append_value(span.dropped_events_count);
+                    .append_value(span.dropped_events_count());
                 self.dropped_links_count
-                    .append_value(span.dropped_links_count);
-                self.flags.append_value(span.flags);
+                    .append_value(span.dropped_links_count());
+                self.flags.append_value(span.flags().unwrap_or_default());
             },
         );
         Ok(())

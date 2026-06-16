@@ -2,7 +2,8 @@
 
 [![Crates.io](https://img.shields.io/crates/v/otlp2records.svg)](https://crates.io/crates/otlp2records)
 
-Transform OTLP telemetry (logs, traces, metrics) into Arrow RecordBatches.
+Transform OTLP and native OTAP telemetry (logs, traces, metrics) into Arrow
+RecordBatches.
 
 A high-performance, WASM-compatible library for converting OpenTelemetry Protocol (OTLP) data to Apache Arrow format for efficient storage and querying.
 
@@ -14,10 +15,15 @@ Currently consumed by [duckdb-otlp](https://github.com/smithclay/duckdb-otlp), [
 - **No async**: Pure synchronous transforms
 - **WASM-first**: All dependencies compile to wasm32
 - **Arrow-native**: RecordBatch is the canonical output format
+- **Shared telemetry normalization**: OTLP and native OTAP logs, traces, and
+  metrics converge through semantic view traits compatible with OpenTelemetry
+  Arrow `pdata-views`
 
 ## Features
 
 - Transform OTLP logs, traces, and metrics to Arrow RecordBatches
+- Decode native OTAP logs, traces, and univariate metrics to the same normalized
+  Arrow outputs
 - Support for both Protobuf and JSON input formats
 - Output to NDJSON, Arrow IPC, or Parquet
 - Direct OTLP-to-Arrow hot path for high-throughput ingestion
@@ -92,6 +98,15 @@ Build with the `wasm` feature for browser/Node.js environments:
 cargo build --target wasm32-unknown-unknown --features wasm
 ```
 
+Crates.io consumers should select the `getrandom 0.3` browser backend in the
+top-level workspace (dependency-local Cargo config is not inherited):
+
+```toml
+# .cargo/config.toml
+[target.wasm32-unknown-unknown]
+rustflags = ['--cfg', 'getrandom_backend="wasm_js"']
+```
+
 ```javascript
 import init, { transform_logs_wasm } from './otlp2records.js';
 
@@ -121,31 +136,6 @@ const arrowIpc = transform_logs_wasm(otlpBytes, "protobuf");
 | `transform_traces(bytes, format)` | Transform OTLP traces to Arrow RecordBatch |
 | `transform_metrics(bytes, format)` | Transform OTLP metrics to MetricBatches |
 
-### Schema Output Selection
-
-The default output is `SchemaOutput::Normalized`, the flattened ClickStack-compatible
-schema used by the existing `transform_logs`, `transform_traces`, and
-`transform_metrics` APIs. The aliases `"normalized"`, `"clickstack"`,
-`"clickstack-mode"`, `""`, and `"default"` all parse to this default.
-
-Rust callers can opt into `SchemaOutput::OtapStar` with explicit APIs:
-
-| Function | Description |
-|----------|-------------|
-| `transform_logs_with_schema(bytes, format, schema_output)` | Transform logs to `LogsOutput::Normalized` or `LogsOutput::OtapStar` |
-| `transform_traces_with_schema(bytes, format, schema_output)` | Transform traces to `TracesOutput::Normalized` or `TracesOutput::OtapStar` |
-| `transform_metrics_with_schema(bytes, format, schema_output)` | Transform metrics to `MetricsOutput::Normalized` or `MetricsOutput::OtapStar` |
-
-`otap-star` / `otap_star` emits multi-table Arrow batches modeled after the
-OpenTelemetry otel-arrow data model. Instead of flattened JSON columns such as
-`events_json`, `links_json`, `metric_attributes`, or `exemplars_json`, child
-entities are emitted as separate tables keyed by deterministic `id` and
-`parent_id` columns. Use `iter_named_batches()` on `OtapLogsBatches`,
-`OtapTracesBatches`, or `OtapMetricsBatches` to serialize each named table.
-
-The FFI and WASM bindings continue to expose the normalized single-batch shape in
-this release. `otap-star` is Rust API only to avoid changing those ABIs.
-
 ### Breaking Changes In 0.8.0
 
 The 0.7 to 0.8 release intentionally changes the default normalized schema. The
@@ -173,8 +163,7 @@ Key normalized-schema changes:
 
 The flattened JSON convenience columns remain for now: `resource_attributes`,
 `scope_attributes`, signal attribute JSON columns, `events_json`, `links_json`,
-and `exemplars_json`. The new `otap-star` output is the more relational
-multi-table shape for callers that want child tables instead of flattened JSON.
+and `exemplars_json`.
 
 ### Transform Observation
 
@@ -190,24 +179,6 @@ Implement `TransformObserver` to receive `TransformPhaseTiming` and `TransformCo
 events. Counters include duplicate resource/scope context hits and misses plus repeated
 resource/scope attribute row-copy counts and bytes.
 
-To observe an OTAP star transform, use the `*_with_schema_and_observer` entry
-points, which route to either schema and thread the observer through:
-
-| Function | Description |
-|----------|-------------|
-| `transform_logs_with_schema_and_observer(bytes, format, schema_output, observer)` | Logs transform with both schema selection and observer |
-| `transform_traces_with_schema_and_observer(bytes, format, schema_output, observer)` | Traces transform with both schema selection and observer |
-| `transform_metrics_with_schema_and_observer(bytes, format, schema_output, observer)` | Metrics transform with both schema selection and observer |
-
-The OTAP path emits the same phase enum (`ProtobufDecode`, `JsonDecode`,
-`JsonlDecode`, `BuilderInit`, `ResourceLogsBuild` / `ResourceSpansBuild` /
-`ResourceMetricsBuild`, the matching `Scope*Build` and per-record
-`LogRecordBuild` / `SpanBuild` / `MetricBuild`, and `ArrowFinalize`) plus the
-`OutputRows`, `Resource/ScopeContextDuplicateHit`, and
-`Resource/ScopeContextDuplicateMiss` counters. The
-`Resource/ScopeAttributesRowCopies*` counters are normalized-only — OTAP
-emits attributes as their own child tables, so no row replication happens.
-
 ### Output Functions
 
 | Function | Description |
@@ -216,8 +187,7 @@ emits attributes as their own child tables, so no row replication happens.
 | `to_ipc(&batch)` | Convert RecordBatch to Arrow IPC format |
 | `to_parquet(&batch)` | Convert RecordBatch to Parquet (requires feature) |
 
-These serializers operate on one `RecordBatch` at a time. For `otap-star`, call
-them per table by iterating named batches.
+These serializers operate on one `RecordBatch` at a time.
 
 ### Schemas
 
@@ -277,10 +247,9 @@ them per table by iterating named batches.
 
 ## Output Schemas
 
-`SchemaOutput::Normalized` is the default flattened schema. In 0.8.0 it uses
+The transform APIs emit a flattened, normalized schema. In 0.8.0 it uses
 OTAP-compatible field names and high-value Arrow physical types while keeping
-the flattened resource/scope/attribute convenience columns. The `clickstack`
-and `clickstack-mode` schema aliases still select this normalized output.
+the flattened resource/scope/attribute convenience columns.
 
 ### Logs Schema
 
@@ -386,6 +355,19 @@ Exponential histograms use the common metric context fields above, plus
 | `default` | Core functionality | Yes |
 | `parquet` | Enable Parquet output | No |
 | `wasm` | Enable WASM bindings | No |
+| `otap-zstd` | Add upstream-default Zstandard OTAP IPC support (native-only) | No |
+
+## Native OTAP Input
+
+Canonical `BatchArrowRecords` logs, traces, and univariate metrics decode
+through a stateful `OtapDecoder` into the existing normalized schemas.
+Uncompressed and LZ4 Arrow IPC decode on every target, including WASM. The
+upstream Producer defaults to Zstandard; enable `otap-zstd` to accept it on
+native targets. That feature uses Arrow's bundled C backend, so it is
+native-only — combining it with a `wasm32` target is unsupported and will not
+build. See
+[docs/otap-input.md](docs/otap-input.md) for the API, protocol coverage,
+provenance, and remaining protocol boundaries.
 
 ## Performance
 

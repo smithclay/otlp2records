@@ -229,6 +229,51 @@ unsafe fn release_exported_metric_batch(out_batch: *mut OtlpArrowBatch) {
     }
 }
 
+/// Export the four normalized metric shapes into `out_batches` and copy the
+/// skipped-metric counters.
+///
+/// Honors the C1 rollback invariant: if any shape's export fails mid-sequence,
+/// every already-exported batch is released so a non-OK return leaves nothing
+/// `present` to release. Callers must zero-initialize `out_batches` and invoke
+/// this inside `catch_unwind`. Shared by the one-shot (`transform_metrics`) and
+/// streaming OTAP (`decode_metrics`) paths so the invariant has one home.
+///
+/// # Safety
+///
+/// `out_batches` must be a valid, writable pointer to a zero-initialized
+/// `OtlpMetricsArrowBatches`.
+unsafe fn export_metric_batches(
+    batches: crate::MetricBatches,
+    out_batches: *mut OtlpMetricsArrowBatches,
+) -> OtlpStatus {
+    let skipped = batches.skipped;
+
+    let gauge_ptr = std::ptr::addr_of_mut!((*out_batches).gauge);
+    let sum_ptr = std::ptr::addr_of_mut!((*out_batches).sum);
+    let histogram_ptr = std::ptr::addr_of_mut!((*out_batches).histogram);
+    let exp_histogram_ptr = std::ptr::addr_of_mut!((*out_batches).exp_histogram);
+
+    let export_result = export_optional_metric_batch(batches.gauge, gauge_ptr)
+        .and_then(|_| export_optional_metric_batch(batches.sum, sum_ptr))
+        .and_then(|_| export_optional_metric_batch(batches.histogram, histogram_ptr))
+        .and_then(|_| export_optional_metric_batch(batches.exp_histogram, exp_histogram_ptr));
+
+    if export_result.is_err() {
+        release_exported_metric_batch(gauge_ptr);
+        release_exported_metric_batch(sum_ptr);
+        release_exported_metric_batch(histogram_ptr);
+        release_exported_metric_batch(exp_histogram_ptr);
+        return OtlpStatus::Internal;
+    }
+
+    (*out_batches).skipped_summaries = skipped.summaries as u64;
+    (*out_batches).skipped_nan_values = skipped.nan_values as u64;
+    (*out_batches).skipped_infinity_values = skipped.infinity_values as u64;
+    (*out_batches).skipped_missing_values = skipped.missing_values as u64;
+
+    OtlpStatus::Ok
+}
+
 /// Transform OTLP bytes to Arrow in one call (non-streaming).
 ///
 /// # Safety
@@ -336,37 +381,183 @@ pub unsafe extern "C" fn otlp_transform_metrics_all(
             Ok(batches) => batches,
             Err(_) => return OtlpStatus::ParseFailed,
         };
-        let skipped = batches.skipped;
+        export_metric_batches(batches, out_batches)
+    }))
+    .unwrap_or(OtlpStatus::Internal)
+}
 
-        // Export each shape in order. If any export fails mid-sequence, release every batch
-        // already exported (present == 1) so we honor the C contract: "non-OK => no batch is
-        // present; nothing to release." Without this, an earlier success (e.g. gauge) would
-        // leak its array/schema private_data when a later shape (e.g. sum) fails, because the
-        // C++ caller trusts that contract and does not inspect present flags on failure.
-        let gauge_ptr = std::ptr::addr_of_mut!((*out_batches).gauge);
-        let sum_ptr = std::ptr::addr_of_mut!((*out_batches).sum);
-        let histogram_ptr = std::ptr::addr_of_mut!((*out_batches).histogram);
-        let exp_histogram_ptr = std::ptr::addr_of_mut!((*out_batches).exp_histogram);
+// ============================================================================
+// FFI Functions - Native OTAP Streaming API
+// ============================================================================
 
-        let export_result = export_optional_metric_batch(batches.gauge, gauge_ptr)
-            .and_then(|_| export_optional_metric_batch(batches.sum, sum_ptr))
-            .and_then(|_| export_optional_metric_batch(batches.histogram, histogram_ptr))
-            .and_then(|_| export_optional_metric_batch(batches.exp_histogram, exp_histogram_ptr));
+/// Opaque, heap-owned handle wrapping a stateful OTAP decoder.
+///
+/// Created by `otlp_otap_decoder_new`, destroyed by `otlp_otap_decoder_free`.
+/// NOT thread-safe and NOT re-entrant: keep one decoder per OTAP stream, driven
+/// by a single thread at a time (mirrors `OtapDecoder`'s `&mut self` methods).
+///
+/// On a non-OK decode the decoder's internal stream state may be partially
+/// advanced. The safe contract is that the stream is then no longer
+/// trustworthy: free the decoder and start a new one rather than feeding it
+/// more messages. Do not attempt mid-stream recovery.
+pub struct OtlpOtapDecoder {
+    inner: crate::otap::OtapDecoder,
+}
 
-        if export_result.is_err() {
-            release_exported_metric_batch(gauge_ptr);
-            release_exported_metric_batch(sum_ptr);
-            release_exported_metric_batch(histogram_ptr);
-            release_exported_metric_batch(exp_histogram_ptr);
-            return OtlpStatus::Internal;
+/// Create a new stateful OTAP decoder.
+///
+/// # Returns
+///
+/// A non-null handle owned by the caller, who must release it with
+/// `otlp_otap_decoder_free`.
+#[no_mangle]
+pub extern "C" fn otlp_otap_decoder_new() -> *mut OtlpOtapDecoder {
+    Box::into_raw(Box::new(OtlpOtapDecoder {
+        inner: crate::otap::OtapDecoder::new(),
+    }))
+}
+
+/// Free an OTAP decoder created by `otlp_otap_decoder_new`.
+///
+/// # Safety
+///
+/// `decoder` must be a pointer returned by `otlp_otap_decoder_new` that has not
+/// already been freed, or null. Passing null is a safe no-op.
+#[no_mangle]
+pub unsafe extern "C" fn otlp_otap_decoder_free(decoder: *mut OtlpOtapDecoder) {
+    if !decoder.is_null() {
+        drop(Box::from_raw(decoder));
+    }
+}
+
+/// Shared body for the single-batch OTAP decode entry points (logs and traces),
+/// which each return exactly one `RecordBatch` on success.
+///
+/// # Safety
+///
+/// Same contract as the public entry points: `decoder` from
+/// `otlp_otap_decoder_new`; `data` valid for `len` bytes; `out_array`/
+/// `out_schema` valid and writable. On `OTLP_OK` the caller owns and must
+/// release both out-params; on non-OK nothing is written.
+unsafe fn otap_decode_batch(
+    decoder: *mut OtlpOtapDecoder,
+    data: *const u8,
+    len: usize,
+    out_array: *mut FFI_ArrowArray,
+    out_schema: *mut FFI_ArrowSchema,
+    decode: fn(&mut crate::otap::OtapDecoder, &[u8]) -> crate::Result<RecordBatch>,
+) -> OtlpStatus {
+    if decoder.is_null() || data.is_null() || out_array.is_null() || out_schema.is_null() {
+        return OtlpStatus::InvalidArgument;
+    }
+
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let slice = std::slice::from_raw_parts(data, len);
+        match decode(&mut (*decoder).inner, slice) {
+            Ok(batch) => export_record_batch(batch, out_array, out_schema)
+                .map_or_else(|status| status, |_| OtlpStatus::Ok),
+            Err(_) => OtlpStatus::ParseFailed,
         }
+    }))
+    .unwrap_or(OtlpStatus::Internal)
+}
 
-        (*out_batches).skipped_summaries = skipped.summaries as u64;
-        (*out_batches).skipped_nan_values = skipped.nan_values as u64;
-        (*out_batches).skipped_infinity_values = skipped.infinity_values as u64;
-        (*out_batches).skipped_missing_values = skipped.missing_values as u64;
+/// Decode one canonical OTAP `BatchArrowRecords` message into a normalized logs
+/// batch, reusing schema/dictionary state established by earlier messages on the
+/// same decoder.
+///
+/// # Safety
+///
+/// - `decoder` must come from `otlp_otap_decoder_new` and not be freed
+/// - `data` must be valid for `len` bytes
+/// - `out_array` and `out_schema` must be valid, writable pointers
+/// - On `OTLP_OK` the caller owns and must release both out_array and out_schema
+/// - On any non-OK status nothing is written and the stream should be discarded
+#[no_mangle]
+pub unsafe extern "C" fn otlp_otap_decode_logs(
+    decoder: *mut OtlpOtapDecoder,
+    data: *const u8,
+    len: usize,
+    out_array: *mut FFI_ArrowArray,
+    out_schema: *mut FFI_ArrowSchema,
+) -> OtlpStatus {
+    otap_decode_batch(
+        decoder,
+        data,
+        len,
+        out_array,
+        out_schema,
+        crate::otap::OtapDecoder::decode_logs,
+    )
+}
 
-        OtlpStatus::Ok
+/// Decode one canonical OTAP `BatchArrowRecords` message into a normalized
+/// traces batch, reusing schema/dictionary state established by earlier messages
+/// on the same decoder.
+///
+/// # Safety
+///
+/// Identical contract to `otlp_otap_decode_logs`.
+#[no_mangle]
+pub unsafe extern "C" fn otlp_otap_decode_traces(
+    decoder: *mut OtlpOtapDecoder,
+    data: *const u8,
+    len: usize,
+    out_array: *mut FFI_ArrowArray,
+    out_schema: *mut FFI_ArrowSchema,
+) -> OtlpStatus {
+    otap_decode_batch(
+        decoder,
+        data,
+        len,
+        out_array,
+        out_schema,
+        crate::otap::OtapDecoder::decode_traces,
+    )
+}
+
+/// Decode one canonical OTAP `BatchArrowRecords` message into the normalized
+/// metric batches, reusing schema/dictionary state established by earlier
+/// messages on the same decoder.
+///
+/// # Safety
+///
+/// - `decoder` must come from `otlp_otap_decoder_new` and not be freed
+/// - `data` must be valid for `len` bytes
+/// - `out_batches` must be a valid pointer to `OtlpMetricsArrowBatches`
+/// - Caller should zero-initialize `out_batches` before calling
+/// - For each output with `present != 0`, caller must release array and schema;
+///   outputs with `present == 0` must not be released
+/// - On any non-OK status no batch is present and the stream should be discarded
+#[no_mangle]
+pub unsafe extern "C" fn otlp_otap_decode_metrics(
+    decoder: *mut OtlpOtapDecoder,
+    data: *const u8,
+    len: usize,
+    out_batches: *mut OtlpMetricsArrowBatches,
+) -> OtlpStatus {
+    if decoder.is_null() || data.is_null() || out_batches.is_null() {
+        return OtlpStatus::InvalidArgument;
+    }
+
+    // Make every output safely inspectable even when decoding/export fails
+    // before a specific metric shape is written.
+    (*out_batches).gauge.present = 0;
+    (*out_batches).sum.present = 0;
+    (*out_batches).histogram.present = 0;
+    (*out_batches).exp_histogram.present = 0;
+    (*out_batches).skipped_summaries = 0;
+    (*out_batches).skipped_nan_values = 0;
+    (*out_batches).skipped_infinity_values = 0;
+    (*out_batches).skipped_missing_values = 0;
+
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let slice = std::slice::from_raw_parts(data, len);
+        let batches = match (*decoder).inner.decode_metrics(slice) {
+            Ok(batches) => batches,
+            Err(_) => return OtlpStatus::ParseFailed,
+        };
+        export_metric_batches(batches, out_batches)
     }))
     .unwrap_or(OtlpStatus::Internal)
 }
@@ -412,6 +603,44 @@ mod tests {
         resource::v1::Resource,
     };
     use prost::Message;
+
+    const OTAP_LOGS_INITIAL: &[u8] = include_bytes!("../../tests/fixtures/otap/logs-initial.bar");
+    const OTAP_LOGS_REUSE: &[u8] = include_bytes!("../../tests/fixtures/otap/logs-reuse.bar");
+    const OTAP_TRACES_INITIAL: &[u8] =
+        include_bytes!("../../tests/fixtures/otap/traces-initial.bar");
+    const OTAP_METRICS_INITIAL: &[u8] =
+        include_bytes!("../../tests/fixtures/otap/metrics-initial.bar");
+    #[cfg(feature = "otap-zstd")]
+    const OTAP_LOGS_ZSTD: &[u8] = include_bytes!("../../tests/fixtures/otap/logs-zstd.bar");
+
+    /// Decode one single-batch OTAP signal through the FFI, import the exported
+    /// Arrow array back into Rust (which also releases the FFI resources on
+    /// drop), and return its row count. Asserts `OTLP_OK`.
+    unsafe fn ffi_decode_rows(
+        decoder: *mut OtlpOtapDecoder,
+        bytes: &[u8],
+        decode: unsafe extern "C" fn(
+            *mut OtlpOtapDecoder,
+            *const u8,
+            usize,
+            *mut FFI_ArrowArray,
+            *mut FFI_ArrowSchema,
+        ) -> OtlpStatus,
+    ) -> usize {
+        let mut ffi_array = std::mem::MaybeUninit::<FFI_ArrowArray>::uninit();
+        let mut ffi_schema = std::mem::MaybeUninit::<FFI_ArrowSchema>::uninit();
+        let status = decode(
+            decoder,
+            bytes.as_ptr(),
+            bytes.len(),
+            ffi_array.as_mut_ptr(),
+            ffi_schema.as_mut_ptr(),
+        );
+        assert_eq!(status, OtlpStatus::Ok);
+        let array = arrow_array::ffi::from_ffi(ffi_array.assume_init(), &ffi_schema.assume_init())
+            .expect("import exported array");
+        array.len()
+    }
 
     fn create_test_log_bytes() -> Vec<u8> {
         let request = ExportLogsServiceRequest {
@@ -655,6 +884,174 @@ mod tests {
             assert_eq!(batches.sum.present, 0);
             assert_eq!(batches.histogram.present, 0);
             assert_eq!(batches.exp_histogram.present, 0);
+        }
+    }
+
+    #[test]
+    fn otap_decode_logs_and_traces_happy_path() {
+        unsafe {
+            let decoder = otlp_otap_decoder_new();
+            assert!(!decoder.is_null());
+            assert!(ffi_decode_rows(decoder, OTAP_LOGS_INITIAL, otlp_otap_decode_logs) > 0);
+            otlp_otap_decoder_free(decoder);
+
+            let decoder = otlp_otap_decoder_new();
+            assert!(ffi_decode_rows(decoder, OTAP_TRACES_INITIAL, otlp_otap_decode_traces) > 0);
+            otlp_otap_decoder_free(decoder);
+        }
+    }
+
+    #[test]
+    fn otap_decode_metrics_reports_present_and_skipped() {
+        unsafe {
+            // Ground truth from the safe decoder on the same bytes; the FFI path
+            // must agree on which shapes are present and the skipped counters.
+            let expected = crate::otap::OtapDecoder::new()
+                .decode_metrics(OTAP_METRICS_INITIAL)
+                .expect("safe decode of metrics fixture");
+
+            let decoder = otlp_otap_decoder_new();
+            let mut batches = std::mem::zeroed::<OtlpMetricsArrowBatches>();
+            let status = otlp_otap_decode_metrics(
+                decoder,
+                OTAP_METRICS_INITIAL.as_ptr(),
+                OTAP_METRICS_INITIAL.len(),
+                &mut batches,
+            );
+            assert_eq!(status, OtlpStatus::Ok);
+            assert_eq!(batches.gauge.present, expected.gauge.is_some() as c_int);
+            assert_eq!(batches.sum.present, expected.sum.is_some() as c_int);
+            assert_eq!(
+                batches.histogram.present,
+                expected.histogram.is_some() as c_int
+            );
+            assert_eq!(
+                batches.exp_histogram.present,
+                expected.exp_histogram.is_some() as c_int
+            );
+            assert_eq!(batches.skipped_summaries, expected.skipped.summaries as u64);
+            assert_eq!(
+                batches.skipped_nan_values,
+                expected.skipped.nan_values as u64
+            );
+            assert_eq!(
+                batches.skipped_infinity_values,
+                expected.skipped.infinity_values as u64
+            );
+            assert_eq!(
+                batches.skipped_missing_values,
+                expected.skipped.missing_values as u64
+            );
+            // The canonical fixture decodes at least one metric shape.
+            assert_ne!(
+                batches.gauge.present
+                    | batches.sum.present
+                    | batches.histogram.present
+                    | batches.exp_histogram.present,
+                0
+            );
+
+            // Honor the ownership contract: release every present batch.
+            release_exported_metric_batch(std::ptr::addr_of_mut!(batches.gauge));
+            release_exported_metric_batch(std::ptr::addr_of_mut!(batches.sum));
+            release_exported_metric_batch(std::ptr::addr_of_mut!(batches.histogram));
+            release_exported_metric_batch(std::ptr::addr_of_mut!(batches.exp_histogram));
+            otlp_otap_decoder_free(decoder);
+        }
+    }
+
+    #[test]
+    fn otap_dictionary_reuse_persists_across_ffi_calls() {
+        unsafe {
+            let decoder = otlp_otap_decoder_new();
+            assert!(ffi_decode_rows(decoder, OTAP_LOGS_INITIAL, otlp_otap_decode_logs) > 0);
+            // The reuse message omits the Arrow schema/dictionary; it only decodes
+            // because the decoder retained state from the initial message.
+            assert!(ffi_decode_rows(decoder, OTAP_LOGS_REUSE, otlp_otap_decode_logs) > 0);
+            otlp_otap_decoder_free(decoder);
+        }
+    }
+
+    #[test]
+    fn otap_reuse_on_fresh_decoder_fails() {
+        unsafe {
+            // The documented "one decoder per stream" guarantee: a reuse message
+            // has no schema/dictionary, so a fresh decoder cannot decode it.
+            let decoder = otlp_otap_decoder_new();
+            let mut ffi_array = std::mem::MaybeUninit::<FFI_ArrowArray>::uninit();
+            let mut ffi_schema = std::mem::MaybeUninit::<FFI_ArrowSchema>::uninit();
+            let status = otlp_otap_decode_logs(
+                decoder,
+                OTAP_LOGS_REUSE.as_ptr(),
+                OTAP_LOGS_REUSE.len(),
+                ffi_array.as_mut_ptr(),
+                ffi_schema.as_mut_ptr(),
+            );
+            assert_eq!(status, OtlpStatus::ParseFailed);
+            otlp_otap_decoder_free(decoder);
+        }
+    }
+
+    #[test]
+    fn otap_null_args_rejected() {
+        unsafe {
+            let decoder = otlp_otap_decoder_new();
+            let mut arr = std::mem::MaybeUninit::<FFI_ArrowArray>::uninit();
+            let mut sch = std::mem::MaybeUninit::<FFI_ArrowSchema>::uninit();
+            let (ptr, len) = (OTAP_LOGS_INITIAL.as_ptr(), OTAP_LOGS_INITIAL.len());
+
+            // Each null argument is rejected before any decoding happens, so the
+            // decoder's stream state is never advanced.
+            assert_eq!(
+                otlp_otap_decode_logs(
+                    std::ptr::null_mut(),
+                    ptr,
+                    len,
+                    arr.as_mut_ptr(),
+                    sch.as_mut_ptr()
+                ),
+                OtlpStatus::InvalidArgument
+            );
+            assert_eq!(
+                otlp_otap_decode_logs(
+                    decoder,
+                    std::ptr::null(),
+                    0,
+                    arr.as_mut_ptr(),
+                    sch.as_mut_ptr()
+                ),
+                OtlpStatus::InvalidArgument
+            );
+            assert_eq!(
+                otlp_otap_decode_logs(decoder, ptr, len, std::ptr::null_mut(), sch.as_mut_ptr()),
+                OtlpStatus::InvalidArgument
+            );
+            assert_eq!(
+                otlp_otap_decode_logs(decoder, ptr, len, arr.as_mut_ptr(), std::ptr::null_mut()),
+                OtlpStatus::InvalidArgument
+            );
+            assert_eq!(
+                otlp_otap_decode_metrics(std::ptr::null_mut(), ptr, len, std::ptr::null_mut()),
+                OtlpStatus::InvalidArgument
+            );
+            assert_eq!(
+                otlp_otap_decode_metrics(decoder, ptr, len, std::ptr::null_mut()),
+                OtlpStatus::InvalidArgument
+            );
+
+            otlp_otap_decoder_free(decoder);
+            // Freeing null must be a safe no-op.
+            otlp_otap_decoder_free(std::ptr::null_mut());
+        }
+    }
+
+    #[cfg(feature = "otap-zstd")]
+    #[test]
+    fn otap_decode_zstd_logs() {
+        unsafe {
+            let decoder = otlp_otap_decoder_new();
+            assert!(ffi_decode_rows(decoder, OTAP_LOGS_ZSTD, otlp_otap_decode_logs) > 0);
+            otlp_otap_decoder_free(decoder);
         }
     }
 

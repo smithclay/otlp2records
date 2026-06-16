@@ -1,17 +1,52 @@
-//! Shared auto-format fallback dispatch used by the per-signal transform
-//! entry points.
+//! Shared dispatch helpers used by the per-signal transform entry points.
 //!
-//! All `*_auto*` variants follow the same pattern: when the payload looks
-//! like JSON we try JSON, then JSONL, then protobuf; otherwise we try
-//! protobuf, then JSON. Error wrapping is identical across signals, so we
-//! centralize it here. The closures take an extra `&mut O` parameter so the
-//! observed variants can thread `&mut Option<&mut dyn TransformObserver>`
-//! through without simultaneous mutable borrows.
+//! Two patterns repeat identically across logs, traces, and metrics and are
+//! centralized here:
+//!
+//! - [`auto_dispatch`]: all `*_auto*` variants try JSON, then JSONL, then
+//!   protobuf when the payload looks like JSON, otherwise protobuf then JSON.
+//!   The closures take an extra `&mut O` parameter so the observed variants can
+//!   thread `&mut Option<&mut dyn TransformObserver>` without simultaneous
+//!   mutable borrows.
+//! - [`decode_json_observed`]: decode a JSON or JSONL request and report the
+//!   decode phase to the observer. Both the normalized and OTAP star JSON paths
+//!   of every signal share this exact block.
+
+use std::time::Instant;
 
 use crate::{
-    decode::{looks_like_json, DecodeError},
+    batch::{observe_phase, TransformObserver, TransformPhase, TransformSignal},
+    decode::{looks_like_json, DecodeError, InputFormat},
     Error, Result,
 };
+
+/// Decode a JSON (`InputFormat::Json`) or JSONL (`InputFormat::Jsonl`) request
+/// and report the corresponding decode phase to `observer`. Returns the decoded
+/// request; the caller chooses the normalized or OTAP star transform to apply.
+/// Any other `format` is a caller bug and yields an `Unsupported` error tagged
+/// with `signal_label` (e.g. `"logs"`).
+pub(super) fn decode_json_observed<R>(
+    bytes: &[u8],
+    format: InputFormat,
+    signal: TransformSignal,
+    observer: &mut Option<&mut dyn TransformObserver>,
+    decode_json: impl FnOnce(&[u8]) -> std::result::Result<R, DecodeError>,
+    decode_jsonl: impl FnOnce(&[u8]) -> std::result::Result<R, DecodeError>,
+    signal_label: &str,
+) -> Result<R> {
+    let start = Instant::now();
+    let (request, phase) = match format {
+        InputFormat::Json => (decode_json(bytes)?, TransformPhase::JsonDecode),
+        InputFormat::Jsonl => (decode_jsonl(bytes)?, TransformPhase::JsonlDecode),
+        _ => {
+            return Err(Error::Decode(DecodeError::Unsupported(format!(
+                "expected JSON or JSONL {signal_label} input"
+            ))));
+        }
+    };
+    observe_phase(observer, signal, phase, start.elapsed());
+    Ok(request)
+}
 
 pub(super) fn auto_dispatch<T, O>(
     bytes: &[u8],

@@ -7,24 +7,23 @@ use arrow_array::{
     },
     RecordBatch,
 };
-use opentelemetry_proto::tonic::{
-    collector::metrics::v1::ExportMetricsServiceRequest,
-    metrics::v1::{
-        metric::Data, number_data_point, ExponentialHistogramDataPoint, HistogramDataPoint,
-        NumberDataPoint,
-    },
-};
+use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
 use prost::Message;
 
 use crate::{
     api::{MetricBatches, SkippedMetrics},
     schema::{exp_histogram_schema_arc, gauge_schema_arc, histogram_schema_arc, sum_schema_arc},
+    views::pdata::{
+        BucketsView, DataType, DataView, ExponentialHistogramDataPointView,
+        ExponentialHistogramView, GaugeView, HistogramDataPointView, HistogramView, MetricView,
+        MetricsView, NumberDataPointView, ResourceMetricsView, ScopeMetricsView, SumView,
+        SummaryView, Value,
+    },
     Result,
 };
 
 use super::{
     context::{ContextDuplicateTracker, MetricMeta, ResourceContext, ScopeContext},
-    json::{append_attrs_json, append_exemplars_json},
     profile::{
         measure_phase, measure_result, observe_counter, TransformCounter, TransformObserver,
         TransformPhase, TransformSignal,
@@ -34,6 +33,7 @@ use super::{
         append_required_service_name_n, append_required_ts_ns, append_u64_list, array,
         record_batch, string_builder,
     },
+    view_json,
 };
 
 pub fn transform_metrics_protobuf(bytes: &[u8]) -> Result<MetricBatches> {
@@ -63,25 +63,48 @@ pub fn transform_metrics_request_observed(
     request: ExportMetricsServiceRequest,
     observer: &mut Option<&mut dyn TransformObserver>,
 ) -> Result<MetricBatches> {
+    transform_metrics_view_observed(&request, observer)
+}
+
+pub(crate) fn transform_metrics_view<V: MetricsView>(view: &V) -> Result<MetricBatches> {
+    transform_metrics_view_observed(view, &mut None)
+}
+
+pub(crate) fn transform_metrics_view_observed<V: MetricsView>(
+    view: &V,
+    observer: &mut Option<&mut dyn TransformObserver>,
+) -> Result<MetricBatches> {
     let mut capacities = MetricCapacities::default();
     measure_phase(
         observer,
         TransformSignal::Metrics,
         TransformPhase::MetricsCapacity,
         || {
-            for resource_metrics in &request.resource_metrics {
-                for scope_metrics in &resource_metrics.scope_metrics {
-                    for metric in &scope_metrics.metrics {
-                        match &metric.data {
-                            Some(Data::Gauge(gauge)) => capacities.gauge += gauge.data_points.len(),
-                            Some(Data::Sum(sum)) => capacities.sum += sum.data_points.len(),
-                            Some(Data::Histogram(histogram)) => {
-                                capacities.histogram += histogram.data_points.len();
+            for resource_metrics in view.resources() {
+                for scope_metrics in resource_metrics.scopes() {
+                    for metric in scope_metrics.metrics() {
+                        let Some(data) = metric.data() else {
+                            continue;
+                        };
+                        match data.value_type() {
+                            DataType::Gauge => {
+                                capacities.gauge += data.as_gauge().unwrap().data_points().count();
                             }
-                            Some(Data::ExponentialHistogram(histogram)) => {
-                                capacities.exp_histogram += histogram.data_points.len();
+                            DataType::Sum => {
+                                capacities.sum += data.as_sum().unwrap().data_points().count();
                             }
-                            _ => {}
+                            DataType::Histogram => {
+                                capacities.histogram +=
+                                    data.as_histogram().unwrap().data_points().count();
+                            }
+                            DataType::ExponentialHistogram => {
+                                capacities.exp_histogram += data
+                                    .as_exponential_histogram()
+                                    .unwrap()
+                                    .data_points()
+                                    .count();
+                            }
+                            DataType::Summary => {}
                         }
                     }
                 }
@@ -112,61 +135,48 @@ pub fn transform_metrics_request_observed(
     let mut skipped = SkippedMetrics::default();
     let mut duplicates = observer.is_some().then(ContextDuplicateTracker::default);
 
-    for resource_metrics in request.resource_metrics {
-        let resource_attrs = resource_metrics
-            .resource
-            .as_ref()
-            .map(|r| r.attributes.as_slice())
-            .unwrap_or(&[]);
-        let resource = ResourceContext::from_attrs_observed(
-            resource_attrs,
+    for resource_metrics in view.resources() {
+        let resource_view = resource_metrics.resource();
+        let resource = ResourceContext::from_view_observed(
+            resource_view.as_ref(),
             TransformSignal::Metrics,
             observer,
             duplicates.as_mut(),
         );
 
-        for scope_metrics in resource_metrics.scope_metrics {
-            let scope_name = scope_metrics.scope.as_ref().map(|s| s.name.as_str());
-            let scope_version = scope_metrics.scope.as_ref().map(|s| s.version.as_str());
-            let scope_attrs = scope_metrics
-                .scope
-                .as_ref()
-                .map(|s| s.attributes.as_slice())
-                .unwrap_or(&[]);
-            let scope = ScopeContext::new_observed(
-                scope_name,
-                scope_version,
-                scope_attrs,
+        for scope_metrics in resource_metrics.scopes() {
+            let scope_view = scope_metrics.scope();
+            let scope = ScopeContext::from_view_observed(
+                scope_view.as_ref(),
                 TransformSignal::Metrics,
                 observer,
                 duplicates.as_mut(),
             );
 
-            for metric in scope_metrics.metrics {
-                let metric_name = metric.name.as_str();
-                let metric_description = metric.description.as_str();
-                let metric_unit = metric.unit.as_str();
+            for metric in scope_metrics.metrics() {
+                let metric_name = String::from_utf8_lossy(metric.name());
+                let metric_description = String::from_utf8_lossy(metric.description());
+                let metric_unit = String::from_utf8_lossy(metric.unit());
+                let Some(data) = metric.data() else {
+                    continue;
+                };
+                let meta = MetricMeta {
+                    name: metric_name.as_ref(),
+                    description: metric_description.as_ref(),
+                    unit: metric_unit.as_ref(),
+                };
 
-                match metric.data {
-                    Some(Data::Gauge(data)) => {
+                match data.value_type() {
+                    DataType::Gauge => {
+                        let data = data.as_gauge().unwrap();
                         let rows_before = gauge.rows;
-                        for point in data.data_points {
-                            if let Some(value) = metric_point_value(&point.value, &mut skipped) {
+                        for point in data.data_points() {
+                            if let Some(value) = metric_point_value(point.value(), &mut skipped) {
                                 measure_result(
                                     observer,
                                     TransformSignal::Metrics,
                                     TransformPhase::ArrowAppend,
-                                    || {
-                                        gauge.append(
-                                            &point,
-                                            value,
-                                            MetricMeta {
-                                                name: metric_name,
-                                                description: metric_description,
-                                                unit: metric_unit,
-                                            },
-                                        )
-                                    },
+                                    || gauge.append(&point, value, meta),
                                 )?;
                             }
                         }
@@ -184,10 +194,11 @@ pub fn transform_metrics_request_observed(
                             );
                         }
                     }
-                    Some(Data::Sum(data)) => {
+                    DataType::Sum => {
+                        let data = data.as_sum().unwrap();
                         let rows_before = sum.rows;
-                        for point in data.data_points {
-                            if let Some(value) = metric_point_value(&point.value, &mut skipped) {
+                        for point in data.data_points() {
+                            if let Some(value) = metric_point_value(point.value(), &mut skipped) {
                                 measure_result(
                                     observer,
                                     TransformSignal::Metrics,
@@ -196,13 +207,9 @@ pub fn transform_metrics_request_observed(
                                         sum.append(
                                             &point,
                                             value,
-                                            data.aggregation_temporality,
-                                            data.is_monotonic,
-                                            MetricMeta {
-                                                name: metric_name,
-                                                description: metric_description,
-                                                unit: metric_unit,
-                                            },
+                                            data.aggregation_temporality(),
+                                            data.is_monotonic(),
+                                            meta,
                                         )
                                     },
                                 )?;
@@ -222,24 +229,15 @@ pub fn transform_metrics_request_observed(
                             );
                         }
                     }
-                    Some(Data::Histogram(data)) => {
+                    DataType::Histogram => {
+                        let data = data.as_histogram().unwrap();
                         let rows_before = histogram.rows;
-                        for point in data.data_points {
+                        for point in data.data_points() {
                             measure_result(
                                 observer,
                                 TransformSignal::Metrics,
                                 TransformPhase::ArrowAppend,
-                                || {
-                                    histogram.append(
-                                        &point,
-                                        data.aggregation_temporality,
-                                        MetricMeta {
-                                            name: metric_name,
-                                            description: metric_description,
-                                            unit: metric_unit,
-                                        },
-                                    )
-                                },
+                                || histogram.append(&point, data.aggregation_temporality(), meta),
                             )?;
                         }
                         let appended = histogram.rows - rows_before;
@@ -254,9 +252,10 @@ pub fn transform_metrics_request_observed(
                             );
                         }
                     }
-                    Some(Data::ExponentialHistogram(data)) => {
+                    DataType::ExponentialHistogram => {
+                        let data = data.as_exponential_histogram().unwrap();
                         let rows_before = exp_histogram.rows;
-                        for point in data.data_points {
+                        for point in data.data_points() {
                             measure_result(
                                 observer,
                                 TransformSignal::Metrics,
@@ -264,12 +263,8 @@ pub fn transform_metrics_request_observed(
                                 || {
                                     exp_histogram.append(
                                         &point,
-                                        data.aggregation_temporality,
-                                        MetricMeta {
-                                            name: metric_name,
-                                            description: metric_description,
-                                            unit: metric_unit,
-                                        },
+                                        data.aggregation_temporality(),
+                                        meta,
                                     )
                                 },
                             )?;
@@ -286,10 +281,9 @@ pub fn transform_metrics_request_observed(
                             );
                         }
                     }
-                    Some(Data::Summary(summary)) => {
-                        skipped.summaries += summary.data_points.len();
+                    DataType::Summary => {
+                        skipped.summaries += data.as_summary().unwrap().data_points().count();
                     }
-                    None => {}
                 }
             }
         }
@@ -371,9 +365,9 @@ impl GaugeBuilders {
         }
     }
 
-    fn append(
+    fn append<P: NumberDataPointView>(
         &mut self,
-        point: &NumberDataPoint,
+        point: &P,
         value: NumberPointValue,
         meta: MetricMeta<'_>,
     ) -> Result<()> {
@@ -464,9 +458,9 @@ impl SumBuilders {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn append(
+    fn append<P: NumberDataPointView>(
         &mut self,
-        point: &NumberDataPoint,
+        point: &P,
         value: NumberPointValue,
         aggregation_temporality: i32,
         is_monotonic: bool,
@@ -641,20 +635,20 @@ impl NumberMetricBuilders for SumBuilders {
     }
 }
 
-fn append_metric_common<B: NumberMetricBuilders>(
+fn append_metric_common<B: NumberMetricBuilders, P: NumberDataPointView>(
     builders: &mut B,
-    point: &NumberDataPoint,
+    point: &P,
     value: NumberPointValue,
     meta: MetricMeta<'_>,
 ) -> Result<()> {
     append_required_ts_ns(
         builders.time_unix_nano(),
-        point.time_unix_nano,
+        point.time_unix_nano(),
         "metric.time_unix_nano",
     )?;
     append_opt_ts_ns(
         builders.start_time_unix_nano(),
-        point.start_time_unix_nano,
+        point.start_time_unix_nano(),
         "metric.start_time_unix_nano",
     )?;
     builders.name().append_value(meta.name);
@@ -670,10 +664,10 @@ fn append_metric_common<B: NumberMetricBuilders>(
             builders.double_value().append_value(value);
         }
     }
-    builders.flags().append_value(point.flags);
+    builders.flags().append_value(point.flags().into_inner());
     let (metric_attributes, exemplars_json, json_scratch) = builders.json_builders();
-    append_attrs_json(metric_attributes, &point.attributes, json_scratch)?;
-    append_exemplars_json(exemplars_json, &point.exemplars, json_scratch)?;
+    view_json::append_attributes(metric_attributes, point.attributes(), json_scratch)?;
+    view_json::append_exemplars(exemplars_json, point.exemplars(), json_scratch)?;
     Ok(())
 }
 
@@ -769,40 +763,42 @@ impl HistogramBuilders {
         }
     }
 
-    fn append(
+    fn append<P: HistogramDataPointView>(
         &mut self,
-        point: &HistogramDataPoint,
+        point: &P,
         aggregation_temporality: i32,
         meta: MetricMeta<'_>,
     ) -> Result<()> {
         append_required_ts_ns(
             &mut self.time_unix_nano,
-            point.time_unix_nano,
+            point.time_unix_nano(),
             "histogram.time_unix_nano",
         )?;
         append_opt_ts_ns(
             &mut self.start_time_unix_nano,
-            point.start_time_unix_nano,
+            point.start_time_unix_nano(),
             "histogram.start_time_unix_nano",
         )?;
         self.name.append_value(meta.name);
         self.description.append_value(meta.description);
         self.unit.append_value(meta.unit);
-        self.count.append_value(point.count);
-        append_finite_opt(&mut self.sum, point.sum);
-        append_finite_opt(&mut self.min, point.min);
-        append_finite_opt(&mut self.max, point.max);
-        append_u64_list(&mut self.bucket_counts, &point.bucket_counts);
-        append_f64_list(&mut self.explicit_bounds, &point.explicit_bounds);
-        append_attrs_json(
+        self.count.append_value(point.count());
+        append_finite_opt(&mut self.sum, point.sum());
+        append_finite_opt(&mut self.min, point.min());
+        append_finite_opt(&mut self.max, point.max());
+        let bucket_counts: Vec<_> = point.bucket_counts().collect();
+        let explicit_bounds: Vec<_> = point.explicit_bounds().collect();
+        append_u64_list(&mut self.bucket_counts, &bucket_counts);
+        append_f64_list(&mut self.explicit_bounds, &explicit_bounds);
+        view_json::append_attributes(
             &mut self.metric_attributes,
-            &point.attributes,
+            point.attributes(),
             &mut self.json_scratch,
         )?;
-        self.flags.append_value(point.flags);
-        append_exemplars_json(
+        self.flags.append_value(point.flags().into_inner());
+        view_json::append_exemplars(
             &mut self.exemplars_json,
-            &point.exemplars,
+            point.exemplars(),
             &mut self.json_scratch,
         )?;
         self.aggregation_temporality
@@ -928,55 +924,57 @@ impl ExpHistogramBuilders {
         }
     }
 
-    fn append(
+    fn append<P: ExponentialHistogramDataPointView>(
         &mut self,
-        point: &ExponentialHistogramDataPoint,
+        point: &P,
         aggregation_temporality: i32,
         meta: MetricMeta<'_>,
     ) -> Result<()> {
         append_required_ts_ns(
             &mut self.time_unix_nano,
-            point.time_unix_nano,
+            point.time_unix_nano(),
             "exp_histogram.time_unix_nano",
         )?;
         append_opt_ts_ns(
             &mut self.start_time_unix_nano,
-            point.start_time_unix_nano,
+            point.start_time_unix_nano(),
             "exp_histogram.start_time_unix_nano",
         )?;
         self.name.append_value(meta.name);
         self.description.append_value(meta.description);
         self.unit.append_value(meta.unit);
-        self.count.append_value(point.count);
-        append_finite_opt(&mut self.sum, point.sum);
-        append_finite_opt(&mut self.min, point.min);
-        append_finite_opt(&mut self.max, point.max);
-        self.scale.append_value(point.scale);
-        self.zero_count.append_value(point.zero_count);
-        append_finite(&mut self.zero_threshold, point.zero_threshold);
-        if let Some(positive) = &point.positive {
-            self.positive_offset.append_value(positive.offset);
-            append_u64_list(&mut self.positive_bucket_counts, &positive.bucket_counts);
+        self.count.append_value(point.count());
+        append_finite_opt(&mut self.sum, point.sum());
+        append_finite_opt(&mut self.min, point.min());
+        append_finite_opt(&mut self.max, point.max());
+        self.scale.append_value(point.scale());
+        self.zero_count.append_value(point.zero_count());
+        append_finite(&mut self.zero_threshold, point.zero_threshold());
+        if let Some(positive) = point.positive() {
+            self.positive_offset.append_value(positive.offset());
+            let counts: Vec<_> = positive.bucket_counts().collect();
+            append_u64_list(&mut self.positive_bucket_counts, &counts);
         } else {
             self.positive_offset.append_null();
             self.positive_bucket_counts.append_null();
         }
-        if let Some(negative) = &point.negative {
-            self.negative_offset.append_value(negative.offset);
-            append_u64_list(&mut self.negative_bucket_counts, &negative.bucket_counts);
+        if let Some(negative) = point.negative() {
+            self.negative_offset.append_value(negative.offset());
+            let counts: Vec<_> = negative.bucket_counts().collect();
+            append_u64_list(&mut self.negative_bucket_counts, &counts);
         } else {
             self.negative_offset.append_null();
             self.negative_bucket_counts.append_null();
         }
-        append_attrs_json(
+        view_json::append_attributes(
             &mut self.metric_attributes,
-            &point.attributes,
+            point.attributes(),
             &mut self.json_scratch,
         )?;
-        self.flags.append_value(point.flags);
-        append_exemplars_json(
+        self.flags.append_value(point.flags().into_inner());
+        view_json::append_exemplars(
             &mut self.exemplars_json,
-            &point.exemplars,
+            point.exemplars(),
             &mut self.json_scratch,
         )?;
         self.aggregation_temporality
@@ -1076,23 +1074,71 @@ fn append_metric_resource_scope_n(
 
 #[inline]
 fn metric_point_value(
-    value: &Option<number_data_point::Value>,
+    value: Option<Value>,
     skipped: &mut SkippedMetrics,
 ) -> Option<NumberPointValue> {
     match value {
-        Some(number_data_point::Value::AsInt(value)) => Some(NumberPointValue::Int(*value)),
-        Some(number_data_point::Value::AsDouble(value)) if value.is_nan() => {
+        Some(Value::Integer(value)) => Some(NumberPointValue::Int(value)),
+        Some(Value::Double(value)) if value.is_nan() => {
             skipped.nan_values += 1;
             None
         }
-        Some(number_data_point::Value::AsDouble(value)) if value.is_infinite() => {
+        Some(Value::Double(value)) if value.is_infinite() => {
             skipped.infinity_values += 1;
             None
         }
-        Some(number_data_point::Value::AsDouble(value)) => Some(NumberPointValue::Double(*value)),
+        Some(Value::Double(value)) => Some(NumberPointValue::Double(value)),
         None => {
             skipped.missing_values += 1;
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use arrow_array::{Array, Int32Array};
+    use opentelemetry_proto::tonic::metrics::v1::{
+        metric, number_data_point, Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics, Sum,
+    };
+
+    use super::*;
+
+    #[test]
+    fn preserves_out_of_spec_aggregation_temporality() {
+        // Proto3 open enums can carry values outside 0..=2. The normalized
+        // Int32 column must pass the raw discriminant through rather than clamp
+        // it to Unspecified.
+        let request = ExportMetricsServiceRequest {
+            resource_metrics: vec![ResourceMetrics {
+                scope_metrics: vec![ScopeMetrics {
+                    metrics: vec![Metric {
+                        name: "m".into(),
+                        data: Some(metric::Data::Sum(Sum {
+                            data_points: vec![NumberDataPoint {
+                                time_unix_nano: 1,
+                                value: Some(number_data_point::Value::AsInt(5)),
+                                ..Default::default()
+                            }],
+                            aggregation_temporality: 3,
+                            is_monotonic: true,
+                        })),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+
+        let batches = transform_metrics_request(request).unwrap();
+        let sum = batches.sum.expect("sum batch present");
+        let temporality = sum
+            .column_by_name("aggregation_temporality")
+            .expect("aggregation_temporality column")
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("Int32 temporality column");
+        assert_eq!(temporality.value(0), 3);
     }
 }

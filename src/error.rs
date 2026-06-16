@@ -32,4 +32,8 @@ pub enum Error {
     /// Schema mismatch error
     #[error("schema mismatch: {0}")]
     SchemaMismatch(String),
+
+    /// Native OTAP decoding error
+    #[error("OTAP decode error: {0}")]
+    Otap(String),
 }

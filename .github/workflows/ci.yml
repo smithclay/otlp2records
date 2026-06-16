@@ -12,6 +12,28 @@ env:
   RUSTFLAGS: -Dwarnings
 
 jobs:
+  msrv:
+    name: Rust 1.86 and WASM
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust 1.86
+        uses: dtolnay/rust-toolchain@1.86
+        with:
+          targets: wasm32-unknown-unknown
+
+      # --all-features is intentionally native-only: `otap-zstd` pulls in Arrow's
+      # bundled C Zstandard backend, which cannot target wasm32.
+      - name: Check MSRV
+        run: cargo check --all-features
+
+      # WASM deliberately uses --features wasm (not --all-features) so the C
+      # Zstandard backend stays out of the wasm32 build. WASM OTAP is
+      # uncompressed/LZ4 only.
+      - name: Check WASM, including native OTAP
+        run: cargo check --target wasm32-unknown-unknown --features wasm
+
   test:
     name: Test
     runs-on: ubuntu-latest
@@ -32,6 +54,9 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-
+
+      - name: Run tests (default features)
+        run: cargo test
 
       - name: Run tests
         run: cargo test --all-features

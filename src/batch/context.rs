@@ -6,15 +6,16 @@ use std::{
     hash::{Hash, Hasher},
 };
 
-use opentelemetry_proto::tonic::common::v1::{any_value, AnyValue, KeyValue};
+use crate::views::pdata::{
+    AnyValueView, AttributeView, InstrumentationScopeView, ResourceView, ValueType,
+};
 
 use super::{
-    json::{attr_field, attrs_json},
     profile::{
         measure_phase, observe_counter, TransformCounter, TransformObserver, TransformPhase,
         TransformSignal,
     },
-    util::non_empty_str,
+    view_json,
 };
 
 #[derive(Default)]
@@ -24,14 +25,15 @@ pub(super) struct ContextDuplicateTracker {
 }
 
 impl ContextDuplicateTracker {
-    pub(super) fn observe_resource(
+    pub(super) fn observe_resource_view<R: ResourceView>(
         &mut self,
-        attrs: &[KeyValue],
+        resource: &R,
         signal: TransformSignal,
         observer: &mut Option<&mut dyn TransformObserver>,
     ) {
-        let fingerprint = resource_fingerprint(attrs);
-        let counter = if self.resource_contexts.insert(fingerprint) {
+        let mut hasher = DefaultHasher::new();
+        hash_view_attrs(resource.attributes(), &mut hasher);
+        let counter = if self.resource_contexts.insert(hasher.finish()) {
             TransformCounter::ResourceContextDuplicateMiss
         } else {
             TransformCounter::ResourceContextDuplicateHit
@@ -39,16 +41,17 @@ impl ContextDuplicateTracker {
         observe_counter(observer, signal, counter, 1);
     }
 
-    pub(super) fn observe_scope(
+    pub(super) fn observe_scope_view<S: InstrumentationScopeView>(
         &mut self,
-        name: Option<&str>,
-        version: Option<&str>,
-        attrs: &[KeyValue],
+        scope: &S,
         signal: TransformSignal,
         observer: &mut Option<&mut dyn TransformObserver>,
     ) {
-        let fingerprint = scope_fingerprint(name, version, attrs);
-        let counter = if self.scope_contexts.insert(fingerprint) {
+        let mut hasher = DefaultHasher::new();
+        scope.name().hash(&mut hasher);
+        scope.version().hash(&mut hasher);
+        hash_view_attrs(scope.attributes(), &mut hasher);
+        let counter = if self.scope_contexts.insert(hasher.finish()) {
             TransformCounter::ScopeContextDuplicateMiss
         } else {
             TransformCounter::ScopeContextDuplicateHit
@@ -65,24 +68,28 @@ pub(super) struct ResourceContext {
 }
 
 impl ResourceContext {
-    pub(super) fn from_attrs_observed(
-        attrs: &[KeyValue],
+    pub(super) fn from_view_observed<R: ResourceView>(
+        resource: Option<&R>,
         signal: TransformSignal,
         observer: &mut Option<&mut dyn TransformObserver>,
         duplicates: Option<&mut ContextDuplicateTracker>,
     ) -> Self {
-        if let Some(duplicates) = duplicates {
-            duplicates.observe_resource(attrs, signal, observer);
+        if let (Some(duplicates), Some(resource)) = (duplicates, resource) {
+            duplicates.observe_resource_view(resource, signal, observer);
         }
         let (service_name, service_namespace, service_instance_id) = measure_phase(
             observer,
             signal,
             TransformPhase::ResourceContextBuild,
             || {
+                let field = |key| {
+                    resource
+                        .and_then(|resource| view_json::attribute_field(resource.attributes(), key))
+                };
                 (
-                    attr_field(attrs, "service.name"),
-                    attr_field(attrs, "service.namespace"),
-                    attr_field(attrs, "service.instance.id"),
+                    field(b"service.name"),
+                    field(b"service.namespace"),
+                    field(b"service.instance.id"),
                 )
             },
         );
@@ -90,7 +97,7 @@ impl ResourceContext {
             observer,
             signal,
             TransformPhase::ResourceAttributesJson,
-            || attrs_json(attrs),
+            || resource.and_then(|resource| view_json::attributes_json(resource.attributes())),
         );
 
         Self {
@@ -109,26 +116,31 @@ pub(super) struct ScopeContext {
 }
 
 impl ScopeContext {
-    pub(super) fn new_observed(
-        name: Option<&str>,
-        version: Option<&str>,
-        attrs: &[KeyValue],
+    pub(super) fn from_view_observed<S: InstrumentationScopeView>(
+        scope: Option<&S>,
         signal: TransformSignal,
         observer: &mut Option<&mut dyn TransformObserver>,
         duplicates: Option<&mut ContextDuplicateTracker>,
     ) -> Self {
-        if let Some(duplicates) = duplicates {
-            duplicates.observe_scope(name, version, attrs, signal, observer);
+        if let (Some(duplicates), Some(scope)) = (duplicates, scope) {
+            duplicates.observe_scope_view(scope, signal, observer);
         }
         let (name, version) =
             measure_phase(observer, signal, TransformPhase::ScopeContextBuild, || {
-                (non_empty_str(name), non_empty_str(version))
+                (
+                    scope
+                        .and_then(InstrumentationScopeView::name)
+                        .map(|value| String::from_utf8_lossy(value).into_owned()),
+                    scope
+                        .and_then(InstrumentationScopeView::version)
+                        .map(|value| String::from_utf8_lossy(value).into_owned()),
+                )
             });
         let attributes_json = measure_phase(
             observer,
             signal,
             TransformPhase::ScopeAttributesJson,
-            || attrs_json(attrs),
+            || scope.and_then(|scope| view_json::attributes_json(scope.attributes())),
         );
 
         Self {
@@ -139,63 +151,55 @@ impl ScopeContext {
     }
 }
 
-fn resource_fingerprint(attrs: &[KeyValue]) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    hash_attrs(attrs, &mut hasher);
-    hasher.finish()
-}
-
-fn scope_fingerprint(name: Option<&str>, version: Option<&str>, attrs: &[KeyValue]) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    name.hash(&mut hasher);
-    version.hash(&mut hasher);
-    hash_attrs(attrs, &mut hasher);
-    hasher.finish()
-}
-
-pub(super) fn hash_attrs(attrs: &[KeyValue], hasher: &mut impl Hasher) {
-    attrs.len().hash(hasher);
-    for attr in attrs {
-        attr.key.hash(hasher);
-        hash_any_value(attr.value.as_ref(), hasher);
+fn hash_view_attrs<A: AttributeView>(
+    attributes: impl Iterator<Item = A>,
+    hasher: &mut impl Hasher,
+) {
+    for attribute in attributes {
+        attribute.key().hash(hasher);
+        match attribute.value() {
+            Some(value) => hash_view_any_value(&value, hasher),
+            None => 0_u8.hash(hasher),
+        }
     }
 }
 
-pub(super) fn hash_any_value(value: Option<&AnyValue>, hasher: &mut impl Hasher) {
-    match value.and_then(|value| value.value.as_ref()) {
-        Some(any_value::Value::StringValue(value)) => {
+fn hash_view_any_value<'a, V: AnyValueView<'a>>(value: &V, hasher: &mut impl Hasher) {
+    match value.value_type() {
+        ValueType::Empty => 0_u8.hash(hasher),
+        ValueType::String => {
             1_u8.hash(hasher);
-            value.hash(hasher);
+            value.as_string().hash(hasher);
         }
-        Some(any_value::Value::BoolValue(value)) => {
+        ValueType::Bool => {
             2_u8.hash(hasher);
-            value.hash(hasher);
+            value.as_bool().hash(hasher);
         }
-        Some(any_value::Value::IntValue(value)) => {
+        ValueType::Int64 => {
             3_u8.hash(hasher);
-            value.hash(hasher);
+            value.as_int64().hash(hasher);
         }
-        Some(any_value::Value::DoubleValue(value)) => {
+        ValueType::Double => {
             4_u8.hash(hasher);
-            value.to_bits().hash(hasher);
+            value.as_double().map(f64::to_bits).hash(hasher);
         }
-        Some(any_value::Value::BytesValue(value)) => {
+        ValueType::Bytes => {
             5_u8.hash(hasher);
-            value.hash(hasher);
+            value.as_bytes().hash(hasher);
         }
-        Some(any_value::Value::ArrayValue(value)) => {
+        ValueType::Array => {
             6_u8.hash(hasher);
-            value.values.len().hash(hasher);
-            for value in &value.values {
-                hash_any_value(Some(value), hasher);
+            if let Some(values) = value.as_array() {
+                for value in values {
+                    hash_view_any_value(&value, hasher);
+                }
             }
         }
-        Some(any_value::Value::KvlistValue(value)) => {
+        ValueType::KeyValueList => {
             7_u8.hash(hasher);
-            hash_attrs(&value.values, hasher);
-        }
-        None => {
-            0_u8.hash(hasher);
+            if let Some(attributes) = value.as_kvlist() {
+                hash_view_attrs(attributes, hasher);
+            }
         }
     }
 }
