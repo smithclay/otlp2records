@@ -305,9 +305,11 @@ OtlpStatus otlp_otap_decode_metrics(
  * feeding bytes in and pulling Arrow out, the host starts a server and Arrow
  * batches arrive as telemetry is received over the wire.
  *
- * Phase 1 serves standard OTLP/gRPC unary Export for logs only. The callback
- * ABI carries stream_id/batch_id from the start so OTAP/Arrow streaming can be
- * added without changing this header.
+ * Serves all six signals over two service families on one listener: standard
+ * OTLP/gRPC unary Export ({Logs,Trace,Metrics}Service) and canonical OTAP/Arrow
+ * bidirectional streaming (Arrow{Logs,Traces,Metrics}Service). The callback ABI
+ * carries stream_id/batch_id so the unary and streaming paths share one
+ * signature; unary requests use 0 for both.
  *
  * Native only: this API is absent from wasm builds (no runtime/sockets).
  * ============================================================================ */
@@ -341,7 +343,10 @@ typedef struct OtlpGrpcServer OtlpGrpcServer;
  * input_bytes is the wire size of the source payload, charged against the
  * host's admission/backpressure budget. The array/schema are borrowed for the
  * duration of the call only and are released by the server after it returns --
- * the callee MUST copy what it needs and MUST NOT call their release callbacks.
+ * the callee MUST copy out only the data they reference and MUST NOT call their
+ * release callbacks. Do NOT copy the ArrowArray/ArrowSchema structs themselves
+ * (e.g. via memcpy) and release the copy later: the server releases the
+ * originals on return, so a release on a struct copy is a double-free.
  * The callee must not throw across this boundary; translate any error into an
  * OtlpIngestStatus.
  *

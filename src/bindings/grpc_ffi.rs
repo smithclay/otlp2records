@@ -159,36 +159,63 @@ impl CallbackCtx {
         input_bytes: u64,
         batch: RecordBatch,
     ) -> OtlpIngestStatus {
-        let ffi_schema = match FFI_ArrowSchema::try_from(batch.schema().as_ref()) {
-            Ok(schema) => schema,
-            Err(_) => return OtlpIngestStatus::Internal,
-        };
-        let struct_array: StructArray = batch.into();
-        let mut ffi_array = FFI_ArrowArray::new(&struct_array.into_data());
-        let mut ffi_schema = ffi_schema;
+        // Fence panics from the Arrow C-Data export (or the callback's Rust
+        // frames) so a bug becomes a clean INTERNAL for this one batch instead of
+        // unwinding the connection task and tearing down every stream multiplexed
+        // on it. Mirrors the catch_unwind in `otlp_grpc_server_start`.
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let ffi_schema = match FFI_ArrowSchema::try_from(batch.schema().as_ref()) {
+                Ok(schema) => schema,
+                Err(_) => return OtlpIngestStatus::Internal,
+            };
+            let struct_array: StructArray = batch.into();
+            let mut ffi_array = FFI_ArrowArray::new(&struct_array.into_data());
+            let mut ffi_schema = ffi_schema;
 
-        (self.on_batch)(
-            self.user_data,
-            signal_type,
-            stream_id,
-            batch_id,
-            input_bytes,
-            &mut ffi_array as *mut FFI_ArrowArray,
-            &mut ffi_schema as *mut FFI_ArrowSchema,
-        )
-        // ffi_array / ffi_schema drop here, invoking their release callbacks.
+            (self.on_batch)(
+                self.user_data,
+                signal_type,
+                stream_id,
+                batch_id,
+                input_bytes,
+                &mut ffi_array as *mut FFI_ArrowArray,
+                &mut ffi_schema as *mut FFI_ArrowSchema,
+            )
+            // ffi_array / ffi_schema drop here, invoking their release callbacks.
+        }));
+        outcome.unwrap_or(OtlpIngestStatus::Internal)
+    }
+}
+
+impl OtlpIngestStatus {
+    /// Canonical `(OTAP status code, human message)` for an outcome — the single
+    /// source of truth shared by the unary (`ingest_status_to_grpc`) and the
+    /// streaming (`ingest_to_batch_status`) mappers so their messages can't drift.
+    /// `Ok` carries an empty message.
+    fn detail(self) -> (StatusCode, &'static str) {
+        match self {
+            OtlpIngestStatus::Ok => (StatusCode::Ok, ""),
+            OtlpIngestStatus::ResourceExhausted => {
+                (StatusCode::ResourceExhausted, "ingest buffer full")
+            }
+            OtlpIngestStatus::Invalid => (StatusCode::InvalidArgument, "invalid payload"),
+            OtlpIngestStatus::Internal => (StatusCode::Internal, "ingest error"),
+            OtlpIngestStatus::Unauthenticated => (StatusCode::Unauthenticated, "unauthorized"),
+        }
     }
 }
 
 fn ingest_status_to_grpc(status: OtlpIngestStatus) -> Result<(), tonic::Status> {
+    // Exhaustive over OtlpIngestStatus on purpose: a new variant must force a
+    // decision here. The message text comes from `detail()` (shared with the
+    // streaming mapper); only the gRPC constructor is chosen per variant.
+    let msg = status.detail().1;
     match status {
         OtlpIngestStatus::Ok => Ok(()),
-        OtlpIngestStatus::ResourceExhausted => {
-            Err(tonic::Status::resource_exhausted("ingest buffer full"))
-        }
-        OtlpIngestStatus::Invalid => Err(tonic::Status::invalid_argument("invalid payload")),
-        OtlpIngestStatus::Internal => Err(tonic::Status::internal("ingest error")),
-        OtlpIngestStatus::Unauthenticated => Err(tonic::Status::unauthenticated("unauthorized")),
+        OtlpIngestStatus::ResourceExhausted => Err(tonic::Status::resource_exhausted(msg)),
+        OtlpIngestStatus::Invalid => Err(tonic::Status::invalid_argument(msg)),
+        OtlpIngestStatus::Internal => Err(tonic::Status::internal(msg)),
+        OtlpIngestStatus::Unauthenticated => Err(tonic::Status::unauthenticated(msg)),
     }
 }
 
@@ -324,15 +351,7 @@ fn deliver_metric_batches(
 
 /// Map a host ingest outcome to the OTAP `BatchStatus` echoed back on the stream.
 fn ingest_to_batch_status(batch_id: i64, status: OtlpIngestStatus) -> BatchStatus {
-    let (code, message) = match status {
-        OtlpIngestStatus::Ok => (StatusCode::Ok, ""),
-        OtlpIngestStatus::ResourceExhausted => {
-            (StatusCode::ResourceExhausted, "ingest buffer full")
-        }
-        OtlpIngestStatus::Invalid => (StatusCode::InvalidArgument, "invalid payload"),
-        OtlpIngestStatus::Internal => (StatusCode::Internal, "ingest error"),
-        OtlpIngestStatus::Unauthenticated => (StatusCode::Unauthenticated, "unauthorized"),
-    };
+    let (code, message) = status.detail();
     BatchStatus {
         batch_id,
         status_code: code as i32,
@@ -699,19 +718,31 @@ pub unsafe extern "C" fn otlp_grpc_server_stop(
         return;
     }
     let server = &mut *server;
-    let deadline = std::time::Duration::from_millis(drain_deadline_ms.max(1));
+    // Fence any panic (e.g. block_on re-entrancy if the "not from a callback"
+    // contract is violated) so it cannot unwind across the extern "C" boundary,
+    // which would be UB. Mirrors the catch_unwind in `otlp_grpc_server_start`.
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let deadline = std::time::Duration::from_millis(drain_deadline_ms.max(1));
+        let start = std::time::Instant::now();
 
-    if let Some(tx) = server.shutdown_tx.take() {
-        let _ = tx.send(());
-    }
-    if let (Some(runtime), Some(join)) = (server.runtime.as_ref(), server.join.take()) {
-        runtime.block_on(async move {
-            let _ = tokio::time::timeout(deadline, join).await;
-        });
-    }
-    if let Some(runtime) = server.runtime.take() {
-        runtime.shutdown_timeout(deadline);
-    }
+        if let Some(tx) = server.shutdown_tx.take() {
+            let _ = tx.send(());
+        }
+        // Wait up to `deadline` for the server task to drain in-flight requests.
+        if let (Some(runtime), Some(join)) = (server.runtime.as_ref(), server.join.take()) {
+            runtime.block_on(async move {
+                let _ = tokio::time::timeout(deadline, join).await;
+            });
+        }
+        // Spend only the *remaining* budget joining the runtime threads, so total
+        // shutdown stays bounded by `deadline` rather than up to 2x.
+        if let Some(runtime) = server.runtime.take() {
+            let remaining = deadline
+                .saturating_sub(start.elapsed())
+                .max(std::time::Duration::from_millis(1));
+            runtime.shutdown_timeout(remaining);
+        }
+    }));
 }
 
 /// Free a server handle. Call `otlp_grpc_server_stop` first.
