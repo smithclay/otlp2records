@@ -336,6 +336,16 @@ typedef enum OtlpIngestStatus {
 typedef struct OtlpGrpcServer OtlpGrpcServer;
 
 /**
+ * @brief service_flags bits for otlp_grpc_server_start: which gRPC service
+ *        families the listener registers. OR them together; 0 registers both.
+ *
+ * Lets the host keep otlp: (OTLP/gRPC unary Export) and otap: (OTAP/Arrow
+ * streaming) as separate listeners with disjoint service sets.
+ */
+#define OTLP_GRPC_SERVICE_OTLP_UNARY 1u /**< {Logs,Trace,Metrics}Service unary Export */
+#define OTLP_GRPC_SERVICE_OTAP_ARROW 2u /**< Arrow{Logs,Traces,Metrics}Service streaming */
+
+/**
  * @brief Per-batch callback: one decoded Arrow batch destined for a signal.
  *
  * Invoked on a server worker thread. stream_id/batch_id are 0 for unary
@@ -386,6 +396,9 @@ typedef int (*OtlpAuthCallback)(
  * @param on_batch Per-batch callback (must be non-NULL)
  * @param on_auth Auth callback, or NULL to disable auth
  * @param user_data Opaque pointer passed verbatim to the callbacks
+ * @param service_flags OR of OTLP_GRPC_SERVICE_* bits selecting which gRPC
+ *        service families to register; 0 registers both. Use this to keep otlp:
+ *        (OTLP/gRPC unary) and otap: (OTAP/Arrow streaming) listeners disjoint.
  * @param max_decoding_message_bytes Cap on a single received gRPC message (one
  *        OTLP Export request or one OTAP BatchArrowRecords), applied to every
  *        service. Pass 0 for tonic's 4 MiB default; raise it when producers send
@@ -405,6 +418,7 @@ OtlpGrpcServer* otlp_grpc_server_start(
     OtlpBatchCallback on_batch,
     OtlpAuthCallback on_auth,
     void* user_data,
+    uint32_t service_flags,
     uint64_t max_decoding_message_bytes,
     char* err_buf,
     size_t err_buf_len

@@ -621,10 +621,22 @@ fn worker_threads() -> usize {
         .unwrap_or(2)
 }
 
+/// `service_flags` bit: register the OTLP/gRPC unary `Export` services
+/// (`{Logs,Trace,Metrics}Service`).
+pub const OTLP_GRPC_SERVICE_OTLP_UNARY: u32 = 1 << 0;
+/// `service_flags` bit: register the OTAP/Arrow bidirectional-streaming services
+/// (`Arrow{Logs,Traces,Metrics}Service`).
+pub const OTLP_GRPC_SERVICE_OTAP_ARROW: u32 = 1 << 1;
+
 /// Start a gRPC ingest server bound to `bind_addr` ("host:port").
 ///
 /// On success returns a non-null handle the caller owns. On failure returns
 /// null and writes a message into `err_buf` (truncated, null-terminated).
+///
+/// `service_flags` selects which gRPC service families to register, OR-ing
+/// [`OTLP_GRPC_SERVICE_OTLP_UNARY`] and/or [`OTLP_GRPC_SERVICE_OTAP_ARROW`]; 0
+/// registers both. This is how the host keeps `otlp:` (OTLP/gRPC unary) and
+/// `otap:` (OTAP/Arrow streaming) as separate listeners with disjoint services.
 ///
 /// `max_decoding_message_bytes` caps a single received gRPC message (one OTLP
 /// Export request or one OTAP `BatchArrowRecords`) on every service; pass 0 for
@@ -645,6 +657,7 @@ pub unsafe extern "C" fn otlp_grpc_server_start(
     on_batch: Option<OtlpBatchCallback>,
     on_auth: Option<OtlpAuthCallback>,
     user_data: *mut c_void,
+    service_flags: u32,
     max_decoding_message_bytes: u64,
     err_buf: *mut c_char,
     err_buf_len: usize,
@@ -699,8 +712,13 @@ pub unsafe extern "C" fn otlp_grpc_server_start(
             max_decoding_message_bytes as usize
         };
 
-        // All six signals on one listener: OTLP/gRPC unary Export (logs/traces/
-        // metrics) and OTAP/Arrow bidirectional streaming (logs/traces/metrics).
+        // Which service families to register. 0 = both, so each named bit (or the
+        // 0 default) opts a family in.
+        let serve_otlp = service_flags == 0 || (service_flags & OTLP_GRPC_SERVICE_OTLP_UNARY) != 0;
+        let serve_otap = service_flags == 0 || (service_flags & OTLP_GRPC_SERVICE_OTAP_ARROW) != 0;
+
+        // The listener serves the OTLP/gRPC unary Export services and/or the
+        // OTAP/Arrow bidirectional-streaming services, per `service_flags`.
         let logs = LogsServiceServer::new(LogsServiceImpl { ctx: ctx.clone() })
             .max_decoding_message_size(max_decoding);
         let traces = TraceServiceServer::new(TraceServiceImpl { ctx: ctx.clone() })
@@ -735,13 +753,16 @@ pub unsafe extern "C" fn otlp_grpc_server_start(
                 .map_err(|e| format!("failed to register listener: {e}"))?;
             let incoming = tokio_stream::wrappers::TcpListenerStream::new(tokio_listener);
             runtime.spawn(async move {
+                // add_optional_service registers a family only when its flag is set;
+                // a None arm is a no-op, so an `otlp:`-only or `otap:`-only listener
+                // simply doesn't route the other family's methods.
                 tonic::transport::Server::builder()
-                    .add_service(logs)
-                    .add_service(traces)
-                    .add_service(metrics)
-                    .add_service(arrow_logs)
-                    .add_service(arrow_traces)
-                    .add_service(arrow_metrics)
+                    .add_optional_service(serve_otlp.then_some(logs))
+                    .add_optional_service(serve_otlp.then_some(traces))
+                    .add_optional_service(serve_otlp.then_some(metrics))
+                    .add_optional_service(serve_otap.then_some(arrow_logs))
+                    .add_optional_service(serve_otap.then_some(arrow_traces))
+                    .add_optional_service(serve_otap.then_some(arrow_metrics))
                     .serve_with_incoming_shutdown(incoming, async move {
                         let _ = shutdown_rx.await;
                     })
