@@ -386,6 +386,10 @@ typedef int (*OtlpAuthCallback)(
  * @param on_batch Per-batch callback (must be non-NULL)
  * @param on_auth Auth callback, or NULL to disable auth
  * @param user_data Opaque pointer passed verbatim to the callbacks
+ * @param max_decoding_message_bytes Cap on a single received gRPC message (one
+ *        OTLP Export request or one OTAP BatchArrowRecords), applied to every
+ *        service. Pass 0 for tonic's 4 MiB default; raise it when producers send
+ *        batches larger than 4 MiB.
  * @param err_buf Optional buffer for an error message on failure (may be NULL)
  * @param err_buf_len Size of err_buf in bytes
  * @return A non-NULL server handle on success; NULL on failure (with err_buf
@@ -401,6 +405,7 @@ OtlpGrpcServer* otlp_grpc_server_start(
     OtlpBatchCallback on_batch,
     OtlpAuthCallback on_auth,
     void* user_data,
+    uint64_t max_decoding_message_bytes,
     char* err_buf,
     size_t err_buf_len
 );

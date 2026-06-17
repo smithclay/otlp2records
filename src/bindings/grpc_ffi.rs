@@ -626,6 +626,10 @@ fn worker_threads() -> usize {
 /// On success returns a non-null handle the caller owns. On failure returns
 /// null and writes a message into `err_buf` (truncated, null-terminated).
 ///
+/// `max_decoding_message_bytes` caps a single received gRPC message (one OTLP
+/// Export request or one OTAP `BatchArrowRecords`) on every service; pass 0 for
+/// tonic's 4 MiB default. Raise it when producers send batches larger than 4 MiB.
+///
 /// # Safety
 ///
 /// - `bind_addr` must be valid for `bind_addr_len` bytes (UTF-8 "host:port").
@@ -641,6 +645,7 @@ pub unsafe extern "C" fn otlp_grpc_server_start(
     on_batch: Option<OtlpBatchCallback>,
     on_auth: Option<OtlpAuthCallback>,
     user_data: *mut c_void,
+    max_decoding_message_bytes: u64,
     err_buf: *mut c_char,
     err_buf_len: usize,
 ) -> *mut OtlpGrpcServer {
@@ -684,29 +689,45 @@ pub unsafe extern "C" fn otlp_grpc_server_start(
         let cancel = CancellationToken::new();
         let tracker = TaskTracker::new();
 
+        // Per-message decode cap applied uniformly to all six services. 0 means
+        // "tonic's default"; resolve it to that concrete value (4 MiB) so the cap
+        // is explicit rather than relying on tonic's implicit default.
+        const TONIC_DEFAULT_MAX_DECODING: usize = 4 * 1024 * 1024;
+        let max_decoding = if max_decoding_message_bytes == 0 {
+            TONIC_DEFAULT_MAX_DECODING
+        } else {
+            max_decoding_message_bytes as usize
+        };
+
         // All six signals on one listener: OTLP/gRPC unary Export (logs/traces/
         // metrics) and OTAP/Arrow bidirectional streaming (logs/traces/metrics).
-        let logs = LogsServiceServer::new(LogsServiceImpl { ctx: ctx.clone() });
-        let traces = TraceServiceServer::new(TraceServiceImpl { ctx: ctx.clone() });
-        let metrics = MetricsServiceServer::new(MetricsServiceImpl { ctx: ctx.clone() });
+        let logs = LogsServiceServer::new(LogsServiceImpl { ctx: ctx.clone() })
+            .max_decoding_message_size(max_decoding);
+        let traces = TraceServiceServer::new(TraceServiceImpl { ctx: ctx.clone() })
+            .max_decoding_message_size(max_decoding);
+        let metrics = MetricsServiceServer::new(MetricsServiceImpl { ctx: ctx.clone() })
+            .max_decoding_message_size(max_decoding);
         let arrow_logs = ArrowLogsServiceServer::new(ArrowLogsServiceImpl {
             ctx: ctx.clone(),
             stream_counter: AtomicU64::new(0),
             cancel: cancel.clone(),
             tracker: tracker.clone(),
-        });
+        })
+        .max_decoding_message_size(max_decoding);
         let arrow_traces = ArrowTracesServiceServer::new(ArrowTracesServiceImpl {
             ctx: ctx.clone(),
             stream_counter: AtomicU64::new(0),
             cancel: cancel.clone(),
             tracker: tracker.clone(),
-        });
+        })
+        .max_decoding_message_size(max_decoding);
         let arrow_metrics = ArrowMetricsServiceServer::new(ArrowMetricsServiceImpl {
             ctx: ctx.clone(),
             stream_counter: AtomicU64::new(0),
             cancel: cancel.clone(),
             tracker: tracker.clone(),
-        });
+        })
+        .max_decoding_message_size(max_decoding);
 
         let join = {
             let _guard = runtime.enter();
