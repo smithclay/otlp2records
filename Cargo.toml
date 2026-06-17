@@ -34,6 +34,11 @@ tokio = { version = "1", optional = true, default-features = false, features = [
 tokio-stream = { version = "0.1", optional = true, default-features = false, features = [
     "net",
 ] }
+# `rt` brings TaskTracker; CancellationToken is always available. Used to give
+# the gRPC server deterministic teardown of in-flight OTAP stream tasks.
+tokio-util = { version = "0.7", optional = true, default-features = false, features = [
+    "rt",
+] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 bytes = "1"
@@ -86,16 +91,18 @@ ffi = []
 # Upstream Producer defaults to Zstandard. Arrow's Zstandard backend compiles
 # bundled C and therefore needs a wasm-capable C toolchain for wasm32 builds.
 otap-zstd = ["arrow-ipc/zstd"]
-# Native gRPC ingest server. Embeds a tonic server (OTLP/gRPC unary Export now;
-# OTAP/Arrow streaming later) and exposes it over the C ABI. Pulls in a tokio
-# runtime, tonic's transport/server, and opentelemetry-proto's collector
-# *service* stubs (gen-tonic, on top of the message types already enabled). Never
-# enabled for wasm32 (no tokio runtime or sockets there); selected by the
-# extension's CMake only for native targets.
+# Native gRPC ingest server. Embeds a tonic server serving all six signals over
+# OTLP/gRPC unary Export and OTAP/Arrow bidi streaming, and exposes it over the C
+# ABI. Pulls in a tokio runtime, tonic's transport/server, tokio-util (deterministic
+# stream-task teardown), and opentelemetry-proto's collector *service* stubs
+# (gen-tonic, on top of the message types already enabled). Never enabled for
+# wasm32 (no tokio runtime or sockets there); selected by the extension's CMake
+# only for native targets.
 grpc = [
     "ffi",
     "dep:tokio",
     "dep:tokio-stream",
+    "dep:tokio-util",
     "tonic/server",
     "tonic/router",
     "tonic/transport",

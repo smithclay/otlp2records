@@ -36,6 +36,8 @@ use std::sync::Arc;
 use arrow_array::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
 use arrow_array::{Array, RecordBatch, StructArray};
 use prost::Message as _;
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 use tonic::metadata::MetadataMap;
 
 use crate::ffi::OtlpSignalType;
@@ -381,16 +383,26 @@ fn decode_error_status(batch_id: i64, error: &crate::Error) -> BatchStatus {
 /// backpressure nack keeps it open.
 fn spawn_single_shape_stream(
     ctx: Arc<CallbackCtx>,
+    cancel: CancellationToken,
+    tracker: &TaskTracker,
     stream_id: u64,
     signal: OtlpSignalType,
     decode: DecodeOne,
     mut input: tonic::Streaming<BatchArrowRecords>,
 ) -> BatchStatusStream {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<BatchStatus, tonic::Status>>(64);
-    tokio::spawn(async move {
+    // Spawn into the server's TaskTracker so shutdown can await this task; the
+    // CancellationToken (checked first via `biased`) lets `otlp_grpc_server_stop`
+    // break the loop at the next await instead of leaving it detached.
+    tracker.spawn(async move {
         let mut decoder = OtapDecoder::new();
         loop {
-            match input.message().await {
+            let message = tokio::select! {
+                biased;
+                () = cancel.cancelled() => break,
+                message = input.message() => message,
+            };
+            match message {
                 Ok(Some(envelope)) => {
                     let batch_id = envelope.batch_id;
                     let input_bytes = envelope.encoded_len();
@@ -427,14 +439,21 @@ fn spawn_single_shape_stream(
 /// envelope decodes into up to four metric shapes, each buffered separately.
 fn spawn_metrics_stream(
     ctx: Arc<CallbackCtx>,
+    cancel: CancellationToken,
+    tracker: &TaskTracker,
     stream_id: u64,
     mut input: tonic::Streaming<BatchArrowRecords>,
 ) -> BatchStatusStream {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<BatchStatus, tonic::Status>>(64);
-    tokio::spawn(async move {
+    tracker.spawn(async move {
         let mut decoder = OtapDecoder::new();
         loop {
-            match input.message().await {
+            let message = tokio::select! {
+                biased;
+                () = cancel.cancelled() => break,
+                message = input.message() => message,
+            };
+            match message {
                 Ok(Some(envelope)) => {
                     let batch_id = envelope.batch_id;
                     let input_bytes = envelope.encoded_len() as u64;
@@ -479,6 +498,8 @@ fn spawn_metrics_stream(
 struct ArrowLogsServiceImpl {
     ctx: Arc<CallbackCtx>,
     stream_counter: AtomicU64,
+    cancel: CancellationToken,
+    tracker: TaskTracker,
 }
 
 #[tonic::async_trait]
@@ -494,6 +515,8 @@ impl ArrowLogsService for ArrowLogsServiceImpl {
         let stream_id = self.stream_counter.fetch_add(1, Ordering::Relaxed) + 1;
         Ok(tonic::Response::new(spawn_single_shape_stream(
             self.ctx.clone(),
+            self.cancel.clone(),
+            &self.tracker,
             stream_id,
             OtlpSignalType::Logs,
             OtapDecoder::decode_logs_message,
@@ -505,6 +528,8 @@ impl ArrowLogsService for ArrowLogsServiceImpl {
 struct ArrowTracesServiceImpl {
     ctx: Arc<CallbackCtx>,
     stream_counter: AtomicU64,
+    cancel: CancellationToken,
+    tracker: TaskTracker,
 }
 
 #[tonic::async_trait]
@@ -520,6 +545,8 @@ impl ArrowTracesService for ArrowTracesServiceImpl {
         let stream_id = self.stream_counter.fetch_add(1, Ordering::Relaxed) + 1;
         Ok(tonic::Response::new(spawn_single_shape_stream(
             self.ctx.clone(),
+            self.cancel.clone(),
+            &self.tracker,
             stream_id,
             OtlpSignalType::Traces,
             OtapDecoder::decode_traces_message,
@@ -531,6 +558,8 @@ impl ArrowTracesService for ArrowTracesServiceImpl {
 struct ArrowMetricsServiceImpl {
     ctx: Arc<CallbackCtx>,
     stream_counter: AtomicU64,
+    cancel: CancellationToken,
+    tracker: TaskTracker,
 }
 
 #[tonic::async_trait]
@@ -546,6 +575,8 @@ impl ArrowMetricsService for ArrowMetricsServiceImpl {
         let stream_id = self.stream_counter.fetch_add(1, Ordering::Relaxed) + 1;
         Ok(tonic::Response::new(spawn_metrics_stream(
             self.ctx.clone(),
+            self.cancel.clone(),
+            &self.tracker,
             stream_id,
             request.into_inner(),
         )))
@@ -563,6 +594,11 @@ pub struct OtlpGrpcServer {
     runtime: Option<tokio::runtime::Runtime>,
     shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
     join: Option<tokio::task::JoinHandle<Result<(), tonic::transport::Error>>>,
+    /// Cancels in-flight OTAP stream loops at their next await on shutdown.
+    cancel: CancellationToken,
+    /// Tracks the spawned OTAP stream tasks so shutdown can await them, so no host
+    /// callback runs after `otlp_grpc_server_stop` returns.
+    tracker: TaskTracker,
 }
 
 fn write_err(err_buf: *mut c_char, err_buf_len: usize, msg: &str) {
@@ -643,6 +679,10 @@ pub unsafe extern "C" fn otlp_grpc_server_start(
             .map_err(|e| format!("failed to configure listener: {e}"))?;
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        // Shared across the three OTAP streaming services: the token signals their
+        // spawned loops to stop, the tracker lets shutdown await them.
+        let cancel = CancellationToken::new();
+        let tracker = TaskTracker::new();
 
         // All six signals on one listener: OTLP/gRPC unary Export (logs/traces/
         // metrics) and OTAP/Arrow bidirectional streaming (logs/traces/metrics).
@@ -652,14 +692,20 @@ pub unsafe extern "C" fn otlp_grpc_server_start(
         let arrow_logs = ArrowLogsServiceServer::new(ArrowLogsServiceImpl {
             ctx: ctx.clone(),
             stream_counter: AtomicU64::new(0),
+            cancel: cancel.clone(),
+            tracker: tracker.clone(),
         });
         let arrow_traces = ArrowTracesServiceServer::new(ArrowTracesServiceImpl {
             ctx: ctx.clone(),
             stream_counter: AtomicU64::new(0),
+            cancel: cancel.clone(),
+            tracker: tracker.clone(),
         });
         let arrow_metrics = ArrowMetricsServiceServer::new(ArrowMetricsServiceImpl {
             ctx: ctx.clone(),
             stream_counter: AtomicU64::new(0),
+            cancel: cancel.clone(),
+            tracker: tracker.clone(),
         });
 
         let join = {
@@ -686,6 +732,8 @@ pub unsafe extern "C" fn otlp_grpc_server_start(
             runtime: Some(runtime),
             shutdown_tx: Some(shutdown_tx),
             join: Some(join),
+            cancel,
+            tracker,
         })
     }));
 
@@ -725,17 +773,33 @@ pub unsafe extern "C" fn otlp_grpc_server_stop(
         let deadline = std::time::Duration::from_millis(drain_deadline_ms.max(1));
         let start = std::time::Instant::now();
 
+        // Stop accepting new connections/streams, tell in-flight OTAP stream loops
+        // to stop at their next await, and close the tracker so its `wait()` can
+        // resolve once the already-spawned tasks finish.
         if let Some(tx) = server.shutdown_tx.take() {
             let _ = tx.send(());
         }
-        // Wait up to `deadline` for the server task to drain in-flight requests.
-        if let (Some(runtime), Some(join)) = (server.runtime.as_ref(), server.join.take()) {
+        server.cancel.cancel();
+        server.tracker.close();
+
+        // Within `deadline`, drain the server task AND every spawned stream task,
+        // so no host callback (and thus no use of `user_data`) runs after this
+        // returns.
+        if let Some(runtime) = server.runtime.as_ref() {
+            let join = server.join.take();
+            let tracker = server.tracker.clone();
             runtime.block_on(async move {
-                let _ = tokio::time::timeout(deadline, join).await;
+                let _ = tokio::time::timeout(deadline, async move {
+                    if let Some(join) = join {
+                        let _ = join.await;
+                    }
+                    tracker.wait().await;
+                })
+                .await;
             });
         }
-        // Spend only the *remaining* budget joining the runtime threads, so total
-        // shutdown stays bounded by `deadline` rather than up to 2x.
+        // Spend only the *remaining* budget hard-stopping the runtime threads, so
+        // total shutdown stays bounded by `deadline` rather than up to 2x.
         if let Some(runtime) = server.runtime.take() {
             let remaining = deadline
                 .saturating_sub(start.elapsed())
