@@ -38,6 +38,7 @@ use arrow_array::{Array, RecordBatch, StructArray};
 use prost::Message as _;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
+use tonic::codec::CompressionEncoding;
 use tonic::metadata::MetadataMap;
 
 use crate::ffi::OtlpSignalType;
@@ -719,33 +720,44 @@ pub unsafe extern "C" fn otlp_grpc_server_start(
 
         // The listener serves the OTLP/gRPC unary Export services and/or the
         // OTAP/Arrow bidirectional-streaming services, per `service_flags`.
+        // accept_compressed(Zstd): decompress zstd-compressed gRPC requests. The
+        // otel-arrow OTAP exporter sends `grpc-encoding: zstd` by default; without
+        // this every stream is rejected. Responses are left uncompressed (the
+        // BatchStatus/ExportResponse acks are tiny). Applied to all six services so
+        // OTLP/gRPC unary and OTAP/Arrow streaming both accept the wire default.
         let logs = LogsServiceServer::new(LogsServiceImpl { ctx: ctx.clone() })
-            .max_decoding_message_size(max_decoding);
+            .max_decoding_message_size(max_decoding)
+            .accept_compressed(CompressionEncoding::Zstd);
         let traces = TraceServiceServer::new(TraceServiceImpl { ctx: ctx.clone() })
-            .max_decoding_message_size(max_decoding);
+            .max_decoding_message_size(max_decoding)
+            .accept_compressed(CompressionEncoding::Zstd);
         let metrics = MetricsServiceServer::new(MetricsServiceImpl { ctx: ctx.clone() })
-            .max_decoding_message_size(max_decoding);
+            .max_decoding_message_size(max_decoding)
+            .accept_compressed(CompressionEncoding::Zstd);
         let arrow_logs = ArrowLogsServiceServer::new(ArrowLogsServiceImpl {
             ctx: ctx.clone(),
             stream_counter: AtomicU64::new(0),
             cancel: cancel.clone(),
             tracker: tracker.clone(),
         })
-        .max_decoding_message_size(max_decoding);
+        .max_decoding_message_size(max_decoding)
+        .accept_compressed(CompressionEncoding::Zstd);
         let arrow_traces = ArrowTracesServiceServer::new(ArrowTracesServiceImpl {
             ctx: ctx.clone(),
             stream_counter: AtomicU64::new(0),
             cancel: cancel.clone(),
             tracker: tracker.clone(),
         })
-        .max_decoding_message_size(max_decoding);
+        .max_decoding_message_size(max_decoding)
+        .accept_compressed(CompressionEncoding::Zstd);
         let arrow_metrics = ArrowMetricsServiceServer::new(ArrowMetricsServiceImpl {
             ctx: ctx.clone(),
             stream_counter: AtomicU64::new(0),
             cancel: cancel.clone(),
             tracker: tracker.clone(),
         })
-        .max_decoding_message_size(max_decoding);
+        .max_decoding_message_size(max_decoding)
+        .accept_compressed(CompressionEncoding::Zstd);
 
         let join = {
             let _guard = runtime.enter();
