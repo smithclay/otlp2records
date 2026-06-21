@@ -106,6 +106,10 @@ grpc = [
     "tonic/server",
     "tonic/router",
     "tonic/transport",
+    # Accept Zstandard-compressed gRPC requests. The otel-arrow OTAP exporter
+    # defaults compression_method to zstd (grpc-encoding: zstd); without this,
+    # tonic rejects those streams. Matches otap-zstd (the Arrow payload codec).
+    "tonic/zstd",
     "opentelemetry-proto/gen-tonic",
 ]
 
