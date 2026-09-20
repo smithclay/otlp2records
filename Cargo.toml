@@ -42,7 +42,7 @@ tokio-util = { version = "0.7", optional = true, default-features = false, featu
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 bytes = "1"
-ordered-float = "4"
+ordered-float = "5"
 base64 = "0.23"
 ciborium = "0.2"
 
