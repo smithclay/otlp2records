@@ -13,13 +13,13 @@ env:
 
 jobs:
   msrv:
-    name: Rust 1.86 and WASM
+    name: MSRV (Rust 1.88) and WASM
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust 1.86
-        uses: dtolnay/rust-toolchain@1.86
+      - name: Install Rust 1.88 (MSRV)
+        uses: dtolnay/rust-toolchain@1.88
         with:
           targets: wasm32-unknown-unknown
 
@@ -40,7 +40,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Pinned to 1.88 for duckdb extension CI-CD compatibility
+      # Pinned to the crate MSRV (1.88, from tonic 0.14.6)
       - name: Install Rust
         uses: dtolnay/rust-toolchain@1.88
 
@@ -67,7 +67,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Pinned to 1.88 for duckdb extension CI-CD compatibility
+      # Pinned to the crate MSRV (1.88, from tonic 0.14.6)
       - name: Install Rust
         uses: dtolnay/rust-toolchain@1.88
 
@@ -94,7 +94,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Pinned to 1.88 for duckdb extension CI-CD compatibility
+      # Pinned to the crate MSRV (1.88, from tonic 0.14.6)
       - name: Install Rust
         uses: dtolnay/rust-toolchain@1.88
 
