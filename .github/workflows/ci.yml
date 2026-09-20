@@ -16,7 +16,7 @@ jobs:
     name: Rust 1.86 and WASM
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust 1.86
         uses: dtolnay/rust-toolchain@1.86
@@ -38,7 +38,7 @@ jobs:
     name: Test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Pinned to 1.88 for duckdb extension CI-CD compatibility
       - name: Install Rust
@@ -65,7 +65,7 @@ jobs:
     name: Clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Pinned to 1.88 for duckdb extension CI-CD compatibility
       - name: Install Rust
@@ -92,7 +92,7 @@ jobs:
     name: Format
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Pinned to 1.88 for duckdb extension CI-CD compatibility
       - name: Install Rust
