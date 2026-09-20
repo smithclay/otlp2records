@@ -5,6 +5,6 @@ edition = "2021"
 publish = false
 
 [dependencies]
-arrow-ipc = "58"
+arrow-ipc = "60"
 otap-df-pdata = { path = "../../../otel-arrow/rust/otap-dataflow/crates/pdata" }
 prost = "0.14"
