@@ -14,7 +14,7 @@ exclude = ["tools/otap-fixture-gen"]
 
 [dependencies]
 # Decoding
-opentelemetry-proto = { version = "0.31", default-features = false, features = ["gen-tonic-messages", "logs", "trace", "metrics"] }
+opentelemetry-proto = { version = "0.33", default-features = false, features = ["gen-tonic-messages", "logs", "trace", "metrics"] }
 prost = "0.14"
 # opentelemetry-proto 0.31 allows tonic 0.14.x, but tonic 0.14.6 raised
 # its MSRV to Rust 1.88. Keep the crate buildable on Rust 1.86 until the
