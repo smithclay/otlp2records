@@ -19,8 +19,8 @@ prost = "0.14"
 # opentelemetry-proto 0.31 allows tonic 0.14.x, but tonic 0.14.6 raised
 # its MSRV to Rust 1.88. Keep the crate buildable on Rust 1.86 until the
 # extension distribution toolchain moves forward.
-tonic = { version = "=0.14.5", default-features = false, features = ["codegen"] }
-tonic-prost = "=0.14.5"
+tonic = { version = "=0.14.6", default-features = false, features = ["codegen"] }
+tonic-prost = "=0.14.6"
 # gRPC ingest server (native-only, behind the `grpc` feature). tokio and tonic's
 # transport/server are pulled in only when that feature is enabled, so the base
 # build stays synchronous and wasm32-safe.
