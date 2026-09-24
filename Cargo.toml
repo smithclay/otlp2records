@@ -71,7 +71,7 @@ getrandom = { version = "0.2", features = ["js"] }
 # opentelemetry_sdk pulls rand 0.9/getrandom 0.3 through the OTLP signal
 # features. Enable its browser backend; .cargo/config.toml selects it only for
 # wasm32-unknown-unknown.
-getrandom_03 = { package = "getrandom", version = "0.3", features = ["wasm_js"] }
+getrandom_03 = { package = "getrandom", version = "0.4", features = ["wasm_js"] }
 wasm-bindgen = { version = "0.2", optional = true }
 
 [lib]
