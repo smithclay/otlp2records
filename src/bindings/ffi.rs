@@ -648,6 +648,7 @@ mod tests {
                 resource: Some(Resource {
                     attributes: vec![KeyValue {
                         key: "service.name".to_string(),
+                        key_strindex: 0,
                         value: Some(AnyValue {
                             value: Some(any_value::Value::StringValue("test-service".to_string())),
                         }),
@@ -736,6 +737,7 @@ mod tests {
                 resource: Some(Resource {
                     attributes: vec![KeyValue {
                         key: "service.name".to_string(),
+                        key_strindex: 0,
                         value: Some(AnyValue {
                             value: Some(any_value::Value::StringValue("test-service".to_string())),
                         }),
@@ -820,6 +822,7 @@ mod tests {
                 resource: Some(Resource {
                     attributes: vec![KeyValue {
                         key: "service.name".to_string(),
+                        key_strindex: 0,
                         value: Some(AnyValue {
                             value: Some(any_value::Value::StringValue("test-service".to_string())),
                         }),

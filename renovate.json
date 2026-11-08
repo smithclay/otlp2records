@@ -2,5 +2,12 @@
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": [
     "config:recommended"
+  ],
+  "packageRules": [
+    {
+      "description": "getrandom entries only enable wasm features on the versions pulled in transitively (0.2 via ahash/arrow, 0.3 via rand/opentelemetry_sdk); they must track those, not the latest release.",
+      "matchDepNames": ["getrandom", "getrandom_03"],
+      "enabled": false
+    }
   ]
 }

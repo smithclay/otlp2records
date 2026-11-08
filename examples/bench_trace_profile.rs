@@ -253,7 +253,7 @@ fn build_span(idx: usize, attribute_bytes: usize) -> Span {
     Span {
         trace_id: id_bytes(idx as u64 * 17 + 3, 16),
         span_id: id_bytes(idx as u64, 8),
-        parent_span_id: if idx % 8 == 0 {
+        parent_span_id: if idx.is_multiple_of(8) {
             Vec::new()
         } else {
             id_bytes(idx as u64 - 1, 8)
@@ -288,6 +288,7 @@ fn attr_value(seed: usize, len: usize) -> String {
 fn string_kv(key: &str, value: &str) -> KeyValue {
     KeyValue {
         key: key.to_string(),
+        key_strindex: 0,
         value: Some(AnyValue {
             value: Some(any_value::Value::StringValue(value.to_string())),
         }),

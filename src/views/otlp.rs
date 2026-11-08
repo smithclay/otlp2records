@@ -1099,7 +1099,9 @@ impl<'a> AnyValueView<'a> for Obj<'a, AnyValue> {
 
     fn value_type(&self) -> ValueType {
         match self.inner.value.as_ref() {
-            None => ValueType::Empty,
+            // `string_value_strindex` is Profiling-only; the spec says other
+            // signals must treat it as absent.
+            None | Some(any_value::Value::StringValueStrindex(_)) => ValueType::Empty,
             Some(any_value::Value::StringValue(_)) => ValueType::String,
             Some(any_value::Value::BoolValue(_)) => ValueType::Bool,
             Some(any_value::Value::IntValue(_)) => ValueType::Int64,

@@ -13,26 +13,33 @@ env:
 
 jobs:
   msrv:
-    name: Rust 1.86 and WASM
+    name: MSRV (Rust 1.90) and WASM
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
 
-      - name: Install Rust 1.86
-        uses: dtolnay/rust-toolchain@1.86
+      - name: Install Rust 1.90
+        uses: dtolnay/rust-toolchain@1.90
         with:
           targets: wasm32-unknown-unknown
 
+      # The MSRV job only proves the crate compiles on rust-version; lints are
+      # enforced by the jobs below on a newer toolchain. Rust 1.90/1.91 emit
+      # dead_code false positives on fields used only through trait impls.
       # --all-features is intentionally native-only: `otap-zstd` pulls in Arrow's
       # bundled C Zstandard backend, which cannot target wasm32.
       - name: Check MSRV
         run: cargo check --all-features
+        env:
+          RUSTFLAGS: ''
 
       # WASM deliberately uses --features wasm (not --all-features) so the C
       # Zstandard backend stays out of the wasm32 build. WASM OTAP is
       # uncompressed/LZ4 only.
       - name: Check WASM, including native OTAP
         run: cargo check --target wasm32-unknown-unknown --features wasm
+        env:
+          RUSTFLAGS: ''
 
   test:
     name: Test
@@ -40,9 +47,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # Pinned to 1.88 for duckdb extension CI-CD compatibility
+      # Matches the toolchain duckdb-otlp's extension-ci-tools (v2.0) builds with.
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@1.88
+        uses: dtolnay/rust-toolchain@1.97.1
 
       - name: Cache cargo registry
         uses: actions/cache@v6
@@ -67,9 +74,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # Pinned to 1.88 for duckdb extension CI-CD compatibility
+      # Matches the toolchain duckdb-otlp's extension-ci-tools (v2.0) builds with.
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@1.88
+        uses: dtolnay/rust-toolchain@1.97.1
 
       - name: Install clippy
         run: rustup component add clippy
@@ -94,9 +101,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # Pinned to 1.88 for duckdb extension CI-CD compatibility
+      # Matches the toolchain duckdb-otlp's extension-ci-tools (v2.0) builds with.
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@1.88
+        uses: dtolnay/rust-toolchain@1.97.1
 
       - name: Install rustfmt
         run: rustup component add rustfmt

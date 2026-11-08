@@ -255,6 +255,7 @@ fn attributes_to_otlp(attributes: Vec<Attribute>) -> Vec<KeyValue> {
         .into_iter()
         .map(|attribute| KeyValue {
             key: attribute.key,
+            key_strindex: 0,
             value: Some(any_value_to_otlp(attribute.value)),
         })
         .collect()
