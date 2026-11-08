@@ -72,18 +72,21 @@ fn test_logs_default_protobuf_hand_built_payload() {
                 attributes: vec![
                     KeyValue {
                         key: "service.name".to_string(),
+                        key_strindex: 0,
                         value: Some(AnyValue {
                             value: Some(any_value::Value::StringValue("checkout".to_string())),
                         }),
                     },
                     KeyValue {
                         key: "service.namespace".to_string(),
+                        key_strindex: 0,
                         value: Some(AnyValue {
                             value: Some(any_value::Value::StringValue("shop".to_string())),
                         }),
                     },
                     KeyValue {
                         key: "deployment.environment".to_string(),
+                        key_strindex: 0,
                         value: Some(AnyValue {
                             value: Some(any_value::Value::StringValue("test".to_string())),
                         }),
@@ -97,6 +100,7 @@ fn test_logs_default_protobuf_hand_built_payload() {
                     version: "1.2.3".to_string(),
                     attributes: vec![KeyValue {
                         key: "scope.key".to_string(),
+                        key_strindex: 0,
                         value: Some(AnyValue {
                             value: Some(any_value::Value::BoolValue(true)),
                         }),
@@ -116,6 +120,7 @@ fn test_logs_default_protobuf_hand_built_payload() {
                         span_id: (0u8..8).collect(),
                         attributes: vec![KeyValue {
                             key: "http.method".to_string(),
+                            key_strindex: 0,
                             value: Some(AnyValue {
                                 value: Some(any_value::Value::StringValue("GET".to_string())),
                             }),
@@ -129,6 +134,7 @@ fn test_logs_default_protobuf_hand_built_payload() {
                                 opentelemetry_proto::tonic::common::v1::KeyValueList {
                                     values: vec![KeyValue {
                                         key: "nested".to_string(),
+                                        key_strindex: 0,
                                         value: Some(AnyValue {
                                             value: Some(any_value::Value::IntValue(42)),
                                         }),

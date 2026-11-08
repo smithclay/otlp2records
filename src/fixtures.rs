@@ -280,6 +280,7 @@ pub fn encode_metrics(profile: &FixtureProfile, base_nanos: i64) -> Vec<u8> {
 fn kv_str(key: impl Into<String>, value: impl Into<String>) -> KeyValue {
     KeyValue {
         key: key.into(),
+        key_strindex: 0,
         value: Some(any_str(value)),
     }
 }
@@ -287,6 +288,7 @@ fn kv_str(key: impl Into<String>, value: impl Into<String>) -> KeyValue {
 fn kv_i64(key: impl Into<String>, value: i64) -> KeyValue {
     KeyValue {
         key: key.into(),
+        key_strindex: 0,
         value: Some(AnyValue {
             value: Some(any_value::Value::IntValue(value)),
         }),

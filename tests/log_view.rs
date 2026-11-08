@@ -14,6 +14,7 @@ fn value(value: any_value::Value) -> AnyValue {
 fn attribute(key: &str, value: any_value::Value) -> KeyValue {
     KeyValue {
         key: key.to_string(),
+        key_strindex: 0,
         value: Some(self::value(value)),
     }
 }

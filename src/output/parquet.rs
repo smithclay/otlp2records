@@ -26,7 +26,7 @@ fn add_field_ids_to_schema(schema: &Schema) -> Schema {
         .enumerate()
         .map(|(idx, field)| {
             let field_id = (idx + 1) as i32;
-            let mut metadata: HashMap<String, String> = field.metadata().clone();
+            let mut metadata: HashMap<String, String> = field.metadata().clone().into();
             metadata.insert(PARQUET_FIELD_ID_META_KEY.to_string(), field_id.to_string());
             Arc::new(field.as_ref().clone().with_metadata(metadata))
         })

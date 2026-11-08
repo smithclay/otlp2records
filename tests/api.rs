@@ -23,6 +23,7 @@ use prost::Message;
 fn string_attr(key: &str, value: &str) -> KeyValue {
     KeyValue {
         key: key.to_string(),
+        key_strindex: 0,
         value: Some(AnyValue {
             value: Some(any_value::Value::StringValue(value.to_string())),
         }),
@@ -53,6 +54,7 @@ fn create_test_log_request() -> ExportLogsServiceRequest {
             resource: Some(Resource {
                 attributes: vec![KeyValue {
                     key: "service.name".to_string(),
+                    key_strindex: 0,
                     value: Some(AnyValue {
                         value: Some(any_value::Value::StringValue("test-service".to_string())),
                     }),
@@ -77,6 +79,7 @@ fn create_test_log_request() -> ExportLogsServiceRequest {
                     }),
                     attributes: vec![KeyValue {
                         key: "log.key".to_string(),
+                        key_strindex: 0,
                         value: Some(AnyValue {
                             value: Some(any_value::Value::StringValue("log-value".to_string())),
                         }),
@@ -98,6 +101,7 @@ fn create_test_trace_request() -> ExportTraceServiceRequest {
             resource: Some(Resource {
                 attributes: vec![KeyValue {
                     key: "service.name".to_string(),
+                    key_strindex: 0,
                     value: Some(AnyValue {
                         value: Some(any_value::Value::StringValue("test-service".to_string())),
                     }),
@@ -120,6 +124,7 @@ fn create_test_trace_request() -> ExportTraceServiceRequest {
                     end_time_unix_nano: 1_700_000_000_100_000_000,
                     attributes: vec![KeyValue {
                         key: "span.key".to_string(),
+                        key_strindex: 0,
                         value: Some(AnyValue {
                             value: Some(any_value::Value::StringValue("span-value".to_string())),
                         }),
@@ -139,6 +144,7 @@ fn create_test_metrics_request() -> ExportMetricsServiceRequest {
             resource: Some(Resource {
                 attributes: vec![KeyValue {
                     key: "service.name".to_string(),
+                    key_strindex: 0,
                     value: Some(AnyValue {
                         value: Some(any_value::Value::StringValue("test-service".to_string())),
                     }),
@@ -166,6 +172,7 @@ fn create_test_metrics_request() -> ExportMetricsServiceRequest {
                                 ),
                                 attributes: vec![KeyValue {
                                     key: "metric.key".to_string(),
+                                    key_strindex: 0,
                                     value: Some(AnyValue {
                                         value: Some(any_value::Value::StringValue(
                                             "metric-value".to_string(),
@@ -211,6 +218,7 @@ fn create_gauge_only_metrics_request() -> ExportMetricsServiceRequest {
             resource: Some(Resource {
                 attributes: vec![KeyValue {
                     key: "service.name".to_string(),
+                    key_strindex: 0,
                     value: Some(AnyValue {
                         value: Some(any_value::Value::StringValue("test-service".to_string())),
                     }),
@@ -245,6 +253,7 @@ fn create_sum_only_metrics_request() -> ExportMetricsServiceRequest {
             resource: Some(Resource {
                 attributes: vec![KeyValue {
                     key: "service.name".to_string(),
+                    key_strindex: 0,
                     value: Some(AnyValue {
                         value: Some(any_value::Value::StringValue("test-service".to_string())),
                     }),
@@ -1016,6 +1025,7 @@ fn test_timestamp_not_epoch_traces() {
             resource: Some(Resource {
                 attributes: vec![KeyValue {
                     key: "service.name".to_string(),
+                    key_strindex: 0,
                     value: Some(AnyValue {
                         value: Some(any_value::Value::StringValue("test-service".to_string())),
                     }),
@@ -1073,6 +1083,7 @@ fn test_timestamp_not_epoch_logs() {
             resource: Some(Resource {
                 attributes: vec![KeyValue {
                     key: "service.name".to_string(),
+                    key_strindex: 0,
                     value: Some(AnyValue {
                         value: Some(any_value::Value::StringValue("test-service".to_string())),
                     }),
@@ -1132,6 +1143,7 @@ fn test_timestamp_not_epoch_metrics() {
             resource: Some(Resource {
                 attributes: vec![KeyValue {
                     key: "service.name".to_string(),
+                    key_strindex: 0,
                     value: Some(AnyValue {
                         value: Some(any_value::Value::StringValue("test-service".to_string())),
                     }),

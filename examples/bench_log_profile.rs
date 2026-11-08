@@ -290,6 +290,7 @@ fn attr_value(seed: usize, len: usize) -> String {
 fn string_kv(key: &str, value: &str) -> KeyValue {
     KeyValue {
         key: key.to_string(),
+        key_strindex: 0,
         value: Some(AnyValue {
             value: Some(any_value::Value::StringValue(value.to_string())),
         }),

@@ -1015,7 +1015,7 @@ pub(super) fn replace(batch: &RecordBatch, index: usize, array: ArrayRef) -> Res
     let old = old_schema.field(index);
     if old.data_type() != array.data_type() {
         let mut metadata = old.metadata().clone();
-        let _ = metadata.insert(ENCODING.into(), PLAIN.into());
+        let _ = metadata.insert(ENCODING, PLAIN);
         fields[index] = Arc::new(
             Field::new(old.name(), array.data_type().clone(), old.is_nullable())
                 .with_metadata(metadata),

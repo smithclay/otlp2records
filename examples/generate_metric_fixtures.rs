@@ -280,14 +280,14 @@ fn point_attrs(idx: usize, seed: usize) -> Vec<KeyValue> {
             STATUS_CODES[idx % STATUS_CODES.len()],
         ),
         string_kv("cloud.region", REGIONS[(idx + seed * 2) % REGIONS.len()]),
-        bool_kv("feature.enabled", (idx + seed) % 2 == 0),
+        bool_kv("feature.enabled", (idx + seed).is_multiple_of(2)),
         int_kv("shard", ((idx + seed) % 64) as i64),
         string_kv("customer.tier", TIERS[(idx + seed) % TIERS.len()]),
     ]
 }
 
 fn exemplars(idx: usize) -> Vec<Exemplar> {
-    if idx % 16 != 0 {
+    if !idx.is_multiple_of(16) {
         return Vec::new();
     }
 
@@ -335,6 +335,7 @@ fn id_bytes(seed: u64, len: usize) -> Vec<u8> {
 fn string_kv(key: &str, value: &str) -> KeyValue {
     KeyValue {
         key: key.to_string(),
+        key_strindex: 0,
         value: Some(AnyValue {
             value: Some(any_value::Value::StringValue(value.to_string())),
         }),
@@ -344,6 +345,7 @@ fn string_kv(key: &str, value: &str) -> KeyValue {
 fn int_kv(key: &str, value: i64) -> KeyValue {
     KeyValue {
         key: key.to_string(),
+        key_strindex: 0,
         value: Some(AnyValue {
             value: Some(any_value::Value::IntValue(value)),
         }),
@@ -353,6 +355,7 @@ fn int_kv(key: &str, value: i64) -> KeyValue {
 fn bool_kv(key: &str, value: bool) -> KeyValue {
     KeyValue {
         key: key.to_string(),
+        key_strindex: 0,
         value: Some(AnyValue {
             value: Some(any_value::Value::BoolValue(value)),
         }),
