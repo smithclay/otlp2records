@@ -41,12 +41,13 @@ use tokio_util::task::TaskTracker;
 use tonic::codec::CompressionEncoding;
 use tonic::metadata::MetadataMap;
 
-use crate::ffi::OtlpSignalType;
+use crate::ffi::{OtlpArrowProfile, OtlpSignalType};
 use crate::otap::grpc_service::{
     ArrowLogsService, ArrowLogsServiceServer, ArrowMetricsService, ArrowMetricsServiceServer,
     ArrowTracesService, ArrowTracesServiceServer,
 };
 use crate::otap::{BatchArrowRecords, BatchStatus, OtapDecoder, StatusCode};
+use crate::ArrowProfile;
 
 use opentelemetry_proto::tonic::collector::logs::v1::{
     logs_service_server::{LogsService, LogsServiceServer},
@@ -127,6 +128,8 @@ struct CallbackCtx {
     user_data: *mut c_void,
     on_batch: OtlpBatchCallback,
     on_auth: Option<OtlpAuthCallback>,
+    /// Applied to every batch before it is exported to the host.
+    profile: ArrowProfile,
 }
 
 // SAFETY: `user_data` is an opaque handle the host keeps alive for the server's
@@ -151,9 +154,11 @@ impl CallbackCtx {
         cb(self.user_data, value.as_ptr() as *const c_char, value.len()) != 0
     }
 
-    /// Export `batch` to the Arrow C Data Interface and hand it to the host's
-    /// batch callback. The FFI structures are released here, after the callback
-    /// returns (the host copies but never releases).
+    /// Re-type `batch` for the server's profile, export it to the Arrow C Data
+    /// Interface and hand it to the host's batch callback. The FFI structures are
+    /// released here, after the callback returns (the host copies but never
+    /// releases). A batch the profile cannot represent is reported as
+    /// `OTLP_INGEST_INVALID` without invoking the callback.
     fn deliver(
         &self,
         signal_type: OtlpSignalType,
@@ -167,6 +172,10 @@ impl CallbackCtx {
         // unwinding the connection task and tearing down every stream multiplexed
         // on it. Mirrors the catch_unwind in `otlp_grpc_server_start`.
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let batch = match self.profile.apply(batch) {
+                Ok(batch) => batch,
+                Err(_) => return OtlpIngestStatus::Invalid,
+            };
             let ffi_schema = match FFI_ArrowSchema::try_from(batch.schema().as_ref()) {
                 Ok(schema) => schema,
                 Err(_) => return OtlpIngestStatus::Internal,
@@ -663,6 +672,45 @@ pub unsafe extern "C" fn otlp_grpc_server_start(
     err_buf: *mut c_char,
     err_buf_len: usize,
 ) -> *mut OtlpGrpcServer {
+    otlp_grpc_server_start_with_profile(
+        bind_addr,
+        bind_addr_len,
+        on_batch,
+        on_auth,
+        user_data,
+        service_flags,
+        max_decoding_message_bytes,
+        OtlpArrowProfile::Canonical,
+        err_buf,
+        err_buf_len,
+    )
+}
+
+/// Start a gRPC ingest server whose batches use the Arrow output `profile`.
+///
+/// Identical to [`otlp_grpc_server_start`] except that every batch handed to
+/// `on_batch` (OTLP/gRPC unary and OTAP/Arrow streaming, every signal and
+/// metric shape) is re-typed for `profile` first.
+/// `OTLP_ARROW_PROFILE_CANONICAL` is identical to `otlp_grpc_server_start`.
+/// Under `OTLP_ARROW_PROFILE_DUCKDB`, a batch the profile cannot represent is
+/// answered `INVALID_ARGUMENT` without invoking `on_batch`.
+///
+/// # Safety
+///
+/// Same contract as [`otlp_grpc_server_start`].
+#[no_mangle]
+pub unsafe extern "C" fn otlp_grpc_server_start_with_profile(
+    bind_addr: *const c_char,
+    bind_addr_len: usize,
+    on_batch: Option<OtlpBatchCallback>,
+    on_auth: Option<OtlpAuthCallback>,
+    user_data: *mut c_void,
+    service_flags: u32,
+    max_decoding_message_bytes: u64,
+    profile: OtlpArrowProfile,
+    err_buf: *mut c_char,
+    err_buf_len: usize,
+) -> *mut OtlpGrpcServer {
     let Some(on_batch) = on_batch else {
         write_err(err_buf, err_buf_len, "on_batch callback is null");
         return std::ptr::null_mut();
@@ -681,6 +729,7 @@ pub unsafe extern "C" fn otlp_grpc_server_start(
             user_data,
             on_batch,
             on_auth,
+            profile: profile.into(),
         });
 
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -873,5 +922,143 @@ pub unsafe extern "C" fn otlp_grpc_server_stop(
 pub unsafe extern "C" fn otlp_grpc_server_free(server: *mut OtlpGrpcServer) {
     if !server.is_null() {
         drop(Box::from_raw(server));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    use opentelemetry_proto::tonic::collector::trace::v1::trace_service_client::TraceServiceClient;
+    use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
+
+    /// `(column, Arrow C format)` of each top-level column the callback saw,
+    /// one entry per delivered batch.
+    type Seen = Mutex<Vec<Vec<(String, String)>>>;
+
+    extern "C" fn record_formats(
+        user_data: *mut c_void,
+        _signal_type: OtlpSignalType,
+        _stream_id: u64,
+        _batch_id: i64,
+        _input_bytes: u64,
+        _array: *mut FFI_ArrowArray,
+        schema: *mut FFI_ArrowSchema,
+    ) -> OtlpIngestStatus {
+        // SAFETY: user_data is the `Seen` owned by `export_one_span`, alive
+        // until the server is stopped; the schema is borrowed for this call.
+        let (seen, schema) = unsafe { (&*(user_data as *const Seen), &*schema) };
+        let formats = schema
+            .children()
+            .map(|c| {
+                (
+                    c.name().unwrap_or_default().to_string(),
+                    c.format().to_string(),
+                )
+            })
+            .collect();
+        seen.lock().unwrap().push(formats);
+        OtlpIngestStatus::Ok
+    }
+
+    /// Start a unary OTLP/gRPC server (with `profile`, or through the
+    /// profile-less entry point for `None`), export one span to it, and return
+    /// the column formats the batch callback received.
+    fn export_one_span(profile: Option<OtlpArrowProfile>) -> Vec<(String, String)> {
+        let seen: Seen = Mutex::new(Vec::new());
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let addr = format!("127.0.0.1:{port}");
+        let user_data = &seen as *const Seen as *mut c_void;
+        let server = unsafe {
+            match profile {
+                None => otlp_grpc_server_start(
+                    addr.as_ptr() as *const c_char,
+                    addr.len(),
+                    Some(record_formats),
+                    None,
+                    user_data,
+                    OTLP_GRPC_SERVICE_OTLP_UNARY,
+                    0,
+                    std::ptr::null_mut(),
+                    0,
+                ),
+                Some(profile) => otlp_grpc_server_start_with_profile(
+                    addr.as_ptr() as *const c_char,
+                    addr.len(),
+                    Some(record_formats),
+                    None,
+                    user_data,
+                    OTLP_GRPC_SERVICE_OTLP_UNARY,
+                    0,
+                    profile,
+                    std::ptr::null_mut(),
+                    0,
+                ),
+            }
+        };
+        assert!(!server.is_null());
+
+        let request = ExportTraceServiceRequest {
+            resource_spans: vec![ResourceSpans {
+                scope_spans: vec![ScopeSpans {
+                    spans: vec![Span {
+                        trace_id: vec![0xab; 16],
+                        span_id: vec![0xcd; 8],
+                        name: "span".to_string(),
+                        start_time_unix_nano: 1_700_000_000_000_000_000,
+                        end_time_unix_nano: 1_700_000_000_000_001_000,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let mut client = TraceServiceClient::connect(format!("http://{addr}"))
+                .await
+                .expect("connect");
+            client.export(request).await.expect("export");
+        });
+        unsafe {
+            otlp_grpc_server_stop(server, 1_000);
+            otlp_grpc_server_free(server);
+        }
+
+        let mut batches = seen.into_inner().unwrap();
+        assert_eq!(batches.len(), 1);
+        batches.pop().unwrap()
+    }
+
+    fn format_of<'a>(formats: &'a [(String, String)], column: &str) -> &'a str {
+        &formats.iter().find(|(name, _)| name == column).unwrap().1
+    }
+
+    #[test]
+    fn grpc_server_applies_the_duckdb_profile_to_delivered_batches() {
+        let formats = export_one_span(Some(OtlpArrowProfile::DuckDb));
+        assert_eq!(format_of(&formats, "trace_id"), "u");
+        assert_eq!(format_of(&formats, "span_id"), "u");
+        assert_eq!(format_of(&formats, "duration_time_unix_nano"), "l");
+        assert_eq!(format_of(&formats, "flags"), "i");
+        assert_eq!(format_of(&formats, "start_time_unix_nano"), "tsn:");
+    }
+
+    #[test]
+    fn grpc_server_default_entry_point_keeps_the_canonical_schema() {
+        let formats = export_one_span(None);
+        assert_eq!(format_of(&formats, "trace_id"), "w:16");
+        assert_eq!(format_of(&formats, "duration_time_unix_nano"), "tDn");
+        assert_eq!(format_of(&formats, "flags"), "I");
+        assert_eq!(export_one_span(Some(OtlpArrowProfile::Canonical)), formats);
     }
 }

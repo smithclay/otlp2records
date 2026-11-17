@@ -102,6 +102,31 @@ typedef enum OtlpStatus {
 } OtlpStatus;
 
 /**
+ * @brief Arrow type profile for the *_with_profile entry points.
+ *
+ * OTLP_ARROW_PROFILE_CANONICAL is the canonical schema every profile-less
+ * entry point returns. OTLP_ARROW_PROFILE_DUCKDB re-types the same batch so
+ * DuckDB's stock Arrow importer yields the duckdb-otlp column types:
+ *
+ *   FixedSizeBinary(N) ("w:N")    -> Utf8 ("u"), lowercase hex, 2N chars
+ *   Duration ("tD*")              -> Int64 ("l"), raw value
+ *   UInt8/16/32 ("C"/"S"/"I")     -> Int32 ("i")
+ *   UInt64 ("L")                  -> Int64 ("l")
+ *   List(T)                       -> List(T mapped as above)
+ *
+ * Everything else (including Timestamp(ns) "tsn:") is unchanged, and nulls
+ * stay null. A UInt32/UInt64 value above the signed maximum is an error, not
+ * a wrap: the transform/decode returns OTLP_ERROR_PARSE_FAILED and the gRPC
+ * server answers INVALID_ARGUMENT without invoking the batch callback.
+ */
+typedef enum OtlpArrowProfile {
+    /** Canonical schema (the default everywhere) */
+    OTLP_ARROW_PROFILE_CANONICAL = 0,
+    /** Types DuckDB's stock Arrow importer maps to the duckdb-otlp columns */
+    OTLP_ARROW_PROFILE_DUCKDB = 1,
+} OtlpArrowProfile;
+
+/**
  * @brief One optional Arrow batch returned by otlp_transform_metrics_all().
  *
  * If present is 0, array/schema are not initialized and must not be released.
@@ -145,6 +170,18 @@ OtlpStatus otlp_get_schema(
     struct ArrowSchema* out_schema
 );
 
+/**
+ * @brief Get the Arrow schema for a signal type under an output profile.
+ *
+ * Identical to otlp_get_schema() for OTLP_ARROW_PROFILE_CANONICAL. The schema
+ * matches the batches the same profile produces.
+ */
+OtlpStatus otlp_get_schema_with_profile(
+    OtlpSignalType signal_type,
+    OtlpArrowProfile profile,
+    struct ArrowSchema* out_schema
+);
+
 /* ============================================================================
  * One-Shot Convenience API
  * ============================================================================ */
@@ -173,6 +210,23 @@ OtlpStatus otlp_transform(
 );
 
 /**
+ * @brief otlp_transform() with an output profile.
+ *
+ * Identical to otlp_transform() for OTLP_ARROW_PROFILE_CANONICAL. Returns
+ * OTLP_ERROR_PARSE_FAILED (nothing written) if a value cannot be represented
+ * in the profile.
+ */
+OtlpStatus otlp_transform_with_profile(
+    OtlpSignalType signal_type,
+    OtlpInputFormat format,
+    OtlpArrowProfile profile,
+    const uint8_t* data,
+    size_t len,
+    struct ArrowArray* out_array,
+    struct ArrowSchema* out_schema
+);
+
+/**
  * @brief Transform OTLP metric bytes to all metric Arrow batches in one parse.
  *
  * @param format Input format (OTLP_FORMAT_AUTO for auto-detection)
@@ -188,6 +242,21 @@ OtlpStatus otlp_transform(
  */
 OtlpStatus otlp_transform_metrics_all(
     OtlpInputFormat format,
+    const uint8_t* data,
+    size_t len,
+    OtlpMetricsArrowBatches* out_batches
+);
+
+/**
+ * @brief otlp_transform_metrics_all() with an output profile.
+ *
+ * Identical to otlp_transform_metrics_all() for OTLP_ARROW_PROFILE_CANONICAL.
+ * Returns OTLP_ERROR_PARSE_FAILED with no batch present if a value cannot be
+ * represented in the profile.
+ */
+OtlpStatus otlp_transform_metrics_all_with_profile(
+    OtlpInputFormat format,
+    OtlpArrowProfile profile,
     const uint8_t* data,
     size_t len,
     OtlpMetricsArrowBatches* out_batches
@@ -227,6 +296,19 @@ typedef struct OtlpOtapDecoder OtlpOtapDecoder;
  *         otlp_otap_decoder_free().
  */
 OtlpOtapDecoder* otlp_otap_decoder_new(void);
+
+/**
+ * @brief Create a new stateful OTAP decoder whose output uses a profile.
+ *
+ * Every batch the decoder returns (logs, traces, every metric shape) is
+ * re-typed for profile; identical to otlp_otap_decoder_new() for
+ * OTLP_ARROW_PROFILE_CANONICAL. A value the profile cannot represent fails
+ * the decode with OTLP_ERROR_PARSE_FAILED (see the Poisoning note above).
+ *
+ * @return Non-null handle owned by the caller; release with
+ *         otlp_otap_decoder_free().
+ */
+OtlpOtapDecoder* otlp_otap_decoder_new_with_profile(OtlpArrowProfile profile);
 
 /**
  * @brief Free an OTAP decoder created by otlp_otap_decoder_new().
@@ -420,6 +502,28 @@ OtlpGrpcServer* otlp_grpc_server_start(
     void* user_data,
     uint32_t service_flags,
     uint64_t max_decoding_message_bytes,
+    char* err_buf,
+    size_t err_buf_len
+);
+
+/**
+ * @brief otlp_grpc_server_start() with an output profile.
+ *
+ * Every batch handed to on_batch (OTLP/gRPC unary and OTAP/Arrow streaming,
+ * every signal and metric shape) is re-typed for profile first. Identical to
+ * otlp_grpc_server_start() for OTLP_ARROW_PROFILE_CANONICAL. A batch the
+ * profile cannot represent is answered INVALID_ARGUMENT without invoking
+ * on_batch.
+ */
+OtlpGrpcServer* otlp_grpc_server_start_with_profile(
+    const char* bind_addr,
+    size_t bind_addr_len,
+    OtlpBatchCallback on_batch,
+    OtlpAuthCallback on_auth,
+    void* user_data,
+    uint32_t service_flags,
+    uint64_t max_decoding_message_bytes,
+    OtlpArrowProfile profile,
     char* err_buf,
     size_t err_buf_len
 );
