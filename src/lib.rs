@@ -57,8 +57,8 @@ pub use api::{
     SkippedMetrics,
 };
 pub use arrow::{
-    extract_min_timestamp_micros, extract_service_name, group_batch_by_service, PartitionedBatch,
-    PartitionedMetrics, ServiceGroupedBatches,
+    extract_min_timestamp_micros, extract_service_name, group_batch_by_service, ArrowProfile,
+    PartitionedBatch, PartitionedMetrics, ServiceGroupedBatches,
 };
 pub use batch::{
     TransformCounter, TransformCounterValue, TransformObserver, TransformPhase,

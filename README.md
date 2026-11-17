@@ -369,6 +369,34 @@ build. See
 [docs/otap-input.md](docs/otap-input.md) for the API, protocol coverage,
 provenance, and remaining protocol boundaries.
 
+## Arrow Profiles
+
+Every transform and decoder emits the canonical schema above by default.
+`ArrowProfile::DuckDb` is an opt-in post-processing pass that re-types a
+finished batch so DuckDB's stock Arrow importer produces the column types the
+`duckdb-otlp` extension exposes:
+
+| Canonical | `ArrowProfile::DuckDb` |
+|-----------|------------------------|
+| `FixedSizeBinary(N)` (ids) | `Utf8`, lowercase hex |
+| `Duration(Nanosecond)` | `Int64` (raw nanoseconds) |
+| `UInt8` / `UInt16` / `UInt32` | `Int32` |
+| `UInt64` | `Int64` (values above `i64::MAX` are an error) |
+| `List(UInt64)` | `List(Int64)` |
+
+```rust
+use otlp2records::{transform_traces, ArrowProfile, InputFormat};
+
+let batch = ArrowProfile::DuckDb.apply(transform_traces(bytes, InputFormat::Protobuf)?)?;
+let schema = ArrowProfile::DuckDb.schema(&otlp2records::traces_schema());
+```
+
+Over the C ABI, each entry point has a `*_with_profile` variant taking an
+`OtlpArrowProfile` (`otlp_get_schema_with_profile`,
+`otlp_transform_with_profile`, `otlp_transform_metrics_all_with_profile`,
+`otlp_otap_decoder_new_with_profile`, `otlp_grpc_server_start_with_profile`);
+see `include/otlp2records.h`. The profile-less functions are unchanged.
+
 ## Performance
 
 - Transforms are plain Rust functions with no interpreter or runtime overhead

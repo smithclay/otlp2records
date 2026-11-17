@@ -21,7 +21,7 @@ use arrow_array::{Array, RecordBatch};
 use crate::decode::InputFormat;
 use crate::{
     exp_histogram_schema, gauge_schema, histogram_schema, logs_schema, sum_schema, traces_schema,
-    transform_logs, transform_metrics, transform_traces,
+    transform_logs, transform_metrics, transform_traces, ArrowProfile,
 };
 
 // ============================================================================
@@ -71,6 +71,29 @@ impl From<OtlpInputFormat> for InputFormat {
             OtlpInputFormat::Protobuf => InputFormat::Protobuf,
             OtlpInputFormat::Json => InputFormat::Json,
             OtlpInputFormat::Jsonl => InputFormat::Jsonl,
+        }
+    }
+}
+
+/// Arrow type profile for FFI output. See [`ArrowProfile`].
+///
+/// C names: OTLP_ARROW_PROFILE_CANONICAL, OTLP_ARROW_PROFILE_DUCKDB.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OtlpArrowProfile {
+    /// Canonical schema, identical to the profile-less entry points
+    /// (C: OTLP_ARROW_PROFILE_CANONICAL)
+    Canonical = 0,
+    /// Types DuckDB's stock Arrow importer maps to the duckdb-otlp column types
+    /// (C: OTLP_ARROW_PROFILE_DUCKDB)
+    DuckDb = 1,
+}
+
+impl From<OtlpArrowProfile> for ArrowProfile {
+    fn from(p: OtlpArrowProfile) -> Self {
+        match p {
+            OtlpArrowProfile::Canonical => ArrowProfile::Canonical,
+            OtlpArrowProfile::DuckDb => ArrowProfile::DuckDb,
         }
     }
 }
@@ -135,6 +158,22 @@ pub unsafe extern "C" fn otlp_get_schema(
     signal_type: OtlpSignalType,
     out_schema: *mut FFI_ArrowSchema,
 ) -> OtlpStatus {
+    otlp_get_schema_with_profile(signal_type, OtlpArrowProfile::Canonical, out_schema)
+}
+
+/// Get the Arrow schema for a signal type under an output profile.
+///
+/// `OTLP_ARROW_PROFILE_CANONICAL` is identical to `otlp_get_schema`.
+///
+/// # Safety
+///
+/// Same contract as `otlp_get_schema`.
+#[no_mangle]
+pub unsafe extern "C" fn otlp_get_schema_with_profile(
+    signal_type: OtlpSignalType,
+    profile: OtlpArrowProfile,
+    out_schema: *mut FFI_ArrowSchema,
+) -> OtlpStatus {
     if out_schema.is_null() {
         return OtlpStatus::InvalidArgument;
     }
@@ -148,6 +187,7 @@ pub unsafe extern "C" fn otlp_get_schema(
             OtlpSignalType::MetricsHistogram => histogram_schema(),
             OtlpSignalType::MetricsExpHistogram => exp_histogram_schema(),
         };
+        let schema = ArrowProfile::from(profile).schema(&schema);
 
         match FFI_ArrowSchema::try_from(&schema) {
             Ok(ffi_schema) => {
@@ -244,8 +284,14 @@ unsafe fn release_exported_metric_batch(out_batch: *mut OtlpArrowBatch) {
 /// `OtlpMetricsArrowBatches`.
 unsafe fn export_metric_batches(
     batches: crate::MetricBatches,
+    profile: ArrowProfile,
     out_batches: *mut OtlpMetricsArrowBatches,
 ) -> OtlpStatus {
+    // Re-type before anything is exported, so a profile error leaves nothing present.
+    let batches = match profile.apply_metrics(batches) {
+        Ok(batches) => batches,
+        Err(_) => return OtlpStatus::ParseFailed,
+    };
     let skipped = batches.skipped;
 
     let gauge_ptr = std::ptr::addr_of_mut!((*out_batches).gauge);
@@ -294,6 +340,36 @@ pub unsafe extern "C" fn otlp_transform(
     out_array: *mut FFI_ArrowArray,
     out_schema: *mut FFI_ArrowSchema,
 ) -> OtlpStatus {
+    otlp_transform_with_profile(
+        signal_type,
+        format,
+        OtlpArrowProfile::Canonical,
+        data,
+        len,
+        out_array,
+        out_schema,
+    )
+}
+
+/// Transform OTLP bytes to Arrow in one call, under an output profile.
+///
+/// `OTLP_ARROW_PROFILE_CANONICAL` is identical to `otlp_transform`. Under
+/// `OTLP_ARROW_PROFILE_DUCKDB`, a value the profile cannot represent (an
+/// unsigned integer above the signed maximum) returns `OTLP_ERROR_PARSE_FAILED`.
+///
+/// # Safety
+///
+/// Same contract as `otlp_transform`.
+#[no_mangle]
+pub unsafe extern "C" fn otlp_transform_with_profile(
+    signal_type: OtlpSignalType,
+    format: OtlpInputFormat,
+    profile: OtlpArrowProfile,
+    data: *const u8,
+    len: usize,
+    out_array: *mut FFI_ArrowArray,
+    out_schema: *mut FFI_ArrowSchema,
+) -> OtlpStatus {
     if data.is_null() || out_array.is_null() || out_schema.is_null() {
         return OtlpStatus::InvalidArgument;
     }
@@ -317,6 +393,9 @@ pub unsafe extern "C" fn otlp_transform(
             }
         };
 
+        let profile = ArrowProfile::from(profile);
+        let batch_result =
+            batch_result.and_then(|batch| batch.map(|b| profile.apply(b)).transpose());
         match batch_result {
             Ok(Some(batch)) => export_record_batch(batch, out_array, out_schema)
                 .map_or_else(|status| status, |_| OtlpStatus::Ok),
@@ -331,7 +410,7 @@ pub unsafe extern "C" fn otlp_transform(
                     OtlpSignalType::MetricsExpHistogram => exp_histogram_schema(),
                 };
 
-                let empty_batch = RecordBatch::new_empty(Arc::new(schema.clone()));
+                let empty_batch = RecordBatch::new_empty(Arc::new(profile.schema(&schema)));
                 export_record_batch(empty_batch, out_array, out_schema)
                     .map_or_else(|status| status, |_| OtlpStatus::Ok)
             }
@@ -359,6 +438,33 @@ pub unsafe extern "C" fn otlp_transform_metrics_all(
     len: usize,
     out_batches: *mut OtlpMetricsArrowBatches,
 ) -> OtlpStatus {
+    otlp_transform_metrics_all_with_profile(
+        format,
+        OtlpArrowProfile::Canonical,
+        data,
+        len,
+        out_batches,
+    )
+}
+
+/// Transform OTLP metric bytes to all metric Arrow batches in one parse, under
+/// an output profile.
+///
+/// `OTLP_ARROW_PROFILE_CANONICAL` is identical to `otlp_transform_metrics_all`.
+/// Under `OTLP_ARROW_PROFILE_DUCKDB`, a value the profile cannot represent
+/// returns `OTLP_ERROR_PARSE_FAILED` with no batch present.
+///
+/// # Safety
+///
+/// Same contract as `otlp_transform_metrics_all`.
+#[no_mangle]
+pub unsafe extern "C" fn otlp_transform_metrics_all_with_profile(
+    format: OtlpInputFormat,
+    profile: OtlpArrowProfile,
+    data: *const u8,
+    len: usize,
+    out_batches: *mut OtlpMetricsArrowBatches,
+) -> OtlpStatus {
     if data.is_null() || out_batches.is_null() {
         return OtlpStatus::InvalidArgument;
     }
@@ -381,7 +487,7 @@ pub unsafe extern "C" fn otlp_transform_metrics_all(
             Ok(batches) => batches,
             Err(_) => return OtlpStatus::ParseFailed,
         };
-        export_metric_batches(batches, out_batches)
+        export_metric_batches(batches, profile.into(), out_batches)
     }))
     .unwrap_or(OtlpStatus::Internal)
 }
@@ -402,6 +508,7 @@ pub unsafe extern "C" fn otlp_transform_metrics_all(
 /// more messages. Do not attempt mid-stream recovery.
 pub struct OtlpOtapDecoder {
     inner: crate::otap::OtapDecoder,
+    profile: ArrowProfile,
 }
 
 /// Create a new stateful OTAP decoder.
@@ -412,8 +519,27 @@ pub struct OtlpOtapDecoder {
 /// `otlp_otap_decoder_free`.
 #[no_mangle]
 pub extern "C" fn otlp_otap_decoder_new() -> *mut OtlpOtapDecoder {
+    otlp_otap_decoder_new_with_profile(OtlpArrowProfile::Canonical)
+}
+
+/// Create a new stateful OTAP decoder whose output uses `profile`.
+///
+/// Every batch the decoder returns (logs, traces, and each metric shape) is
+/// re-typed for `profile`. `OTLP_ARROW_PROFILE_CANONICAL` is identical to
+/// `otlp_otap_decoder_new`. Under `OTLP_ARROW_PROFILE_DUCKDB`, a value the
+/// profile cannot represent fails the decode with `OTLP_ERROR_PARSE_FAILED`.
+///
+/// # Returns
+///
+/// A non-null handle owned by the caller, who must release it with
+/// `otlp_otap_decoder_free`.
+#[no_mangle]
+pub extern "C" fn otlp_otap_decoder_new_with_profile(
+    profile: OtlpArrowProfile,
+) -> *mut OtlpOtapDecoder {
     Box::into_raw(Box::new(OtlpOtapDecoder {
         inner: crate::otap::OtapDecoder::new(),
+        profile: profile.into(),
     }))
 }
 
@@ -453,7 +579,8 @@ unsafe fn otap_decode_batch(
 
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let slice = std::slice::from_raw_parts(data, len);
-        match decode(&mut (*decoder).inner, slice) {
+        let profile = (*decoder).profile;
+        match decode(&mut (*decoder).inner, slice).and_then(|batch| profile.apply(batch)) {
             Ok(batch) => export_record_batch(batch, out_array, out_schema)
                 .map_or_else(|status| status, |_| OtlpStatus::Ok),
             Err(_) => OtlpStatus::ParseFailed,
@@ -557,7 +684,7 @@ pub unsafe extern "C" fn otlp_otap_decode_metrics(
             Ok(batches) => batches,
             Err(_) => return OtlpStatus::ParseFailed,
         };
-        export_metric_batches(batches, out_batches)
+        export_metric_batches(batches, (*decoder).profile, out_batches)
     }))
     .unwrap_or(OtlpStatus::Internal)
 }
@@ -1054,6 +1181,314 @@ mod tests {
         unsafe {
             let decoder = otlp_otap_decoder_new();
             assert!(ffi_decode_rows(decoder, OTAP_LOGS_ZSTD, otlp_otap_decode_logs) > 0);
+            otlp_otap_decoder_free(decoder);
+        }
+    }
+
+    const TRACES_PB: &[u8] = include_bytes!("../../testdata/traces_large.pb");
+    const METRICS_MIXED_PB: &[u8] = include_bytes!("../../testdata/metrics_mixed.pb");
+
+    const ALL_SIGNALS: [OtlpSignalType; 6] = [
+        OtlpSignalType::Logs,
+        OtlpSignalType::Traces,
+        OtlpSignalType::MetricsGauge,
+        OtlpSignalType::MetricsSum,
+        OtlpSignalType::MetricsHistogram,
+        OtlpSignalType::MetricsExpHistogram,
+    ];
+
+    /// Every Arrow C format string in `schema`'s children, recursively
+    /// (list element formats included), as `(name, format)`.
+    fn child_formats(schema: &FFI_ArrowSchema) -> Vec<(String, String)> {
+        fn walk(schema: &FFI_ArrowSchema, out: &mut Vec<(String, String)>) {
+            for child in schema.children() {
+                out.push((
+                    child.name().unwrap_or_default().to_string(),
+                    child.format().to_string(),
+                ));
+                walk(child, out);
+            }
+        }
+        let mut out = Vec::new();
+        walk(schema, &mut out);
+        out
+    }
+
+    /// No format string DuckDB's stock importer maps differently from the
+    /// duckdb-otlp column types: FixedSizeBinary (`w:N`), Duration (`tD*`),
+    /// unsigned ints (`C`/`S`/`I`/`L`).
+    fn assert_duckdb_formats(schema: &FFI_ArrowSchema) {
+        let formats = child_formats(schema);
+        assert!(!formats.is_empty());
+        for (name, format) in formats {
+            assert!(
+                !format.starts_with("w:")
+                    && !format.starts_with("tD")
+                    && !matches!(format.as_str(), "C" | "S" | "I" | "L"),
+                "{name}: {format}"
+            );
+        }
+    }
+
+    unsafe fn get_schema(signal: OtlpSignalType, profile: OtlpArrowProfile) -> FFI_ArrowSchema {
+        let mut out = std::mem::MaybeUninit::<FFI_ArrowSchema>::uninit();
+        assert_eq!(
+            otlp_get_schema_with_profile(signal, profile, out.as_mut_ptr()),
+            OtlpStatus::Ok
+        );
+        out.assume_init()
+    }
+
+    unsafe fn transform(
+        signal: OtlpSignalType,
+        profile: Option<OtlpArrowProfile>,
+        bytes: &[u8],
+    ) -> Result<(arrow_array::ArrayRef, FFI_ArrowSchema), OtlpStatus> {
+        let mut arr = std::mem::MaybeUninit::<FFI_ArrowArray>::uninit();
+        let mut sch = std::mem::MaybeUninit::<FFI_ArrowSchema>::uninit();
+        let (ptr, len) = (bytes.as_ptr(), bytes.len());
+        let status = match profile {
+            None => otlp_transform(
+                signal,
+                OtlpInputFormat::Protobuf,
+                ptr,
+                len,
+                arr.as_mut_ptr(),
+                sch.as_mut_ptr(),
+            ),
+            Some(p) => otlp_transform_with_profile(
+                signal,
+                OtlpInputFormat::Protobuf,
+                p,
+                ptr,
+                len,
+                arr.as_mut_ptr(),
+                sch.as_mut_ptr(),
+            ),
+        };
+        if status != OtlpStatus::Ok {
+            return Err(status);
+        }
+        let schema = sch.assume_init();
+        let data = arrow_array::ffi::from_ffi(arr.assume_init(), &schema).expect("import");
+        Ok((arrow_array::make_array(data), schema))
+    }
+
+    #[test]
+    fn get_schema_canonical_profile_matches_plain_entry_point() {
+        unsafe {
+            for signal in ALL_SIGNALS {
+                let mut plain = std::mem::MaybeUninit::<FFI_ArrowSchema>::uninit();
+                assert_eq!(otlp_get_schema(signal, plain.as_mut_ptr()), OtlpStatus::Ok);
+                let plain = arrow_schema::Schema::try_from(&plain.assume_init()).unwrap();
+                let canonical = arrow_schema::Schema::try_from(&get_schema(
+                    signal,
+                    OtlpArrowProfile::Canonical,
+                ))
+                .unwrap();
+                assert_eq!(plain, canonical, "{signal:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn get_schema_duckdb_profile_has_no_remapped_formats() {
+        unsafe {
+            for signal in ALL_SIGNALS {
+                assert_duckdb_formats(&get_schema(signal, OtlpArrowProfile::DuckDb));
+            }
+            // The canonical schema still carries them (default unchanged).
+            let canonical = child_formats(&get_schema(
+                OtlpSignalType::Traces,
+                OtlpArrowProfile::Canonical,
+            ));
+            assert!(canonical.contains(&("trace_id".into(), "w:16".into())));
+            assert!(canonical.contains(&("duration_time_unix_nano".into(), "tDn".into())));
+            assert!(canonical.contains(&("flags".into(), "I".into())));
+        }
+    }
+
+    #[test]
+    fn transform_canonical_profile_is_identical_to_plain_transform() {
+        unsafe {
+            let (plain, plain_schema) = transform(OtlpSignalType::Traces, None, TRACES_PB).unwrap();
+            let (canonical, canonical_schema) = transform(
+                OtlpSignalType::Traces,
+                Some(OtlpArrowProfile::Canonical),
+                TRACES_PB,
+            )
+            .unwrap();
+            assert_eq!(plain.to_data(), canonical.to_data());
+            assert_eq!(
+                arrow_schema::Schema::try_from(&plain_schema).unwrap(),
+                arrow_schema::Schema::try_from(&canonical_schema).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn transform_duckdb_profile_matches_its_schema() {
+        unsafe {
+            for (signal, bytes) in [
+                (OtlpSignalType::Traces, TRACES_PB),
+                (OtlpSignalType::Logs, &create_test_log_bytes()[..]),
+            ] {
+                let (array, schema) =
+                    transform(signal, Some(OtlpArrowProfile::DuckDb), bytes).unwrap();
+                assert!(!array.is_empty());
+                assert_duckdb_formats(&schema);
+                // Bind-time schema == scan-time schema.
+                assert_eq!(
+                    arrow_schema::Schema::try_from(&schema).unwrap(),
+                    arrow_schema::Schema::try_from(&get_schema(signal, OtlpArrowProfile::DuckDb))
+                        .unwrap()
+                );
+            }
+            // An empty request still yields the profile's (empty) schema.
+            let (array, schema) =
+                transform(OtlpSignalType::Traces, Some(OtlpArrowProfile::DuckDb), &[]).unwrap();
+            assert_eq!(array.len(), 0);
+            assert_duckdb_formats(&schema);
+        }
+    }
+
+    #[test]
+    fn transform_duckdb_profile_rejects_unrepresentable_unsigned() {
+        // dropped_attributes_count is a proto uint32; above i32::MAX it has no
+        // INTEGER representation, so the profile fails rather than wrapping.
+        let mut request = ExportLogsServiceRequest::decode(&create_test_log_bytes()[..]).unwrap();
+        request.resource_logs[0].scope_logs[0].log_records[0].dropped_attributes_count = u32::MAX;
+        let bytes = request.encode_to_vec();
+        unsafe {
+            assert!(transform(OtlpSignalType::Logs, None, &bytes).is_ok());
+            assert_eq!(
+                transform(OtlpSignalType::Logs, Some(OtlpArrowProfile::DuckDb), &bytes)
+                    .unwrap_err(),
+                OtlpStatus::ParseFailed
+            );
+        }
+    }
+
+    unsafe fn present_batches(batches: &mut OtlpMetricsArrowBatches) -> Vec<FFI_ArrowSchema> {
+        let mut out = Vec::new();
+        for batch in [
+            &mut batches.gauge,
+            &mut batches.sum,
+            &mut batches.histogram,
+            &mut batches.exp_histogram,
+        ] {
+            if batch.present != 0 {
+                batch.present = 0;
+                let array = std::ptr::replace(&mut batch.array, FFI_ArrowArray::empty());
+                let schema = std::ptr::replace(&mut batch.schema, FFI_ArrowSchema::empty());
+                // Import (and so release) the array; keep the schema to inspect.
+                arrow_array::ffi::from_ffi(array, &schema).expect("import metric batch");
+                out.push(schema);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn metrics_all_duckdb_profile_retypes_every_shape() {
+        unsafe {
+            let mut plain = std::mem::zeroed::<OtlpMetricsArrowBatches>();
+            assert_eq!(
+                otlp_transform_metrics_all(
+                    OtlpInputFormat::Protobuf,
+                    METRICS_MIXED_PB.as_ptr(),
+                    METRICS_MIXED_PB.len(),
+                    &mut plain,
+                ),
+                OtlpStatus::Ok
+            );
+            let mut duck = std::mem::zeroed::<OtlpMetricsArrowBatches>();
+            assert_eq!(
+                otlp_transform_metrics_all_with_profile(
+                    OtlpInputFormat::Protobuf,
+                    OtlpArrowProfile::DuckDb,
+                    METRICS_MIXED_PB.as_ptr(),
+                    METRICS_MIXED_PB.len(),
+                    &mut duck,
+                ),
+                OtlpStatus::Ok
+            );
+            assert_eq!(plain.skipped_summaries, duck.skipped_summaries);
+            let plain = present_batches(&mut plain);
+            let duck = present_batches(&mut duck);
+            assert_eq!(plain.len(), duck.len());
+            assert!(!duck.is_empty());
+            for schema in &duck {
+                assert_duckdb_formats(schema);
+            }
+        }
+    }
+
+    #[test]
+    fn otap_decoder_duckdb_profile_retypes_every_signal() {
+        unsafe {
+            for (bytes, decode) in [
+                (
+                    OTAP_LOGS_INITIAL,
+                    otlp_otap_decode_logs as unsafe extern "C" fn(_, _, _, _, _) -> _,
+                ),
+                (OTAP_TRACES_INITIAL, otlp_otap_decode_traces),
+            ] {
+                let decoder = otlp_otap_decoder_new_with_profile(OtlpArrowProfile::DuckDb);
+                let mut arr = std::mem::MaybeUninit::<FFI_ArrowArray>::uninit();
+                let mut sch = std::mem::MaybeUninit::<FFI_ArrowSchema>::uninit();
+                assert_eq!(
+                    decode(
+                        decoder,
+                        bytes.as_ptr(),
+                        bytes.len(),
+                        arr.as_mut_ptr(),
+                        sch.as_mut_ptr()
+                    ),
+                    OtlpStatus::Ok
+                );
+                let schema = sch.assume_init();
+                let data = arrow_array::ffi::from_ffi(arr.assume_init(), &schema).unwrap();
+                assert!(!data.is_empty());
+                assert_duckdb_formats(&schema);
+                otlp_otap_decoder_free(decoder);
+            }
+
+            let decoder = otlp_otap_decoder_new_with_profile(OtlpArrowProfile::DuckDb);
+            let mut batches = std::mem::zeroed::<OtlpMetricsArrowBatches>();
+            assert_eq!(
+                otlp_otap_decode_metrics(
+                    decoder,
+                    OTAP_METRICS_INITIAL.as_ptr(),
+                    OTAP_METRICS_INITIAL.len(),
+                    &mut batches,
+                ),
+                OtlpStatus::Ok
+            );
+            let schemas = present_batches(&mut batches);
+            assert!(!schemas.is_empty());
+            for schema in &schemas {
+                assert_duckdb_formats(schema);
+            }
+            otlp_otap_decoder_free(decoder);
+
+            // The profile-less constructor still yields canonical ids.
+            let decoder = otlp_otap_decoder_new();
+            let mut arr = std::mem::MaybeUninit::<FFI_ArrowArray>::uninit();
+            let mut sch = std::mem::MaybeUninit::<FFI_ArrowSchema>::uninit();
+            assert_eq!(
+                otlp_otap_decode_traces(
+                    decoder,
+                    OTAP_TRACES_INITIAL.as_ptr(),
+                    OTAP_TRACES_INITIAL.len(),
+                    arr.as_mut_ptr(),
+                    sch.as_mut_ptr()
+                ),
+                OtlpStatus::Ok
+            );
+            let schema = sch.assume_init();
+            arrow_array::ffi::from_ffi(arr.assume_init(), &schema).unwrap();
+            assert!(child_formats(&schema).contains(&("trace_id".into(), "w:16".into())));
             otlp_otap_decoder_free(decoder);
         }
     }
