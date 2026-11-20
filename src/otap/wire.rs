@@ -5,7 +5,8 @@
 //!
 //! Synced from `opentelemetry/proto/experimental/arrow/v1/arrow_service.proto`
 //! in open-telemetry/otel-arrow commit
-//! `f8cd17f084c1a766f887530531ad06f546080c90`.
+//! `305e4dbe2381996a12e884c8960096bab7946c7a` (the proto is unchanged since
+//! `f8cd17f084c1a766f887530531ad06f546080c90`, the original sync).
 
 /// A collection of Arrow payloads sharing an OTAP batch ID.
 #[derive(Clone, PartialEq, prost::Message)]

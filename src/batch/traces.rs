@@ -12,6 +12,7 @@ use prost::Message;
 
 use crate::{
     schema::traces_schema_arc,
+    views::otlp::Obj,
     views::pdata::{ResourceSpansView, ScopeSpansView, SpanView, StatusView, TracesView},
     Result,
 };
@@ -61,7 +62,7 @@ pub fn transform_traces_request_observed(
     input_bytes: usize,
     observer: &mut Option<&mut dyn TransformObserver>,
 ) -> Result<RecordBatch> {
-    transform_traces_view_observed(&request, input_bytes, observer)
+    transform_traces_view_observed(&Obj::new(&request), input_bytes, observer)
 }
 
 pub(crate) fn transform_traces_view<V: TracesView>(

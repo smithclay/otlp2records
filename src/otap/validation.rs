@@ -439,11 +439,23 @@ impl Simple {
             Self::Utf8 => actual == &DataType::Utf8,
             Self::Binary => actual == &DataType::Binary,
             Self::FixedSizeBinary(width) => actual == &DataType::FixedSizeBinary(width),
-            Self::TimestampNanosecond => {
-                matches!(actual, DataType::Timestamp(TimeUnit::Nanosecond, _))
-            }
+            Self::TimestampNanosecond => is_otap_timestamp(actual),
             Self::DurationNanosecond => actual == &DataType::Duration(TimeUnit::Nanosecond),
         }
+    }
+}
+
+/// Whether `data_type` is a canonical OTAP timestamp column: nanoseconds since
+/// the Unix epoch, annotated `UTC`, `+00:00`, or with no time zone. Upstream
+/// producers emit `UTC` since otel-arrow pdata 0.6x and read a missing zone as
+/// UTC; any other zone is rejected there, so it is rejected here too.
+pub(super) fn is_otap_timestamp(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::Timestamp(TimeUnit::Nanosecond, None) => true,
+        DataType::Timestamp(TimeUnit::Nanosecond, Some(zone)) => {
+            matches!(zone.as_ref(), "UTC" | "+00:00")
+        }
+        _ => false,
     }
 }
 
@@ -528,5 +540,20 @@ mod tests {
         .unwrap();
 
         assert!(validate(PayloadSchema::HistogramPoints, "histogram points", &batch).is_err());
+    }
+
+    #[test]
+    fn accepts_only_utc_or_unzoned_nanosecond_timestamps() {
+        let ns =
+            |zone: Option<&str>| DataType::Timestamp(TimeUnit::Nanosecond, zone.map(Into::into));
+        assert!(is_otap_timestamp(&ns(None)));
+        assert!(is_otap_timestamp(&ns(Some("UTC"))));
+        assert!(is_otap_timestamp(&ns(Some("+00:00"))));
+        assert!(!is_otap_timestamp(&ns(Some("America/New_York"))));
+        assert!(!is_otap_timestamp(&ns(Some("+01:00"))));
+        assert!(!is_otap_timestamp(&DataType::Timestamp(
+            TimeUnit::Microsecond,
+            Some("UTC".into())
+        )));
     }
 }

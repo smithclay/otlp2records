@@ -18,6 +18,10 @@ opentelemetry-proto = { version = "0.33", default-features = false, features = [
 prost = "0.14"
 tonic = { version = "0.14", default-features = false, features = ["codegen"] }
 tonic-prost = "0.14"
+# Zero-dependency OTLP/OTAP view traits from open-telemetry/otel-arrow. Versioned
+# independently of the rest of that workspace (and MSRV 1.87), so it is safe to
+# depend on from this crate and from wasm32.
+otel-arrow-dfe-pdata-views = "0.54"
 # gRPC ingest server (native-only, behind the `grpc` feature). tokio and tonic's
 # transport/server are pulled in only when that feature is enabled, so the base
 # build stays synchronous and wasm32-safe.

@@ -12,6 +12,7 @@ use prost::Message;
 
 use crate::{
     schema::logs_schema_arc,
+    views::otlp::Obj,
     views::pdata::{LogRecordView, LogsDataView, ResourceLogsView, ScopeLogsView},
     DecodeError, Error, Result,
 };
@@ -61,7 +62,7 @@ pub fn transform_logs_request_observed(
     observer: &mut Option<&mut dyn TransformObserver>,
 ) -> Result<RecordBatch> {
     validate_log_ids(&request)?;
-    transform_logs_view_observed(&request, input_bytes, observer)
+    transform_logs_view_observed(&Obj::new(&request), input_bytes, observer)
 }
 
 /// Rejects log identifiers whose byte width is non-canonical. OTLP `trace_id`
