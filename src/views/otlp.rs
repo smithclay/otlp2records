@@ -23,10 +23,10 @@ use opentelemetry_proto::tonic::{
 };
 
 use super::pdata::{
-    AnyValueView, AttributeView, BucketsView, DataPointFlags, DataType, DataView, EventView,
-    ExemplarView, ExponentialHistogramDataPointView, ExponentialHistogramView, GaugeView,
-    HistogramDataPointView, HistogramView, InstrumentationScopeView, LinkView, LogRecordView,
-    LogsDataView, MetricView, MetricsView, NumberDataPointView, ResourceLogsView,
+    AggregationTemporality, AnyValueView, AttributeView, BucketsView, DataPointFlags, DataType,
+    DataView, EventView, ExemplarView, ExponentialHistogramDataPointView, ExponentialHistogramView,
+    GaugeView, HistogramDataPointView, HistogramView, InstrumentationScopeView, LinkView,
+    LogRecordView, LogsDataView, MetricView, MetricsView, NumberDataPointView, ResourceLogsView,
     ResourceMetricsView, ResourceSpansView, ResourceView, ScopeLogsView, ScopeMetricsView,
     ScopeSpansView, SpanId, SpanView, StatusView, Str, SumView, SummaryDataPointView, SummaryView,
     TraceId, TracesView, Value, ValueAtQuantileView, ValueType,
@@ -38,9 +38,19 @@ pub struct Obj<'a, T> {
 }
 
 impl<'a, T> Obj<'a, T> {
-    fn new(inner: &'a T) -> Self {
+    pub(crate) fn new(inner: &'a T) -> Self {
         Self { inner }
     }
+}
+
+/// Maps a wire `aggregation_temporality` onto the view enum. Values outside the
+/// OTLP enum (including negatives) become `Unspecified`, like upstream's
+/// `From<u32>`.
+pub(crate) fn temporality(raw: i32) -> AggregationTemporality {
+    u32::try_from(raw).map_or(
+        AggregationTemporality::Unspecified,
+        AggregationTemporality::from,
+    )
 }
 
 pub struct ObjIter<'a, T, O> {
@@ -123,7 +133,7 @@ impl<'a> Iterator for AnyValueIter<'a> {
     }
 }
 
-impl LogsDataView for ExportLogsServiceRequest {
+impl LogsDataView for Obj<'_, ExportLogsServiceRequest> {
     type ResourceLogs<'a>
         = Obj<'a, ResourceLogs>
     where
@@ -134,7 +144,7 @@ impl LogsDataView for ExportLogsServiceRequest {
         Self: 'a;
 
     fn resources(&self) -> Self::ResourcesIter<'_> {
-        ObjIter::new(self.resource_logs.iter())
+        ObjIter::new(self.inner.resource_logs.iter())
     }
 }
 
@@ -251,7 +261,7 @@ impl LogRecordView for Obj<'_, LogRecord> {
     }
 }
 
-impl TracesView for ExportTraceServiceRequest {
+impl TracesView for Obj<'_, ExportTraceServiceRequest> {
     type ResourceSpans<'a>
         = Obj<'a, ResourceSpans>
     where
@@ -262,7 +272,7 @@ impl TracesView for ExportTraceServiceRequest {
         Self: 'a;
 
     fn resources(&self) -> Self::ResourcesIter<'_> {
-        ObjIter::new(self.resource_spans.iter())
+        ObjIter::new(self.inner.resource_spans.iter())
     }
 }
 
@@ -487,7 +497,7 @@ impl StatusView for Obj<'_, Status> {
     }
 }
 
-impl MetricsView for ExportMetricsServiceRequest {
+impl MetricsView for Obj<'_, ExportMetricsServiceRequest> {
     type ResourceMetrics<'a>
         = Obj<'a, ResourceMetrics>
     where
@@ -498,7 +508,7 @@ impl MetricsView for ExportMetricsServiceRequest {
         Self: 'a;
 
     fn resources(&self) -> Self::ResourceMetricsIter<'_> {
-        ObjIter::new(self.resource_metrics.iter())
+        ObjIter::new(self.inner.resource_metrics.iter())
     }
 }
 
@@ -688,8 +698,8 @@ impl SumView for Obj<'_, Sum> {
         ObjIter::new(self.inner.data_points.iter())
     }
 
-    fn aggregation_temporality(&self) -> i32 {
-        self.inner.aggregation_temporality
+    fn aggregation_temporality(&self) -> AggregationTemporality {
+        temporality(self.inner.aggregation_temporality)
     }
 
     fn is_monotonic(&self) -> bool {
@@ -793,8 +803,8 @@ impl HistogramView for Obj<'_, Histogram> {
         ObjIter::new(self.inner.data_points.iter())
     }
 
-    fn aggregation_temporality(&self) -> i32 {
-        self.inner.aggregation_temporality
+    fn aggregation_temporality(&self) -> AggregationTemporality {
+        temporality(self.inner.aggregation_temporality)
     }
 }
 
@@ -873,8 +883,8 @@ impl ExponentialHistogramView for Obj<'_, ExponentialHistogram> {
         ObjIter::new(self.inner.data_points.iter())
     }
 
-    fn aggregation_temporality(&self) -> i32 {
-        self.inner.aggregation_temporality
+    fn aggregation_temporality(&self) -> AggregationTemporality {
+        temporality(self.inner.aggregation_temporality)
     }
 }
 

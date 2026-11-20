@@ -8,7 +8,7 @@ use crate::{
     api::MetricBatches,
     batch::transform_metrics_view,
     views::pdata::{
-        BucketsView, DataPointFlags, DataType, DataView, ExemplarView,
+        AggregationTemporality, BucketsView, DataPointFlags, DataType, DataView, ExemplarView,
         ExponentialHistogramDataPointView, ExponentialHistogramView, GaugeView,
         HistogramDataPointView, HistogramView, InstrumentationScopeView, MetricView, MetricsView,
         NumberDataPointView, ResourceMetricsView, ResourceView, ScopeMetricsView, SpanId, Str,
@@ -737,8 +737,8 @@ impl SumView for SumSet<'_> {
     fn data_points(&self) -> Self::NumberDataPointIter<'_> {
         NumberPointIter::new(self.view, self.metric_id)
     }
-    fn aggregation_temporality(&self) -> i32 {
-        self.temporality
+    fn aggregation_temporality(&self) -> AggregationTemporality {
+        crate::views::otlp::temporality(self.temporality)
     }
     fn is_monotonic(&self) -> bool {
         self.monotonic
@@ -867,8 +867,8 @@ impl HistogramView for HistogramSet<'_> {
     fn data_points(&self) -> Self::HistogramDataPointIter<'_> {
         HistogramPointIter::new(self.view, self.metric_id)
     }
-    fn aggregation_temporality(&self) -> i32 {
-        self.temporality
+    fn aggregation_temporality(&self) -> AggregationTemporality {
+        crate::views::otlp::temporality(self.temporality)
     }
 }
 
@@ -1007,8 +1007,8 @@ impl ExponentialHistogramView for ExpHistogramSet<'_> {
     fn data_points(&self) -> Self::ExponentialHistogramDataPointIter<'_> {
         ExpHistogramPointIter::new(self.view, self.metric_id)
     }
-    fn aggregation_temporality(&self) -> i32 {
-        self.temporality
+    fn aggregation_temporality(&self) -> AggregationTemporality {
+        crate::views::otlp::temporality(self.temporality)
     }
 }
 

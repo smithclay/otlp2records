@@ -2,7 +2,7 @@
 //!
 //! Adapted from the code `tonic` generates for
 //! `opentelemetry/proto/experimental/arrow/v1/arrow_service.proto`
-//! (open-telemetry/otel-arrow, commit `f8cd17f0…`). The three signal services
+//! (open-telemetry/otel-arrow, commit `305e4dbe…`). The three signal services
 //! (`ArrowLogsService`/`ArrowTracesService`/`ArrowMetricsService`) are identical
 //! apart from their method name and route, so they are generated from one macro
 //! rather than copied three times. They are hand-vendored — like the message

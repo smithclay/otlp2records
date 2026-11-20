@@ -100,25 +100,34 @@ LZ4 (or uncompressed) Arrow IPC.
 
 ## Architecture And Provenance
 
-OTLP and OTAP converge at semantic view traits compatible with
-`otap-df-pdata-views`; neither path owns a separate normalization policy.
-Scalar OTAP values remain borrowed from Arrow arrays. The adapter allocates
-hierarchy indexes, decoded transport ID columns, owned CBOR containers for
-map/slice values, and the small lists required by normalized histogram output.
+OTLP and OTAP converge at the semantic view traits of
+[`otel-arrow-dfe-pdata-views`](https://crates.io/crates/otel-arrow-dfe-pdata-views),
+the zero-dependency view crate the OpenTelemetry Arrow project publishes;
+neither path owns a separate normalization policy. Scalar OTAP values remain
+borrowed from Arrow arrays. The adapter allocates hierarchy indexes, decoded
+transport ID columns, owned CBOR containers for map/slice values, and the small
+lists required by normalized histogram output.
 
-The copied stable interfaces and wire definitions are pinned to
-open-telemetry/otel-arrow commit
-`f8cd17f084c1a766f887530531ad06f546080c90`:
+The view traits return a closed `AggregationTemporality` enum, so an
+out-of-spec wire value (proto3 enums are open) reaches the normalized
+`aggregation_temporality` column as `0` (unspecified).
 
-- semantic telemetry traits: `src/views/pdata.rs`;
-- canonical OTAP envelope types and enum values: `src/otap/wire.rs`.
+The canonical OTAP envelope types, enum values, and gRPC service stubs
+(`src/otap/wire.rs`, `src/otap/grpc_service.rs`) are copied from
+`opentelemetry/proto/experimental/arrow/v1/arrow_service.proto` at
+open-telemetry/otel-arrow commit `305e4dbe2381996a12e884c8960096bab7946c7a`.
 
 The schema, transport, and view adapters are intentionally local while upstream
 crate boundaries stabilize. They are not a general OTAP implementation and do
-not produce OTAP star tables or convert OTAP back to OTLP.
+not produce OTAP star tables or convert OTAP back to OTLP. Timestamp columns
+follow upstream's rule: nanoseconds, annotated `UTC`, `+00:00`, or with no time
+zone (current producers emit `UTC`).
 
 Interoperability fixtures in `tests/fixtures/otap` are generated with the
-upstream `Producer`. Regenerate them from the repository root with:
+upstream `Producer` from the published
+[`otel-arrow-dfe-pdata`](https://crates.io/crates/otel-arrow-dfe-pdata) crate,
+pinned exactly in `tools/otap-fixture-gen/Cargo.toml` (currently `=0.66.0`).
+Bump that pin and regenerate them from the repository root with:
 
 ```sh
 cargo +stable run \
@@ -126,10 +135,9 @@ cargo +stable run \
   tests/fixtures/otap
 ```
 
-The generator is excluded from crates.io packages because it intentionally
-depends on the adjacent authoritative upstream checkout and its heavy dataflow
-dependency graph. No upstream crate enters this crate's product dependency
-graph.
+The generator is excluded from crates.io packages because of `otel-arrow-dfe-pdata`'s
+heavy dataflow dependency graph and its Rust 1.96 MSRV. Only
+`otel-arrow-dfe-pdata-views` enters this crate's product dependency graph.
 
 ## Remaining Boundary
 

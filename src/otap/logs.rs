@@ -10,7 +10,7 @@ use arrow_array::{
     FixedSizeBinaryArray, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray,
     StructArray, TimestampNanosecondArray, UInt16Array, UInt32Array, UInt8Array,
 };
-use arrow_schema::{DataType, Field, Fields, Schema, TimeUnit};
+use arrow_schema::{DataType, Field, Fields, Schema};
 use ciborium::Value;
 
 use super::wire::{
@@ -1078,7 +1078,13 @@ fn validate_logs(batch: &RecordBatch) -> Result<()> {
     for field in batch.schema().fields() {
         match field.name().as_str() {
             "time_unix_nano" | "observed_time_unix_nano" => {
-                expect(field, &DataType::Timestamp(TimeUnit::Nanosecond, None))?
+                if !super::validation::is_otap_timestamp(field.data_type()) {
+                    return Err(Error::Otap(format!(
+                        "{} has type {:?}, expected a nanosecond timestamp in UTC",
+                        field.name(),
+                        field.data_type()
+                    )));
+                }
             }
             "body" => validate_any_struct(field)?,
             "id" => expect(field, &DataType::UInt16)?,
