@@ -7,7 +7,7 @@ publish = false
 [dependencies]
 # Must be the arrow-ipc otel-arrow-dfe-pdata uses: CompressionType goes into
 # its ProducerOptions.
-arrow-ipc = "59.3"
+arrow-ipc = "60.0"
 # Exact pin: the upstream workspace is 0.x and releases weekly, and these
 # fixtures are only meaningful against a known Producer.
 otap-df-pdata = { package = "otel-arrow-dfe-pdata", version = "=0.66.0" }
