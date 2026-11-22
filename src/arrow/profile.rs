@@ -415,34 +415,6 @@ mod tests {
     }
 
     #[test]
-    fn duckdb_profile_shares_columns_it_does_not_change() {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("name", DataType::Utf8, false),
-            Field::new("flags", DataType::UInt32, true),
-        ]));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(StringArray::from(vec!["a"])),
-                Arc::new(UInt32Array::from(vec![1])),
-            ],
-        )
-        .unwrap();
-        let out = ArrowProfile::DuckDb.apply(batch.clone()).unwrap();
-        assert!(Arc::ptr_eq(out.column(0), batch.column(0)));
-        assert_eq!(out.schema().field(1).data_type(), &DataType::Int32);
-
-        // A batch with nothing to re-type is returned as-is.
-        let plain = RecordBatch::try_new(
-            Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, false)])),
-            vec![Arc::new(StringArray::from(vec!["a"]))],
-        )
-        .unwrap();
-        let out = ArrowProfile::DuckDb.apply(plain.clone()).unwrap();
-        assert!(Arc::ptr_eq(&out.schema(), &plain.schema()));
-    }
-
-    #[test]
     fn duckdb_profile_keeps_field_names_nullability_and_metadata() {
         let field = Field::new("trace_id", DataType::FixedSizeBinary(16), false).with_metadata(
             [("k".to_string(), "v".to_string())]

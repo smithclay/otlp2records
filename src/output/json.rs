@@ -69,11 +69,9 @@ mod tests {
         let result = to_json(&batch).unwrap();
         let json_str = String::from_utf8(result).unwrap();
 
-        // Split into lines and verify each is valid JSON
         let lines: Vec<&str> = json_str.lines().collect();
         assert_eq!(lines.len(), 3);
 
-        // Parse and verify each line
         let obj1: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
         assert_eq!(obj1["name"], "alpha");
         assert_eq!(obj1["value"], 1);
@@ -122,17 +120,14 @@ mod tests {
         let lines: Vec<&str> = json_str.lines().collect();
         assert_eq!(lines.len(), 3);
 
-        // First row: both present
         let obj1: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
         assert_eq!(obj1["name"], "alpha");
         assert_eq!(obj1["value"], 1);
 
-        // Second row: name is null
         let obj2: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
         assert!(obj2["name"].is_null());
         assert_eq!(obj2["value"], 2);
 
-        // Third row: value is null
         let obj3: serde_json::Value = serde_json::from_str(lines[2]).unwrap();
         assert_eq!(obj3["name"], "gamma");
         assert!(obj3["value"].is_null());

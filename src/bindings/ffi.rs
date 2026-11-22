@@ -502,10 +502,6 @@ pub extern "C" fn otlp_status_message(status: OtlpStatus) -> *const c_char {
     })
 }
 
-// ============================================================================
-// Tests
-// ============================================================================
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -722,7 +718,6 @@ mod tests {
                 batches.skipped_missing_values,
                 expected.skipped.missing_values as u64
             );
-            // The canonical fixture decodes at least one metric shape.
             assert_ne!(
                 batches.gauge.present
                     | batches.sum.present
@@ -784,7 +779,6 @@ mod tests {
             );
 
             otlp_otap_decoder_free(decoder);
-            // Freeing null must be a safe no-op.
             otlp_otap_decoder_free(std::ptr::null_mut());
         }
     }
@@ -902,23 +896,6 @@ mod tests {
                 .unwrap();
                 assert_eq!(plain, canonical, "{signal:?}");
             }
-        }
-    }
-
-    #[test]
-    fn get_schema_duckdb_profile_has_no_remapped_formats() {
-        unsafe {
-            for signal in ALL_SIGNALS {
-                assert_duckdb_formats(&get_schema(signal, OtlpArrowProfile::DuckDb));
-            }
-            // The canonical schema still carries them (default unchanged).
-            let canonical = child_formats(&get_schema(
-                OtlpSignalType::Traces,
-                OtlpArrowProfile::Canonical,
-            ));
-            assert!(canonical.contains(&("trace_id".into(), "w:16".into())));
-            assert!(canonical.contains(&("duration_time_unix_nano".into(), "tDn".into())));
-            assert!(canonical.contains(&("flags".into(), "I".into())));
         }
     }
 

@@ -162,12 +162,10 @@ fn validate_id_field(value: &str, key: &str) -> Result<(), DecodeError> {
         return Ok(());
     }
 
-    // Try hex decode
     if const_hex::decode(value).is_ok() {
         return Ok(());
     }
 
-    // Try base64 decode
     if BASE64_STANDARD.decode(value).is_ok() {
         return Ok(());
     }

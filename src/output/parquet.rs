@@ -169,9 +169,7 @@ mod tests {
         let batch = create_test_batch();
         let result = to_parquet(&batch).unwrap();
 
-        // Verify it's not empty and has parquet magic bytes
         assert!(!result.is_empty());
-        // Parquet files start with "PAR1"
         assert_eq!(&result[0..4], b"PAR1");
     }
 
@@ -180,7 +178,6 @@ mod tests {
         let original_batch = create_test_batch();
         let parquet_bytes = to_parquet(&original_batch).unwrap();
 
-        // Read back using parquet reader
         let reader = ParquetRecordBatchReaderBuilder::try_new(Bytes::from(parquet_bytes))
             .unwrap()
             .build()
@@ -193,7 +190,6 @@ mod tests {
         assert_eq!(read_batch.num_rows(), 3);
         assert_eq!(read_batch.num_columns(), 2);
 
-        // Verify data integrity
         let name_col = read_batch
             .column(0)
             .as_any()
@@ -227,11 +223,9 @@ mod tests {
         let batch = RecordBatch::try_new(schema, vec![name_array, value_array]).unwrap();
         let result = to_parquet(&batch).unwrap();
 
-        // Should still produce valid Parquet
         assert!(!result.is_empty());
         assert_eq!(&result[0..4], b"PAR1");
 
-        // Verify we can read it back
         let reader = ParquetRecordBatchReaderBuilder::try_new(Bytes::from(result))
             .unwrap()
             .build()
@@ -256,7 +250,6 @@ mod tests {
         let batch = RecordBatch::try_new(schema, vec![name_array, value_array]).unwrap();
         let result = to_parquet(&batch).unwrap();
 
-        // Verify roundtrip preserves nulls
         let reader = ParquetRecordBatchReaderBuilder::try_new(Bytes::from(result))
             .unwrap()
             .build()
@@ -290,7 +283,6 @@ mod tests {
         let batch = create_test_batch();
         let result = to_parquet_bytes(&batch).unwrap();
 
-        // Verify it's valid Parquet
         assert!(!result.is_empty());
         assert_eq!(&result[0..4], b"PAR1");
     }
@@ -306,7 +298,6 @@ mod tests {
         assert!(!result.is_empty());
         assert_eq!(&result[0..4], b"PAR1");
 
-        // Verify roundtrip
         let reader = ParquetRecordBatchReaderBuilder::try_new(Bytes::from(result))
             .unwrap()
             .build()
@@ -322,7 +313,6 @@ mod tests {
         let batch = create_test_batch();
         let mut buffer = Cursor::new(Vec::new());
 
-        // Test with explicit uncompressed and a custom data page row count
         let props = WriterProperties::builder()
             .set_compression(Compression::UNCOMPRESSED)
             .set_data_page_row_count_limit(100)
@@ -334,7 +324,6 @@ mod tests {
         assert!(!result.is_empty());
         assert_eq!(&result[0..4], b"PAR1");
 
-        // Verify roundtrip still works
         let reader = ParquetRecordBatchReaderBuilder::try_new(Bytes::from(result))
             .unwrap()
             .build()

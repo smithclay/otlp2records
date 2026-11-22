@@ -27,9 +27,6 @@
 //! - `"json"` for JSON format
 //! - `"auto"` for auto-detection (JSON vs protobuf)
 
-// This module is only compiled when targeting wasm32 with the wasm feature enabled.
-// The cfg gate is in lib.rs: #[cfg(all(feature = "wasm", target_arch = "wasm32"))]
-
 use wasm_bindgen::prelude::*;
 
 use crate::decode::InputFormat;
@@ -82,7 +79,6 @@ fn transform_metrics_gauge_impl(bytes: &[u8], format: &str) -> Result<Vec<u8>, S
     match batches.gauge {
         Some(batch) => to_ipc(&batch).map_err(|e| e.to_string()),
         None => {
-            // Return empty IPC with correct schema for consistency
             let empty_batch = RecordBatch::new_empty(gauge_schema().into());
             to_ipc(&empty_batch).map_err(|e| e.to_string())
         }
@@ -99,7 +95,6 @@ fn transform_metrics_sum_impl(bytes: &[u8], format: &str) -> Result<Vec<u8>, Str
     match batches.sum {
         Some(batch) => to_ipc(&batch).map_err(|e| e.to_string()),
         None => {
-            // Return empty IPC with correct schema for consistency
             let empty_batch = RecordBatch::new_empty(sum_schema().into());
             to_ipc(&empty_batch).map_err(|e| e.to_string())
         }
@@ -228,13 +223,6 @@ pub fn transform_metrics_gauge_wasm(bytes: &[u8], format: &str) -> Result<Vec<u8
 pub fn transform_metrics_sum_wasm(bytes: &[u8], format: &str) -> Result<Vec<u8>, JsError> {
     transform_metrics_sum_impl(bytes, format).map_err(|e| JsError::new(&e))
 }
-
-// ============================================================================
-// Tests
-// ============================================================================
-// Note: These tests are included for documentation purposes but won't run
-// since this module is only compiled on wasm32. For actual testing, use
-// wasm-bindgen-test or test the underlying functions in lib.rs tests.
 
 #[cfg(test)]
 mod tests {
@@ -432,7 +420,6 @@ mod tests {
         let ipc_bytes = result.unwrap();
         assert!(!ipc_bytes.is_empty());
 
-        // Verify we can read back the IPC
         use arrow_ipc::reader::StreamReader;
         use std::io::Cursor;
 
@@ -468,7 +455,6 @@ mod tests {
         let ipc_bytes = result.unwrap();
         assert!(!ipc_bytes.is_empty());
 
-        // Verify we can read back the IPC
         use arrow_ipc::reader::StreamReader;
         use std::io::Cursor;
 

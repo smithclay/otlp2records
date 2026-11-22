@@ -13,14 +13,19 @@ env:
 
 jobs:
   msrv:
-    name: MSRV (Rust 1.90) and WASM
+    name: MSRV (Cargo.toml rust-version) and WASM
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
 
-      - name: Install Rust 1.90
-        uses: dtolnay/rust-toolchain@1.90
+      - name: Read rust-version from Cargo.toml
+        id: msrv
+        run: echo "version=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml)" >> "$GITHUB_OUTPUT"
+
+      - name: Install the MSRV toolchain
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ steps.msrv.outputs.version }}
           targets: wasm32-unknown-unknown
 
       # The MSRV job only proves the crate compiles on rust-version; lints are
@@ -90,6 +95,32 @@ jobs:
 
       - name: Compile tests/c_abi against include/otlp2records.h and run it
         run: ./tools/c-abi-test.sh
+
+  duckdb:
+    name: Real DuckDB (Arrow importer and Parquet)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1.97.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Cache cargo registry
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-duckdb-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-duckdb-
+
+      - name: Load every signal into DuckDB and check what it sees
+        run: ./tools/duckdb-test.sh
 
   clippy:
     name: Clippy
