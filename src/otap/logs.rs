@@ -14,8 +14,8 @@ use arrow_schema::{DataType, Field, Fields, Schema};
 use ciborium::Value;
 
 use super::wire::{
-    ATTR_BOOL, ATTR_BYTES, ATTR_DOUBLE, ATTR_INT, ATTR_KEY, ATTR_SER, ATTR_STR, ATTR_TYPE,
-    VALUE_BOOL, VALUE_BYTES, VALUE_EMPTY, VALUE_F64, VALUE_I64, VALUE_MAP, VALUE_SLICE, VALUE_STR,
+    AnyValueType, ATTR_BOOL, ATTR_BYTES, ATTR_DOUBLE, ATTR_INT, ATTR_KEY, ATTR_SER, ATTR_STR,
+    ATTR_TYPE,
 };
 use crate::{
     batch::transform_logs_view,
@@ -111,9 +111,9 @@ impl OtapLogsView {
         let body_nested = parse_nested_struct(&logs, "body")?;
         Ok(Self {
             logs,
-            resource_attrs: resource_attrs.map(AttributeTable::new).transpose()?,
-            scope_attrs: scope_attrs.map(AttributeTable::new).transpose()?,
-            log_attrs: log_attrs.map(AttributeTable::new).transpose()?,
+            resource_attrs: table("resource attributes", resource_attrs)?,
+            scope_attrs: table("scope attributes", scope_attrs)?,
+            log_attrs: table("log attributes", log_attrs)?,
             resources,
             body_nested,
         })
@@ -121,7 +121,14 @@ impl OtapLogsView {
 }
 
 impl<K: OtapInt + Ord> AttributeTable<K> {
-    pub(super) fn new(batch: RecordBatch) -> Result<Self> {
+    pub(super) fn new(name: &str, batch: RecordBatch) -> Result<Self> {
+        validate_any_fields(batch.schema().fields(), name)?;
+        validate_any_rows(
+            |column| batch.column_by_name(column),
+            batch.num_rows(),
+            |_| true,
+            name,
+        )?;
         let parent = batch
             .column_by_name("parent_id")
             .ok_or_else(|| Error::Otap("attribute parent_id is missing".into()))?;
@@ -148,11 +155,20 @@ impl<K: OtapInt + Ord> AttributeTable<K> {
 
     fn value(&self, row: usize) -> OtapValue<'_> {
         row_value(
-            &self.batch,
+            |name| self.batch.column_by_name(name),
             row,
             self.nested.get(row).and_then(Option::as_ref),
         )
     }
+}
+
+pub(super) fn table<K: OtapInt + Ord>(
+    name: &str,
+    batch: Option<RecordBatch>,
+) -> Result<Option<AttributeTable<K>>> {
+    batch
+        .map(|batch| AttributeTable::new(name, batch))
+        .transpose()
 }
 
 /// Iterates the attributes attached to one parent row, yielding `OtapAttribute`
@@ -721,62 +737,41 @@ fn struct_value<'a>(
     if values.is_null(row) {
         return None;
     }
-    Some(row_value_struct(values, row, nested))
+    Some(row_value(|name| values.column_by_name(name), row, nested))
 }
 
-pub(super) fn row_value<'a>(
-    batch: &'a RecordBatch,
-    row: usize,
-    nested: Option<&'a OwnedValue>,
-) -> OtapValue<'a> {
-    let value_type = batch
-        .column_by_name(ATTR_TYPE)
-        .and_then(|array| u8_at(array, row));
-    row_value_columns(|name| batch.column_by_name(name), value_type, row, nested)
-}
-
-fn row_value_struct<'a>(
-    values: &'a StructArray,
-    row: usize,
-    nested: Option<&'a OwnedValue>,
-) -> OtapValue<'a> {
-    let value_type = values
-        .column_by_name(ATTR_TYPE)
-        .and_then(|array| u8_at(array, row));
-    row_value_columns(|name| values.column_by_name(name), value_type, row, nested)
-}
-
-fn row_value_columns<'a>(
+fn row_value<'a>(
     column: impl Fn(&str) -> Option<&'a ArrayRef>,
-    value_type: Option<u8>,
     row: usize,
     nested: Option<&'a OwnedValue>,
 ) -> OtapValue<'a> {
-    match value_type {
-        None | Some(VALUE_EMPTY) => OtapValue::Empty,
-        Some(VALUE_STR) => column(ATTR_STR)
+    let Some(value_type) = column(ATTR_TYPE)
+        .and_then(|array| u8_at(array, row))
+        .and_then(AnyValueType::from_wire)
+    else {
+        return OtapValue::Empty;
+    };
+    let payload = value_type.payload_column().and_then(column);
+    let value = match value_type {
+        AnyValueType::Empty => None,
+        AnyValueType::Str => payload
             .and_then(|array| string_at(array, row))
-            .map(OtapValue::String)
-            .unwrap_or(OtapValue::Empty),
-        Some(VALUE_I64) => column(ATTR_INT)
+            .map(OtapValue::String),
+        AnyValueType::Int => payload
             .and_then(|array| i64_at(array, row))
-            .map(OtapValue::Int)
-            .unwrap_or(OtapValue::Empty),
-        Some(VALUE_F64) => column(ATTR_DOUBLE)
+            .map(OtapValue::Int),
+        AnyValueType::Double => payload
             .and_then(|array| f64_at(array, row))
-            .map(OtapValue::Double)
-            .unwrap_or(OtapValue::Empty),
-        Some(VALUE_BOOL) => column(ATTR_BOOL)
+            .map(OtapValue::Double),
+        AnyValueType::Bool => payload
             .and_then(|array| bool_at(array, row))
-            .map(OtapValue::Bool)
-            .unwrap_or(OtapValue::Empty),
-        Some(VALUE_MAP | VALUE_SLICE) => nested.map(OtapValue::Owned).unwrap_or(OtapValue::Empty),
-        Some(VALUE_BYTES) => column(ATTR_BYTES)
+            .map(OtapValue::Bool),
+        AnyValueType::Map | AnyValueType::Slice => nested.map(OtapValue::Owned),
+        AnyValueType::Bytes => payload
             .and_then(|array| bytes_at(array, row))
-            .map(OtapValue::Bytes)
-            .unwrap_or(OtapValue::Empty),
-        Some(_) => OtapValue::Empty,
-    }
+            .map(OtapValue::Bytes),
+    };
+    value.unwrap_or(OtapValue::Empty)
 }
 
 fn parse_nested_struct(batch: &RecordBatch, name: &str) -> Result<Vec<Option<OwnedValue>>> {
@@ -815,7 +810,8 @@ fn parse_nested(
 ) -> Result<Vec<Option<OwnedValue>>> {
     let mut result = Vec::with_capacity(rows);
     for row in 0..rows {
-        if matches!(u8_at(types, row), Some(VALUE_MAP | VALUE_SLICE)) {
+        let value_type = u8_at(types, row).and_then(AnyValueType::from_wire);
+        if matches!(value_type, Some(AnyValueType::Map | AnyValueType::Slice)) {
             let bytes = serialized
                 .and_then(|array| bytes_at(array, row))
                 .ok_or_else(|| Error::Otap(format!("{context} row {row} has no CBOR value")))?;
@@ -1032,8 +1028,8 @@ pub(super) fn same_attribute_value(batch: &RecordBatch, left: usize, right: usiz
     let Some(types) = batch.column_by_name(ATTR_TYPE) else {
         return false;
     };
-    let left_type = u8_at(types, left);
-    if left_type != u8_at(types, right) {
+    let left_type = u8_at(types, left).and_then(AnyValueType::from_wire);
+    if left_type != u8_at(types, right).and_then(AnyValueType::from_wire) {
         return false;
     }
     let Some(keys) = batch.column_by_name(ATTR_KEY) else {
@@ -1042,16 +1038,22 @@ pub(super) fn same_attribute_value(batch: &RecordBatch, left: usize, right: usiz
     if string_at(keys, left) != string_at(keys, right) {
         return false;
     }
+    let Some(left_type) = left_type else {
+        return false;
+    };
+    let payload = left_type
+        .payload_column()
+        .and_then(|name| batch.column_by_name(name));
     match left_type {
-        Some(VALUE_STR) => equal_at(batch.column_by_name(ATTR_STR), left, right, string_at),
-        Some(VALUE_I64) => equal_at(batch.column_by_name(ATTR_INT), left, right, i64_at),
-        Some(VALUE_F64) => batch.column_by_name(ATTR_DOUBLE).is_some_and(|array| {
+        AnyValueType::Str => equal_at(payload, left, right, string_at),
+        AnyValueType::Int => equal_at(payload, left, right, i64_at),
+        AnyValueType::Double => payload.is_some_and(|array| {
             let left = f64_at(array, left).map(f64::to_bits);
             left.is_some() && left == f64_at(array, right).map(f64::to_bits)
         }),
-        Some(VALUE_BOOL) => equal_at(batch.column_by_name(ATTR_BOOL), left, right, bool_at),
-        Some(VALUE_BYTES) => equal_at(batch.column_by_name(ATTR_BYTES), left, right, bytes_at),
-        _ => false,
+        AnyValueType::Bool => equal_at(payload, left, right, bool_at),
+        AnyValueType::Bytes => equal_at(payload, left, right, bytes_at),
+        AnyValueType::Empty | AnyValueType::Map | AnyValueType::Slice => false,
     }
 }
 
@@ -1151,7 +1153,6 @@ pub(super) fn validate_attrs(name: &str, batch: &RecordBatch) -> Result<()> {
             )));
         }
     }
-    validate_any_fields(batch.schema().fields(), name)?;
     expect(
         batch.schema().field_with_name("parent_id").unwrap(),
         &DataType::UInt16,
@@ -1168,29 +1169,7 @@ pub(super) fn validate_attrs(name: &str, batch: &RecordBatch) -> Result<()> {
             )));
         }
     }
-    validate_any_rows(
-        |column| batch.column_by_name(column),
-        batch.num_rows(),
-        |_| true,
-        name,
-    )
-}
-
-/// Runs the per-row `AnyValue` validation on an attribute table without the
-/// 16-bit-specific `parent_id`/`key` structural checks already covered by the
-/// `Attrs32` schema in [`super::validation`]. The 32-bit attribute tables
-/// (data point, exemplar, span event, span link) are structurally validated
-/// there but otherwise skip this scan, so call this to reject unknown type
-/// discriminants and present-but-missing payloads rather than silently
-/// coercing them to [`OtapValue::Empty`].
-pub(super) fn validate_attr_value_rows(name: &str, batch: &RecordBatch) -> Result<()> {
-    validate_any_fields(batch.schema().fields(), name)?;
-    validate_any_rows(
-        |column| batch.column_by_name(column),
-        batch.num_rows(),
-        |_| true,
-        name,
-    )
+    Ok(())
 }
 
 fn validate_any_rows<'a>(
@@ -1205,37 +1184,27 @@ fn validate_any_rows<'a>(
         if !is_present(row) {
             continue;
         }
-        let value_type = u8_at(types, row)
+        let raw = u8_at(types, row)
             .ok_or_else(|| Error::Otap(format!("{context} type is null at row {row}")))?;
+        let value_type = AnyValueType::from_wire(raw).ok_or_else(|| {
+            Error::Otap(format!(
+                "{context} has unknown AnyValue type {raw} at row {row}"
+            ))
+        })?;
+        let payload = value_type.payload_column().and_then(&column);
         let value_present = match value_type {
-            VALUE_EMPTY => true,
-            VALUE_STR => column(ATTR_STR)
-                .and_then(|array| string_at(array, row))
-                .is_some(),
-            VALUE_I64 => column(ATTR_INT)
-                .and_then(|array| i64_at(array, row))
-                .is_some(),
-            VALUE_F64 => column(ATTR_DOUBLE)
-                .and_then(|array| f64_at(array, row))
-                .is_some(),
-            VALUE_BOOL => column(ATTR_BOOL)
-                .and_then(|array| bool_at(array, row))
-                .is_some(),
-            VALUE_MAP | VALUE_SLICE => column(ATTR_SER)
-                .and_then(|array| bytes_at(array, row))
-                .is_some(),
-            VALUE_BYTES => column(ATTR_BYTES)
-                .and_then(|array| bytes_at(array, row))
-                .is_some(),
-            other => {
-                return Err(Error::Otap(format!(
-                    "{context} has unknown AnyValue type {other} at row {row}"
-                )))
+            AnyValueType::Empty => true,
+            AnyValueType::Str => payload.and_then(|a| string_at(a, row)).is_some(),
+            AnyValueType::Int => payload.and_then(|a| i64_at(a, row)).is_some(),
+            AnyValueType::Double => payload.and_then(|a| f64_at(a, row)).is_some(),
+            AnyValueType::Bool => payload.and_then(|a| bool_at(a, row)).is_some(),
+            AnyValueType::Map | AnyValueType::Slice | AnyValueType::Bytes => {
+                payload.and_then(|a| bytes_at(a, row)).is_some()
             }
         };
         if !value_present {
             return Err(Error::Otap(format!(
-                "{context} value for type {value_type} is missing at row {row}"
+                "{context} value for type {raw} is missing at row {row}"
             )));
         }
     }
@@ -1548,7 +1517,7 @@ mod tests {
             vec![
                 Arc::new(UInt16Array::from(vec![0u16])),
                 Arc::new(StringArray::from(vec!["k"])),
-                Arc::new(UInt8Array::from(vec![VALUE_EMPTY])),
+                Arc::new(UInt8Array::from(vec![AnyValueType::Empty as u8])),
             ],
         )
         .unwrap()

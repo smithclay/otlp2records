@@ -322,7 +322,8 @@ unsafe fn write_metrics(
 ///
 /// Created by `otlp_otap_decoder_new`, destroyed by `otlp_otap_decoder_free`.
 /// NOT thread-safe and NOT re-entrant: keep one decoder per OTAP stream, driven
-/// by a single thread at a time (mirrors `OtapDecoder`'s `&mut self` methods).
+/// by a single thread at a time. Any non-OK decode poisons it: every later
+/// decode returns `OTLP_ERROR_PARSE_FAILED`.
 pub struct OtlpOtapDecoder {
     inner: crate::otap::OtapDecoder,
     profile: ArrowProfile,

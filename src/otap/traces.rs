@@ -14,9 +14,9 @@ use crate::{
 use super::logs::{
     bool_at, build_groups, bytes_at, column_string, column_u16, column_u32, decode_attr_parent_ids,
     decode_quasi_delta, decode_root_ids, duration_nanos_at, f64_at, i32_at, i64_at, id, index_u16,
-    is_plain, nested_string, nested_u32_value, replace, same_attribute_value, string_at, timestamp,
-    u16_at, u32_at, u8_at, validate_attr_value_rows, validate_attrs, Attr16Iter, Attr32Iter,
-    AttributeTable, AttributeTable32, OtapAttribute, ResourceGroup, ScopeGroup,
+    is_plain, nested_string, nested_u32_value, replace, same_attribute_value, string_at, table,
+    timestamp, u16_at, u32_at, u8_at, validate_attrs, Attr16Iter, Attr32Iter, AttributeTable,
+    AttributeTable32, OtapAttribute, ResourceGroup, ScopeGroup,
 };
 use super::validation::{validate, PayloadSchema};
 
@@ -64,9 +64,6 @@ pub(super) fn normalize(
     ] {
         if let Some(batch) = batch {
             validate(payload, name, batch)?;
-            if matches!(payload, PayloadSchema::Attrs32) {
-                validate_attr_value_rows(name, batch)?;
-            }
         }
     }
     for (name, batch) in [
@@ -144,13 +141,13 @@ impl OtapTracesView {
             .unwrap_or_default();
         Ok(Self {
             spans,
-            resource_attrs: resource_attrs.map(AttributeTable::new).transpose()?,
-            scope_attrs: scope_attrs.map(AttributeTable::new).transpose()?,
-            span_attrs: span_attrs.map(AttributeTable::new).transpose()?,
+            resource_attrs: table("resource attributes", resource_attrs)?,
+            scope_attrs: table("scope attributes", scope_attrs)?,
+            span_attrs: table("span attributes", span_attrs)?,
             events,
-            event_attrs: event_attrs.map(AttributeTable32::new).transpose()?,
+            event_attrs: table("span event attributes", event_attrs)?,
             links,
-            link_attrs: link_attrs.map(AttributeTable32::new).transpose()?,
+            link_attrs: table("span link attributes", link_attrs)?,
             resources,
             events_by_parent,
             links_by_parent,
@@ -768,60 +765,5 @@ mod transport_tests {
             .downcast_ref::<UInt32Array>()
             .unwrap();
         assert_eq!(parent_ids.values(), &[7, 2]);
-    }
-
-    #[test]
-    fn rejects_unknown_value_type_in_32bit_attributes() {
-        // A 32-bit attribute table (data point / exemplar / span event / span
-        // link) carrying an unknown AnyValue discriminant must be rejected, not
-        // silently coerced to an empty value.
-        let batch = RecordBatch::try_new(
-            Arc::new(Schema::new(vec![
-                Field::new("parent_id", DataType::UInt32, false),
-                Field::new("key", DataType::Utf8, false),
-                Field::new("type", DataType::UInt8, false),
-                Field::new("str", DataType::Utf8, true),
-            ])),
-            vec![
-                Arc::new(UInt32Array::from(vec![1])),
-                Arc::new(StringArray::from(vec!["k"])),
-                Arc::new(UInt8Array::from(vec![99])),
-                Arc::new(StringArray::from(vec![Some("v")])),
-            ],
-        )
-        .unwrap();
-
-        let error = validate_attr_value_rows("span event attributes", &batch).unwrap_err();
-        assert!(
-            error.to_string().contains("unknown AnyValue type 99"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[test]
-    fn rejects_missing_payload_in_32bit_attributes() {
-        // A declared string value whose payload column is null at that row must
-        // be rejected rather than silently decoded as empty.
-        let batch = RecordBatch::try_new(
-            Arc::new(Schema::new(vec![
-                Field::new("parent_id", DataType::UInt32, false),
-                Field::new("key", DataType::Utf8, false),
-                Field::new("type", DataType::UInt8, false),
-                Field::new("str", DataType::Utf8, true),
-            ])),
-            vec![
-                Arc::new(UInt32Array::from(vec![1])),
-                Arc::new(StringArray::from(vec!["k"])),
-                Arc::new(UInt8Array::from(vec![super::super::wire::VALUE_STR])),
-                Arc::new(StringArray::from(vec![None::<&str>])),
-            ],
-        )
-        .unwrap();
-
-        let error = validate_attr_value_rows("span link attributes", &batch).unwrap_err();
-        assert!(
-            error.to_string().contains("is missing at row 0"),
-            "unexpected error: {error}"
-        );
     }
 }

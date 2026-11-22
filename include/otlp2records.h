@@ -282,9 +282,9 @@ OtlpStatus otlp_transform_metrics_all_with_profile(
  * --features ffi,otap-zstd (native only; the Zstandard backend cannot target
  * wasm32).
  *
- * Poisoning: on any non-OK return the decoder's stream state may be partially
- * advanced and is no longer trustworthy. Free the decoder and start a new one
- * rather than feeding it more messages; do not attempt mid-stream recovery.
+ * Poisoning: any non-OK return poisons the decoder, because the failed message
+ * may have advanced some of its stream state. Every later decode on it returns
+ * OTLP_ERROR_PARSE_FAILED; free it and start a new decoder for a new stream.
  * ============================================================================ */
 
 /** Opaque stateful OTAP decoder. One per OTAP stream; not thread-safe. */
@@ -333,7 +333,7 @@ void otlp_otap_decoder_free(OtlpOtapDecoder* decoder);
  *
  * @note On OTLP_OK the caller must call out_array->release() and
  *       out_schema->release(). On any non-OK status nothing is written and the
- *       stream should be discarded (see Poisoning note above).
+ *       decoder is poisoned (see the Poisoning note above).
  */
 OtlpStatus otlp_otap_decode_logs(
     OtlpOtapDecoder* decoder,
@@ -370,8 +370,6 @@ OtlpStatus otlp_otap_decode_traces(
  *       any non-OK status every present is 0 and every counter is 0.
  * @note For each output with present != 0, caller must release array and schema.
  * @note Outputs with present == 0 must not be released.
- * @note On any non-OK status no batch is present and the stream should be
- *       discarded (see Poisoning note above).
  */
 OtlpStatus otlp_otap_decode_metrics(
     OtlpOtapDecoder* decoder,
