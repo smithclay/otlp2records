@@ -38,6 +38,10 @@ mod views;
 #[path = "bindings/ffi.rs"]
 pub mod ffi;
 
+#[cfg(feature = "ffi")]
+#[path = "bindings/export.rs"]
+mod ffi_export;
+
 // Native gRPC ingest server FFI. Gated on the `grpc` feature (which pulls in a
 // tokio runtime + tonic transport) and never compiled for wasm32, which has no
 // runtime or sockets.

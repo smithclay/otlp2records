@@ -236,7 +236,8 @@ OtlpStatus otlp_transform_with_profile(
  *                     plus skipped metric counters
  * @return OTLP_OK on success, error code otherwise
  *
- * @note Caller should zero-initialize out_batches before calling.
+ * @note out_batches is fully overwritten, so it need not be initialized. On
+ *       any non-OK status every present is 0 and every counter is 0.
  * @note For each output with present != 0, caller must release array and schema.
  * @note Outputs with present == 0 must not be released.
  */
@@ -365,7 +366,8 @@ OtlpStatus otlp_otap_decode_traces(
  *                     exp_histogram plus skipped metric counters
  * @return OTLP_OK on success, error code otherwise
  *
- * @note Caller should zero-initialize out_batches before calling.
+ * @note out_batches is fully overwritten, so it need not be initialized. On
+ *       any non-OK status every present is 0 and every counter is 0.
  * @note For each output with present != 0, caller must release array and schema.
  * @note Outputs with present == 0 must not be released.
  * @note On any non-OK status no batch is present and the stream should be

@@ -34,7 +34,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use arrow_array::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
-use arrow_array::{Array, RecordBatch, StructArray};
+use arrow_array::RecordBatch;
 use prost::Message as _;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
@@ -42,6 +42,7 @@ use tonic::codec::CompressionEncoding;
 use tonic::metadata::MetadataMap;
 
 use crate::ffi::{OtlpArrowProfile, OtlpSignalType};
+use crate::ffi_export::{ffi_boundary, ExportError, ExportedBatch, ExportedMetrics};
 use crate::otap::grpc_service::{
     ArrowLogsService, ArrowLogsServiceServer, ArrowMetricsService, ArrowMetricsServiceServer,
     ArrowTracesService, ArrowTracesServiceServer,
@@ -154,12 +155,28 @@ impl CallbackCtx {
         cb(self.user_data, value.as_ptr() as *const c_char, value.len()) != 0
     }
 
-    /// Re-type `batch` for the server's profile, export it to the Arrow C Data
-    /// Interface and hand it to the host's batch callback. The FFI structures are
-    /// released here, after the callback returns (the host copies but never
-    /// releases). A batch the profile cannot represent is reported as
-    /// `OTLP_INGEST_INVALID` without invoking the callback.
     fn deliver(
+        &self,
+        signal_type: OtlpSignalType,
+        stream_id: u64,
+        batch_id: i64,
+        input_bytes: u64,
+        batch: ExportedBatch,
+    ) -> OtlpIngestStatus {
+        batch.lend(|array, schema| {
+            (self.on_batch)(
+                self.user_data,
+                signal_type,
+                stream_id,
+                batch_id,
+                input_bytes,
+                array,
+                schema,
+            )
+        })
+    }
+
+    fn deliver_one(
         &self,
         signal_type: OtlpSignalType,
         stream_id: u64,
@@ -167,35 +184,49 @@ impl CallbackCtx {
         input_bytes: u64,
         batch: RecordBatch,
     ) -> OtlpIngestStatus {
-        // Fence panics from the Arrow C-Data export (or the callback's Rust
-        // frames) so a bug becomes a clean INTERNAL for this one batch instead of
-        // unwinding the connection task and tearing down every stream multiplexed
-        // on it. Mirrors the catch_unwind in `otlp_grpc_server_start`.
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let batch = match self.profile.apply(batch) {
-                Ok(batch) => batch,
-                Err(_) => return OtlpIngestStatus::Invalid,
-            };
-            let ffi_schema = match FFI_ArrowSchema::try_from(batch.schema().as_ref()) {
-                Ok(schema) => schema,
-                Err(_) => return OtlpIngestStatus::Internal,
-            };
-            let struct_array: StructArray = batch.into();
-            let mut ffi_array = FFI_ArrowArray::new(&struct_array.into_data());
-            let mut ffi_schema = ffi_schema;
+        ffi_boundary(OtlpIngestStatus::Internal, || {
+            match ExportedBatch::new(self.profile, batch).map_err(OtlpIngestStatus::from) {
+                Ok(batch) => self.deliver(signal_type, stream_id, batch_id, input_bytes, batch),
+                Err(status) => status,
+            }
+        })
+    }
 
-            (self.on_batch)(
-                self.user_data,
-                signal_type,
-                stream_id,
-                batch_id,
-                input_bytes,
-                &mut ffi_array as *mut FFI_ArrowArray,
-                &mut ffi_schema as *mut FFI_ArrowSchema,
-            )
-            // ffi_array / ffi_schema drop here, invoking their release callbacks.
-        }));
-        outcome.unwrap_or(OtlpIngestStatus::Internal)
+    /// Delivers each present metric shape of one message, charging the wire
+    /// bytes to the first. Every shape is exported before any is delivered, so a
+    /// profile error delivers nothing; a host nack part-way leaves the earlier
+    /// shapes buffered.
+    fn deliver_metrics(
+        &self,
+        stream_id: u64,
+        batch_id: i64,
+        input_bytes: u64,
+        batches: crate::MetricBatches,
+    ) -> OtlpIngestStatus {
+        ffi_boundary(OtlpIngestStatus::Internal, || {
+            let exported = match ExportedMetrics::new(self.profile, batches) {
+                Ok(exported) => exported,
+                Err(error) => return error.into(),
+            };
+            let mut charge = input_bytes;
+            for (signal, batch) in exported.into_shapes() {
+                let charge = std::mem::take(&mut charge);
+                let status = self.deliver(signal, stream_id, batch_id, charge, batch);
+                if status != OtlpIngestStatus::Ok {
+                    return status;
+                }
+            }
+            OtlpIngestStatus::Ok
+        })
+    }
+}
+
+impl From<ExportError> for OtlpIngestStatus {
+    fn from(error: ExportError) -> Self {
+        match error {
+            ExportError::Unrepresentable => OtlpIngestStatus::Invalid,
+            ExportError::SchemaNotExportable => OtlpIngestStatus::Internal,
+        }
     }
 }
 
@@ -257,7 +288,7 @@ impl LogsService for LogsServiceImpl {
             .map_err(|e| {
                 tonic::Status::invalid_argument(format!("failed to transform logs: {e}"))
             })?;
-        ingest_status_to_grpc(self.ctx.deliver(
+        ingest_status_to_grpc(self.ctx.deliver_one(
             OtlpSignalType::Logs,
             0,
             0,
@@ -287,7 +318,7 @@ impl TraceService for TraceServiceImpl {
             .map_err(|e| {
                 tonic::Status::invalid_argument(format!("failed to transform traces: {e}"))
             })?;
-        ingest_status_to_grpc(self.ctx.deliver(
+        ingest_status_to_grpc(self.ctx.deliver_one(
             OtlpSignalType::Traces,
             0,
             0,
@@ -317,48 +348,9 @@ impl MetricsService for MetricsServiceImpl {
             crate::batch::transform_metrics_request_observed(req, &mut None).map_err(|e| {
                 tonic::Status::invalid_argument(format!("failed to transform metrics: {e}"))
             })?;
-        ingest_status_to_grpc(deliver_metric_batches(
-            &self.ctx,
-            0,
-            0,
-            input_bytes,
-            batches,
-        ))?;
+        ingest_status_to_grpc(self.ctx.deliver_metrics(0, 0, input_bytes, batches))?;
         Ok(tonic::Response::new(ExportMetricsServiceResponse::default()))
     }
-}
-
-/// Deliver each present metric shape from one OTLP/OTAP message to its buffer,
-/// returning the first non-OK outcome (or OK). The wire bytes are charged once,
-/// on the first present shape; the others take the host's admission floor.
-///
-/// NOTE: the shapes are buffered independently (one host call each), so a
-/// backpressure nack partway through can leave earlier shapes buffered. A client
-/// retry of the whole message would then re-buffer them. This matches the
-/// approximate admission model and keeps the per-batch FFI ABI unchanged.
-fn deliver_metric_batches(
-    ctx: &CallbackCtx,
-    stream_id: u64,
-    batch_id: i64,
-    input_bytes: u64,
-    batches: crate::MetricBatches,
-) -> OtlpIngestStatus {
-    let mut remaining = input_bytes;
-    for (signal, maybe_batch) in [
-        (OtlpSignalType::MetricsGauge, batches.gauge),
-        (OtlpSignalType::MetricsSum, batches.sum),
-        (OtlpSignalType::MetricsHistogram, batches.histogram),
-        (OtlpSignalType::MetricsExpHistogram, batches.exp_histogram),
-    ] {
-        if let Some(batch) = maybe_batch {
-            let charge = std::mem::take(&mut remaining);
-            let status = ctx.deliver(signal, stream_id, batch_id, charge, batch);
-            if status != OtlpIngestStatus::Ok {
-                return status;
-            }
-        }
-    }
-    OtlpIngestStatus::Ok
 }
 
 /// Map a host ingest outcome to the OTAP `BatchStatus` echoed back on the stream.
@@ -418,8 +410,13 @@ fn spawn_single_shape_stream(
                     let input_bytes = envelope.encoded_len();
                     match decode(&mut decoder, envelope, input_bytes) {
                         Ok(batch) => {
-                            let ingest =
-                                ctx.deliver(signal, stream_id, batch_id, input_bytes as u64, batch);
+                            let ingest = ctx.deliver_one(
+                                signal,
+                                stream_id,
+                                batch_id,
+                                input_bytes as u64,
+                                batch,
+                            );
                             if tx
                                 .send(Ok(ingest_to_batch_status(batch_id, ingest)))
                                 .await
@@ -469,13 +466,8 @@ fn spawn_metrics_stream(
                     let input_bytes = envelope.encoded_len() as u64;
                     match decoder.decode_metrics_message(envelope) {
                         Ok(batches) => {
-                            let ingest = deliver_metric_batches(
-                                &ctx,
-                                stream_id,
-                                batch_id,
-                                input_bytes,
-                                batches,
-                            );
+                            let ingest =
+                                ctx.deliver_metrics(stream_id, batch_id, input_bytes, batches);
                             if tx
                                 .send(Ok(ingest_to_batch_status(batch_id, ingest)))
                                 .await
@@ -711,146 +703,159 @@ pub unsafe extern "C" fn otlp_grpc_server_start_with_profile(
     err_buf: *mut c_char,
     err_buf_len: usize,
 ) -> *mut OtlpGrpcServer {
-    let Some(on_batch) = on_batch else {
-        write_err(err_buf, err_buf_len, "on_batch callback is null");
-        return std::ptr::null_mut();
-    };
-    if bind_addr.is_null() {
-        write_err(err_buf, err_buf_len, "bind_addr is null");
-        return std::ptr::null_mut();
-    }
-
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let addr_slice = std::slice::from_raw_parts(bind_addr as *const u8, bind_addr_len);
-        let addr = std::str::from_utf8(addr_slice)
-            .map_err(|_| "bind_addr is not valid UTF-8".to_string())?;
-
-        let ctx = Arc::new(CallbackCtx {
-            user_data,
+    let started = ffi_boundary(Err("panic while starting gRPC server".into()), || {
+        start_server(
+            bind_addr,
+            bind_addr_len,
             on_batch,
             on_auth,
-            profile: profile.into(),
-        });
-
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(worker_threads())
-            .thread_name("otlp-grpc")
-            .enable_all()
-            .build()
-            .map_err(|e| format!("failed to start runtime: {e}"))?;
-
-        // Bind synchronously so address-in-use surfaces to the caller now.
-        let std_listener =
-            std::net::TcpListener::bind(addr).map_err(|e| format!("failed to bind {addr}: {e}"))?;
-        std_listener
-            .set_nonblocking(true)
-            .map_err(|e| format!("failed to configure listener: {e}"))?;
-
-        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-        // Shared across the three OTAP streaming services: the token signals their
-        // spawned loops to stop, the tracker lets shutdown await them.
-        let cancel = CancellationToken::new();
-        let tracker = TaskTracker::new();
-
-        // Per-message decode cap applied uniformly to all six services. 0 means
-        // "tonic's default"; resolve it to that concrete value (4 MiB) so the cap
-        // is explicit rather than relying on tonic's implicit default.
-        const TONIC_DEFAULT_MAX_DECODING: usize = 4 * 1024 * 1024;
-        let max_decoding = if max_decoding_message_bytes == 0 {
-            TONIC_DEFAULT_MAX_DECODING
-        } else {
-            max_decoding_message_bytes as usize
-        };
-
-        // Which service families to register. 0 = both, so each named bit (or the
-        // 0 default) opts a family in.
-        let serve_otlp = service_flags == 0 || (service_flags & OTLP_GRPC_SERVICE_OTLP_UNARY) != 0;
-        let serve_otap = service_flags == 0 || (service_flags & OTLP_GRPC_SERVICE_OTAP_ARROW) != 0;
-
-        // The listener serves the OTLP/gRPC unary Export services and/or the
-        // OTAP/Arrow bidirectional-streaming services, per `service_flags`.
-        // accept_compressed(Zstd): decompress zstd-compressed gRPC requests. The
-        // otel-arrow OTAP exporter sends `grpc-encoding: zstd` by default; without
-        // this every stream is rejected. Responses are left uncompressed (the
-        // BatchStatus/ExportResponse acks are tiny). Applied to all six services so
-        // OTLP/gRPC unary and OTAP/Arrow streaming both accept the wire default.
-        let logs = LogsServiceServer::new(LogsServiceImpl { ctx: ctx.clone() })
-            .max_decoding_message_size(max_decoding)
-            .accept_compressed(CompressionEncoding::Zstd);
-        let traces = TraceServiceServer::new(TraceServiceImpl { ctx: ctx.clone() })
-            .max_decoding_message_size(max_decoding)
-            .accept_compressed(CompressionEncoding::Zstd);
-        let metrics = MetricsServiceServer::new(MetricsServiceImpl { ctx: ctx.clone() })
-            .max_decoding_message_size(max_decoding)
-            .accept_compressed(CompressionEncoding::Zstd);
-        let arrow_logs = ArrowLogsServiceServer::new(ArrowLogsServiceImpl {
-            ctx: ctx.clone(),
-            stream_counter: AtomicU64::new(0),
-            cancel: cancel.clone(),
-            tracker: tracker.clone(),
-        })
-        .max_decoding_message_size(max_decoding)
-        .accept_compressed(CompressionEncoding::Zstd);
-        let arrow_traces = ArrowTracesServiceServer::new(ArrowTracesServiceImpl {
-            ctx: ctx.clone(),
-            stream_counter: AtomicU64::new(0),
-            cancel: cancel.clone(),
-            tracker: tracker.clone(),
-        })
-        .max_decoding_message_size(max_decoding)
-        .accept_compressed(CompressionEncoding::Zstd);
-        let arrow_metrics = ArrowMetricsServiceServer::new(ArrowMetricsServiceImpl {
-            ctx: ctx.clone(),
-            stream_counter: AtomicU64::new(0),
-            cancel: cancel.clone(),
-            tracker: tracker.clone(),
-        })
-        .max_decoding_message_size(max_decoding)
-        .accept_compressed(CompressionEncoding::Zstd);
-
-        let join = {
-            let _guard = runtime.enter();
-            let tokio_listener = tokio::net::TcpListener::from_std(std_listener)
-                .map_err(|e| format!("failed to register listener: {e}"))?;
-            let incoming = tokio_stream::wrappers::TcpListenerStream::new(tokio_listener);
-            runtime.spawn(async move {
-                // add_optional_service registers a family only when its flag is set;
-                // a None arm is a no-op, so an `otlp:`-only or `otap:`-only listener
-                // simply doesn't route the other family's methods.
-                tonic::transport::Server::builder()
-                    .add_optional_service(serve_otlp.then_some(logs))
-                    .add_optional_service(serve_otlp.then_some(traces))
-                    .add_optional_service(serve_otlp.then_some(metrics))
-                    .add_optional_service(serve_otap.then_some(arrow_logs))
-                    .add_optional_service(serve_otap.then_some(arrow_traces))
-                    .add_optional_service(serve_otap.then_some(arrow_metrics))
-                    .serve_with_incoming_shutdown(incoming, async move {
-                        let _ = shutdown_rx.await;
-                    })
-                    .await
-            })
-        };
-
-        Ok::<_, String>(OtlpGrpcServer {
-            runtime: Some(runtime),
-            shutdown_tx: Some(shutdown_tx),
-            join: Some(join),
-            cancel,
-            tracker,
-        })
-    }));
-
-    match result {
-        Ok(Ok(server)) => Box::into_raw(Box::new(server)),
-        Ok(Err(msg)) => {
+            user_data,
+            service_flags,
+            max_decoding_message_bytes,
+            profile.into(),
+        )
+    });
+    match started {
+        Ok(server) => Box::into_raw(Box::new(server)),
+        Err(msg) => {
             write_err(err_buf, err_buf_len, &msg);
             std::ptr::null_mut()
         }
-        Err(_) => {
-            write_err(err_buf, err_buf_len, "panic while starting gRPC server");
-            std::ptr::null_mut()
-        }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn start_server(
+    bind_addr: *const c_char,
+    bind_addr_len: usize,
+    on_batch: Option<OtlpBatchCallback>,
+    on_auth: Option<OtlpAuthCallback>,
+    user_data: *mut c_void,
+    service_flags: u32,
+    max_decoding_message_bytes: u64,
+    profile: ArrowProfile,
+) -> Result<OtlpGrpcServer, String> {
+    let on_batch = on_batch.ok_or("on_batch callback is null")?;
+    if bind_addr.is_null() {
+        return Err("bind_addr is null".into());
+    }
+    let addr_slice = std::slice::from_raw_parts(bind_addr as *const u8, bind_addr_len);
+    let addr =
+        std::str::from_utf8(addr_slice).map_err(|_| "bind_addr is not valid UTF-8".to_string())?;
+
+    let ctx = Arc::new(CallbackCtx {
+        user_data,
+        on_batch,
+        on_auth,
+        profile,
+    });
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads())
+        .thread_name("otlp-grpc")
+        .enable_all()
+        .build()
+        .map_err(|e| format!("failed to start runtime: {e}"))?;
+
+    // Bind synchronously so address-in-use surfaces to the caller now.
+    let std_listener =
+        std::net::TcpListener::bind(addr).map_err(|e| format!("failed to bind {addr}: {e}"))?;
+    std_listener
+        .set_nonblocking(true)
+        .map_err(|e| format!("failed to configure listener: {e}"))?;
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    // Shared across the three OTAP streaming services: the token signals their
+    // spawned loops to stop, the tracker lets shutdown await them.
+    let cancel = CancellationToken::new();
+    let tracker = TaskTracker::new();
+
+    // Per-message decode cap applied uniformly to all six services. 0 means
+    // "tonic's default"; resolve it to that concrete value (4 MiB) so the cap
+    // is explicit rather than relying on tonic's implicit default.
+    const TONIC_DEFAULT_MAX_DECODING: usize = 4 * 1024 * 1024;
+    let max_decoding = if max_decoding_message_bytes == 0 {
+        TONIC_DEFAULT_MAX_DECODING
+    } else {
+        max_decoding_message_bytes as usize
+    };
+
+    // Which service families to register. 0 = both, so each named bit (or the
+    // 0 default) opts a family in.
+    let serve_otlp = service_flags == 0 || (service_flags & OTLP_GRPC_SERVICE_OTLP_UNARY) != 0;
+    let serve_otap = service_flags == 0 || (service_flags & OTLP_GRPC_SERVICE_OTAP_ARROW) != 0;
+
+    // The listener serves the OTLP/gRPC unary Export services and/or the
+    // OTAP/Arrow bidirectional-streaming services, per `service_flags`.
+    // accept_compressed(Zstd): decompress zstd-compressed gRPC requests. The
+    // otel-arrow OTAP exporter sends `grpc-encoding: zstd` by default; without
+    // this every stream is rejected. Responses are left uncompressed (the
+    // BatchStatus/ExportResponse acks are tiny). Applied to all six services so
+    // OTLP/gRPC unary and OTAP/Arrow streaming both accept the wire default.
+    let logs = LogsServiceServer::new(LogsServiceImpl { ctx: ctx.clone() })
+        .max_decoding_message_size(max_decoding)
+        .accept_compressed(CompressionEncoding::Zstd);
+    let traces = TraceServiceServer::new(TraceServiceImpl { ctx: ctx.clone() })
+        .max_decoding_message_size(max_decoding)
+        .accept_compressed(CompressionEncoding::Zstd);
+    let metrics = MetricsServiceServer::new(MetricsServiceImpl { ctx: ctx.clone() })
+        .max_decoding_message_size(max_decoding)
+        .accept_compressed(CompressionEncoding::Zstd);
+    let arrow_logs = ArrowLogsServiceServer::new(ArrowLogsServiceImpl {
+        ctx: ctx.clone(),
+        stream_counter: AtomicU64::new(0),
+        cancel: cancel.clone(),
+        tracker: tracker.clone(),
+    })
+    .max_decoding_message_size(max_decoding)
+    .accept_compressed(CompressionEncoding::Zstd);
+    let arrow_traces = ArrowTracesServiceServer::new(ArrowTracesServiceImpl {
+        ctx: ctx.clone(),
+        stream_counter: AtomicU64::new(0),
+        cancel: cancel.clone(),
+        tracker: tracker.clone(),
+    })
+    .max_decoding_message_size(max_decoding)
+    .accept_compressed(CompressionEncoding::Zstd);
+    let arrow_metrics = ArrowMetricsServiceServer::new(ArrowMetricsServiceImpl {
+        ctx: ctx.clone(),
+        stream_counter: AtomicU64::new(0),
+        cancel: cancel.clone(),
+        tracker: tracker.clone(),
+    })
+    .max_decoding_message_size(max_decoding)
+    .accept_compressed(CompressionEncoding::Zstd);
+
+    let join = {
+        let _guard = runtime.enter();
+        let tokio_listener = tokio::net::TcpListener::from_std(std_listener)
+            .map_err(|e| format!("failed to register listener: {e}"))?;
+        let incoming = tokio_stream::wrappers::TcpListenerStream::new(tokio_listener);
+        runtime.spawn(async move {
+            // add_optional_service registers a family only when its flag is set;
+            // a None arm is a no-op, so an `otlp:`-only or `otap:`-only listener
+            // simply doesn't route the other family's methods.
+            tonic::transport::Server::builder()
+                .add_optional_service(serve_otlp.then_some(logs))
+                .add_optional_service(serve_otlp.then_some(traces))
+                .add_optional_service(serve_otlp.then_some(metrics))
+                .add_optional_service(serve_otap.then_some(arrow_logs))
+                .add_optional_service(serve_otap.then_some(arrow_traces))
+                .add_optional_service(serve_otap.then_some(arrow_metrics))
+                .serve_with_incoming_shutdown(incoming, async move {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+        })
+    };
+
+    Ok(OtlpGrpcServer {
+        runtime: Some(runtime),
+        shutdown_tx: Some(shutdown_tx),
+        join: Some(join),
+        cancel,
+        tracker,
+    })
 }
 
 /// Stop the server: signal graceful shutdown, drain in-flight work up to
@@ -865,14 +870,10 @@ pub unsafe extern "C" fn otlp_grpc_server_stop(
     server: *mut OtlpGrpcServer,
     drain_deadline_ms: u64,
 ) {
-    if server.is_null() {
-        return;
-    }
-    let server = &mut *server;
-    // Fence any panic (e.g. block_on re-entrancy if the "not from a callback"
-    // contract is violated) so it cannot unwind across the extern "C" boundary,
-    // which would be UB. Mirrors the catch_unwind in `otlp_grpc_server_start`.
-    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    ffi_boundary((), || {
+        let Some(server) = server.as_mut() else {
+            return;
+        };
         let deadline = std::time::Duration::from_millis(drain_deadline_ms.max(1));
         let start = std::time::Instant::now();
 
@@ -909,7 +910,7 @@ pub unsafe extern "C" fn otlp_grpc_server_stop(
                 .max(std::time::Duration::from_millis(1));
             runtime.shutdown_timeout(remaining);
         }
-    }));
+    })
 }
 
 /// Free a server handle. Call `otlp_grpc_server_stop` first.
@@ -920,9 +921,11 @@ pub unsafe extern "C" fn otlp_grpc_server_stop(
 /// freed, or null (a no-op).
 #[no_mangle]
 pub unsafe extern "C" fn otlp_grpc_server_free(server: *mut OtlpGrpcServer) {
-    if !server.is_null() {
-        drop(Box::from_raw(server));
-    }
+    ffi_boundary((), || {
+        if !server.is_null() {
+            drop(Box::from_raw(server));
+        }
+    })
 }
 
 #[cfg(test)]
