@@ -223,6 +223,10 @@ static void test_grpc_lifecycle(void) {
     otlp_grpc_server_free(server);
     otlp_grpc_server_stop(NULL, 0);
     otlp_grpc_server_free(NULL);
+
+    server = otlp_grpc_server_start(any, strlen(any), never_called, NULL, NULL, 0, 0, err, sizeof err);
+    CHECK(server != NULL);
+    otlp_grpc_server_free(server);
 }
 
 int main(int argc, char** argv) {

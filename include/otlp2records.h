@@ -435,7 +435,9 @@ typedef struct OtlpGrpcServer OtlpGrpcServer;
  * Invoked on a server worker thread. stream_id/batch_id are 0 for unary
  * requests; for streaming they identify the source stream and message.
  * input_bytes is the wire size of the source payload, charged against the
- * host's admission/backpressure budget. The array/schema are borrowed for the
+ * host's admission/backpressure budget. It is reported on the first batch
+ * delivered from a message and is 0 on the rest, so a metrics message that fans
+ * out into several shapes is charged once. The array/schema are borrowed for the
  * duration of the call only and are released by the server after it returns --
  * the callee MUST copy out only the data they reference and MUST NOT call their
  * release callbacks. Do NOT copy the ArrowArray/ArrowSchema structs themselves
@@ -445,6 +447,8 @@ typedef struct OtlpGrpcServer OtlpGrpcServer;
  * OtlpIngestStatus.
  *
  * @return OTLP_INGEST_OK on success, or an error mapped to a gRPC status.
+ *         A non-OK status for one metric shape fails the request without
+ *         delivering the later shapes; the earlier ones stay delivered.
  */
 typedef OtlpIngestStatus (*OtlpBatchCallback)(
     void* user_data,
@@ -531,18 +535,27 @@ OtlpGrpcServer* otlp_grpc_server_start_with_profile(
 );
 
 /**
- * @brief Stop the server: graceful shutdown, drain in-flight work up to the
- *        deadline, then join the runtime threads. Idempotent.
+ * @brief Stop the server. Idempotent.
+ *
+ * Stops accepting connections and drains in-flight requests for up to
+ * drain_deadline_ms. Then no new callback is started, and this waits for
+ * callbacks already running to return, however long that takes: once it
+ * returns, no batch or auth callback is running or will run, so user_data may
+ * be freed. Requests refused during shutdown are answered UNAVAILABLE.
  *
  * @param server Handle from otlp_grpc_server_start(), or NULL (a no-op)
  * @param drain_deadline_ms Max time to wait for in-flight requests to drain
  *
- * @note Must NOT be called from within a batch/auth callback.
+ * @note Called from inside a batch/auth callback it returns immediately
+ *       without stopping the server.
  */
 void otlp_grpc_server_stop(OtlpGrpcServer* server, uint64_t drain_deadline_ms);
 
 /**
- * @brief Free a server handle. Call otlp_grpc_server_stop() first.
+ * @brief Free a server handle, stopping it first if it is still running.
+ *
+ * Called from inside a batch/auth callback it returns at once, and the server
+ * stops after that callback returns.
  *
  * @param server Handle from otlp_grpc_server_start(), or NULL (a no-op)
  */
