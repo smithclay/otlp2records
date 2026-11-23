@@ -1,14 +1,14 @@
 use std::sync::Arc;
 
 use arrow_array::{
-    DurationNanosecondArray, FixedSizeBinaryArray, RecordBatch, StringArray,
-    TimestampNanosecondArray, UInt32Array,
+    Array, DurationNanosecondArray, FixedSizeBinaryArray, RecordBatch, StringArray,
+    TimestampNanosecondArray, UInt32Array, UInt8Array,
 };
-use arrow_ipc::writer::StreamWriter;
+use arrow_ipc::reader::StreamReader;
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use otlp2records::{
     otap::{ArrowPayload, ArrowPayloadType, BatchArrowRecords, OtapDecoder},
-    transform_traces, InputFormat,
+    to_ipc, transform_traces, InputFormat,
 };
 use prost::Message;
 
@@ -88,12 +88,7 @@ fn rejects_noncanonical_optional_span_column_type() {
 }
 
 fn envelope(payload_type: ArrowPayloadType, batch: RecordBatch) -> Vec<u8> {
-    let mut record = Vec::new();
-    {
-        let mut writer = StreamWriter::try_new(&mut record, &batch.schema()).unwrap();
-        writer.write(&batch).unwrap();
-        writer.finish().unwrap();
-    }
+    let record = to_ipc(&batch).unwrap();
     BatchArrowRecords {
         batch_id: 1,
         arrow_payloads: vec![ArrowPayload {
@@ -104,4 +99,84 @@ fn envelope(payload_type: ArrowPayloadType, batch: RecordBatch) -> Vec<u8> {
         headers: vec![],
     }
     .encode_to_vec()
+}
+
+fn with_payload(
+    payload_type: ArrowPayloadType,
+    edit: impl FnOnce(RecordBatch) -> RecordBatch,
+) -> Vec<u8> {
+    let mut envelope = BatchArrowRecords::decode(INITIAL_BAR).unwrap();
+    let payload = envelope
+        .arrow_payloads
+        .iter_mut()
+        .find(|p| p.r#type == payload_type as i32)
+        .expect("fixture carries the payload");
+    let batch = StreamReader::try_new(std::io::Cursor::new(&payload.record), None)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap();
+    payload.record = to_ipc(&edit(batch)).unwrap();
+    envelope.encode_to_vec()
+}
+
+fn with_column(batch: RecordBatch, name: &str, column: Arc<dyn Array>) -> RecordBatch {
+    let index = batch.schema().index_of(name).unwrap();
+    let mut columns = batch.columns().to_vec();
+    columns[index] = column;
+    RecordBatch::try_new(batch.schema(), columns).unwrap()
+}
+
+fn type_column(batch: &RecordBatch, value: u8) -> Arc<dyn Array> {
+    Arc::new(UInt8Array::from(vec![value; batch.num_rows()]))
+}
+
+#[test]
+fn rejects_unknown_any_value_type_in_span_event_attributes() {
+    let bytes = with_payload(ArrowPayloadType::SpanEventAttrs, |batch| {
+        let types = type_column(&batch, 99);
+        with_column(batch, "type", types)
+    });
+    let error = OtapDecoder::new().decode_traces(&bytes).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("span event attributes has unknown AnyValue type 99"),
+        "{error}"
+    );
+}
+
+#[test]
+fn rejects_a_declared_value_whose_payload_is_missing_in_span_link_attributes() {
+    let bytes = with_payload(ArrowPayloadType::SpanLinkAttrs, |batch| {
+        let types = type_column(&batch, 7);
+        let batch = with_column(batch, "type", types);
+        let schema = batch.schema();
+        let keep: Vec<usize> = (0..schema.fields().len())
+            .filter(|&i| schema.field(i).name() != "bytes")
+            .collect();
+        batch.project(&keep).unwrap()
+    });
+    let error = OtapDecoder::new().decode_traces(&bytes).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("span link attributes value for type 7 is missing"),
+        "{error}"
+    );
+}
+
+#[test]
+fn a_decode_error_poisons_the_decoder_for_the_rest_of_the_stream() {
+    let mut decoder = OtapDecoder::new();
+    decoder.decode_traces(INITIAL_BAR).unwrap();
+    let broken = with_payload(ArrowPayloadType::SpanEventAttrs, |batch| {
+        let types = type_column(&batch, 99);
+        with_column(batch, "type", types)
+    });
+    decoder.decode_traces(&broken).unwrap_err();
+    let error = decoder.decode_traces(REUSE_BAR).unwrap_err();
+    assert!(error.to_string().contains("poisoned"), "{error}");
+    let error = decoder.decode_traces(INITIAL_BAR).unwrap_err();
+    assert!(error.to_string().contains("poisoned"), "{error}");
 }

@@ -60,30 +60,41 @@ pub struct ArrowPayload {
     pub record: Vec<u8>,
 }
 
-/// OTLP `AnyValue` discriminants as encoded in the OTAP attribute `type`
-/// column (otel-arrow `AttributeValueType`).
-///
-/// `Map` (5) and `Slice` (6) payloads are CBOR-serialized into the `ser`
-/// column; the remaining variants map to their like-named typed columns. They
-/// are shared by the decoder (`otap::logs`) and the structural validator
-/// (`otap::validation`) so the column reader and validator cannot disagree on
-/// the numbering.
-pub(crate) const VALUE_EMPTY: u8 = 0;
-pub(crate) const VALUE_STR: u8 = 1;
-pub(crate) const VALUE_I64: u8 = 2;
-pub(crate) const VALUE_F64: u8 = 3;
-pub(crate) const VALUE_BOOL: u8 = 4;
-pub(crate) const VALUE_MAP: u8 = 5;
-pub(crate) const VALUE_SLICE: u8 = 6;
-pub(crate) const VALUE_BYTES: u8 = 7;
+/// OTLP `AnyValue` discriminant in an OTAP `type` column (otel-arrow
+/// `AttributeValueType`). `Map` and `Slice` are CBOR-serialized into `ser`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, prost::Enumeration)]
+#[repr(i32)]
+pub(crate) enum AnyValueType {
+    Empty = 0,
+    Str = 1,
+    Int = 2,
+    Double = 3,
+    Bool = 4,
+    Map = 5,
+    Slice = 6,
+    Bytes = 7,
+}
 
-/// Column names of an OTAP `AnyValue` record — the `type` discriminator plus
-/// the typed payload columns, which line up 1:1 with the `VALUE_*` constants
-/// above (`VALUE_STR` → `ATTR_STR`, etc.) — together with the attribute `key`.
-/// This same column layout backs attribute records and the log `body` struct.
-/// Shared by the structural validator (`otap::validation`) and the decoder
-/// (`otap::logs`) so a rename cannot silently desync the validator from the
-/// reader.
+impl AnyValueType {
+    pub(crate) fn from_wire(value: u8) -> Option<Self> {
+        Self::try_from(i32::from(value)).ok()
+    }
+
+    pub(crate) fn payload_column(self) -> Option<&'static str> {
+        match self {
+            Self::Empty => None,
+            Self::Str => Some(ATTR_STR),
+            Self::Int => Some(ATTR_INT),
+            Self::Double => Some(ATTR_DOUBLE),
+            Self::Bool => Some(ATTR_BOOL),
+            Self::Map | Self::Slice => Some(ATTR_SER),
+            Self::Bytes => Some(ATTR_BYTES),
+        }
+    }
+}
+
+/// Column names of an OTAP `AnyValue` record (attribute tables and the log
+/// `body` struct).
 pub(crate) const ATTR_KEY: &str = "key";
 pub(crate) const ATTR_TYPE: &str = "type";
 pub(crate) const ATTR_STR: &str = "str";

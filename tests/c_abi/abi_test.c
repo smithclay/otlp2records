@@ -172,6 +172,7 @@ static void test_otap(const char* root) {
 
     decoder = otlp_otap_decoder_new_with_profile(OTLP_ARROW_PROFILE_DUCKDB);
     CHECK(otlp_otap_decode_logs(decoder, reuse.data, reuse.len, &array, &schema) == OTLP_ERROR_PARSE_FAILED);
+    CHECK(otlp_otap_decode_logs(decoder, initial.data, initial.len, &array, &schema) == OTLP_ERROR_PARSE_FAILED);
     otlp_otap_decoder_free(decoder);
     otlp_otap_decoder_free(NULL);
 

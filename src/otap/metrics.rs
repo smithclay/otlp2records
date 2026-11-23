@@ -22,9 +22,9 @@ use super::{
     logs::{
         bool_at, build_groups, column_string, column_u16, column_u32, decode_attr_parent_ids,
         decode_delta, decode_quasi_delta, decode_root_ids, f64_at, i32_at, i64_at, id, index_u16,
-        index_u32, nested_string, nested_u32_value, replace, timestamp, validate_attr_value_rows,
-        validate_attrs, Attr16Iter, Attr32Iter, AttributeTable, AttributeTable32, OtapAttribute,
-        ResourceGroup, ScopeGroup,
+        index_u32, nested_string, nested_u32_value, replace, table, timestamp, validate_attrs,
+        Attr16Iter, Attr32Iter, AttributeTable, AttributeTable32, OtapAttribute, ResourceGroup,
+        ScopeGroup,
     },
     traces::{decode_attr_parent_ids_u32, decode_delta_u32},
 };
@@ -141,9 +141,6 @@ pub(super) fn normalize(
     ] {
         if let Some(batch) = batch {
             validate(payload, name, batch)?;
-            if matches!(payload, PayloadSchema::Attrs32) {
-                validate_attr_value_rows(name, batch)?;
-            }
         }
     }
     for (name, batch) in [
@@ -234,12 +231,12 @@ struct ExemplarTable {
 }
 
 impl ExemplarTable {
-    fn new(batch: RecordBatch, attrs: Option<RecordBatch>) -> Result<Self> {
+    fn new(kind: &str, batch: RecordBatch, attrs: Option<RecordBatch>) -> Result<Self> {
         let by_parent = index_u32(&batch, "parent_id")?;
         Ok(Self {
             batch,
             by_parent,
-            attrs: attrs.map(AttributeTable32::new).transpose()?,
+            attrs: table(&format!("{kind} exemplar attributes"), attrs)?,
         })
     }
     fn rows(&self, parent: Option<u32>) -> &[usize] {
@@ -258,6 +255,7 @@ struct PointTable {
 
 impl PointTable {
     fn new(
+        kind: &str,
         batch: Option<RecordBatch>,
         attrs: Option<RecordBatch>,
         exemplars: Option<RecordBatch>,
@@ -267,9 +265,9 @@ impl PointTable {
             .map(|batch| {
                 Ok(Self {
                     children: ChildTable::new(batch)?,
-                    attrs: attrs.map(AttributeTable32::new).transpose()?,
+                    attrs: table(&format!("{kind} data point attributes"), attrs)?,
                     exemplars: exemplars
-                        .map(|batch| ExemplarTable::new(batch, exemplar_attrs))
+                        .map(|batch| ExemplarTable::new(kind, batch, exemplar_attrs))
                         .transpose()?,
                 })
             })
@@ -315,23 +313,26 @@ impl OtapMetricsView {
         Ok(Self {
             metrics,
             resources,
-            resource_attrs: resource_attrs.map(AttributeTable::new).transpose()?,
-            scope_attrs: scope_attrs.map(AttributeTable::new).transpose()?,
-            metric_attrs: metric_attrs.map(AttributeTable::new).transpose()?,
+            resource_attrs: table("resource attributes", resource_attrs)?,
+            scope_attrs: table("scope attributes", scope_attrs)?,
+            metric_attrs: table("metric attributes", metric_attrs)?,
             number: PointTable::new(
+                "number",
                 number_points,
                 number_attrs,
                 number_exemplars,
                 number_exemplar_attrs,
             )?,
-            summary: PointTable::new(summary_points, summary_attrs, None, None)?,
+            summary: PointTable::new("summary", summary_points, summary_attrs, None, None)?,
             histogram: PointTable::new(
+                "histogram",
                 histogram_points,
                 histogram_attrs,
                 histogram_exemplars,
                 histogram_exemplar_attrs,
             )?,
             exp_histogram: PointTable::new(
+                "exponential histogram",
                 exp_histogram_points,
                 exp_histogram_attrs,
                 exp_histogram_exemplars,

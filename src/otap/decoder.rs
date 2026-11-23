@@ -41,9 +41,76 @@ impl StreamState {
 /// A decoder instance must be retained for the lifetime of an OTAP stream
 /// because later `BatchArrowRecords` messages can omit schemas and reuse Arrow
 /// dictionaries established by earlier messages.
+///
+/// Any error poisons the decoder: a failed message may have advanced some of
+/// its payload streams and not others, so every later call fails too. Start a
+/// new decoder for a new stream.
 #[derive(Default)]
 pub struct OtapDecoder {
     streams: HashMap<String, StreamState>,
+    poisoned: Option<String>,
+}
+
+struct Signal {
+    name: &'static str,
+    root: ArrowPayloadType,
+    accepts: &'static [ArrowPayloadType],
+}
+
+const LOGS: Signal = Signal {
+    name: "logs",
+    root: ArrowPayloadType::Logs,
+    accepts: &[
+        ArrowPayloadType::ResourceAttrs,
+        ArrowPayloadType::ScopeAttrs,
+        ArrowPayloadType::LogAttrs,
+    ],
+};
+
+const TRACES: Signal = Signal {
+    name: "traces",
+    root: ArrowPayloadType::Spans,
+    accepts: &[
+        ArrowPayloadType::ResourceAttrs,
+        ArrowPayloadType::ScopeAttrs,
+        ArrowPayloadType::SpanAttrs,
+        ArrowPayloadType::SpanEvents,
+        ArrowPayloadType::SpanLinks,
+        ArrowPayloadType::SpanEventAttrs,
+        ArrowPayloadType::SpanLinkAttrs,
+    ],
+};
+
+const METRICS: Signal = Signal {
+    name: "metrics",
+    root: ArrowPayloadType::UnivariateMetrics,
+    accepts: &[
+        ArrowPayloadType::ResourceAttrs,
+        ArrowPayloadType::ScopeAttrs,
+        ArrowPayloadType::NumberDataPoints,
+        ArrowPayloadType::SummaryDataPoints,
+        ArrowPayloadType::HistogramDataPoints,
+        ArrowPayloadType::ExpHistogramDataPoints,
+        ArrowPayloadType::NumberDpAttrs,
+        ArrowPayloadType::SummaryDpAttrs,
+        ArrowPayloadType::HistogramDpAttrs,
+        ArrowPayloadType::ExpHistogramDpAttrs,
+        ArrowPayloadType::NumberDpExemplars,
+        ArrowPayloadType::HistogramDpExemplars,
+        ArrowPayloadType::ExpHistogramDpExemplars,
+        ArrowPayloadType::NumberDpExemplarAttrs,
+        ArrowPayloadType::HistogramDpExemplarAttrs,
+        ArrowPayloadType::ExpHistogramDpExemplarAttrs,
+        ArrowPayloadType::MetricAttrs,
+    ],
+};
+
+struct Payloads(HashMap<ArrowPayloadType, RecordBatch>);
+
+impl Payloads {
+    fn take(&mut self, payload_type: ArrowPayloadType) -> Option<RecordBatch> {
+        self.0.remove(&payload_type)
+    }
 }
 
 impl OtapDecoder {
@@ -55,28 +122,28 @@ impl OtapDecoder {
 
     /// Decodes one canonical `BatchArrowRecords` message into normalized logs.
     pub fn decode_logs(&mut self, bytes: &[u8]) -> Result<RecordBatch> {
-        let envelope = BatchArrowRecords::decode(bytes)?;
-        self.decode_logs_envelope(envelope, bytes.len())
+        self.guarded(|decoder| {
+            let envelope = BatchArrowRecords::decode(bytes)?;
+            decoder.logs(envelope, bytes.len())
+        })
     }
 
-    /// Decodes one already-deserialized `BatchArrowRecords` into normalized logs,
-    /// reusing dictionary/schema state from earlier messages on this decoder.
-    ///
-    /// Used by the gRPC streaming path, where tonic has already decoded the
-    /// protobuf envelope; `input_bytes` is the wire size (for builder sizing and
-    /// admission accounting). `decode_logs` is the equivalent for raw bytes.
+    /// Decodes one already-deserialized `BatchArrowRecords` into normalized logs.
+    /// `input_bytes` is its wire size, used to size the output builders.
     pub fn decode_logs_message(
         &mut self,
         envelope: BatchArrowRecords,
         input_bytes: usize,
     ) -> Result<RecordBatch> {
-        self.decode_logs_envelope(envelope, input_bytes)
+        self.guarded(|decoder| decoder.logs(envelope, input_bytes))
     }
 
     /// Decodes one canonical `BatchArrowRecords` message into normalized traces.
     pub fn decode_traces(&mut self, bytes: &[u8]) -> Result<RecordBatch> {
-        let envelope = BatchArrowRecords::decode(bytes)?;
-        self.decode_traces_envelope(envelope, bytes.len())
+        self.guarded(|decoder| {
+            let envelope = BatchArrowRecords::decode(bytes)?;
+            decoder.traces(envelope, bytes.len())
+        })
     }
 
     /// Decodes one already-deserialized `BatchArrowRecords` into normalized
@@ -86,151 +153,100 @@ impl OtapDecoder {
         envelope: BatchArrowRecords,
         input_bytes: usize,
     ) -> Result<RecordBatch> {
-        self.decode_traces_envelope(envelope, input_bytes)
+        self.guarded(|decoder| decoder.traces(envelope, input_bytes))
     }
 
     /// Decodes one canonical `BatchArrowRecords` message into normalized metrics.
     pub fn decode_metrics(&mut self, bytes: &[u8]) -> Result<MetricBatches> {
-        let envelope = BatchArrowRecords::decode(bytes)?;
-        self.decode_metrics_envelope(envelope)
+        self.guarded(|decoder| decoder.metrics(BatchArrowRecords::decode(bytes)?))
     }
 
     /// Decodes one already-deserialized `BatchArrowRecords` into normalized
     /// metric shapes (the streaming counterpart of [`Self::decode_metrics`]).
     pub fn decode_metrics_message(&mut self, envelope: BatchArrowRecords) -> Result<MetricBatches> {
-        self.decode_metrics_envelope(envelope)
+        self.guarded(|decoder| decoder.metrics(envelope))
     }
 
-    fn decode_logs_envelope(
-        &mut self,
-        envelope: BatchArrowRecords,
-        input_bytes: usize,
-    ) -> Result<RecordBatch> {
-        let mut decoded = HashMap::new();
-
-        for payload in envelope.arrow_payloads {
-            let payload_type = ArrowPayloadType::try_from(payload.r#type).map_err(|_| {
-                Error::Otap(format!("unknown Arrow payload type {}", payload.r#type))
-            })?;
-            if !matches!(
-                payload_type,
-                ArrowPayloadType::ResourceAttrs
-                    | ArrowPayloadType::ScopeAttrs
-                    | ArrowPayloadType::Logs
-                    | ArrowPayloadType::LogAttrs
-            ) {
-                return Err(Error::Otap(format!(
-                    "payload type {payload_type:?} is not valid for logs"
-                )));
-            }
-            if decoded.contains_key(&payload_type) {
-                return Err(Error::Otap(format!(
-                    "duplicate {payload_type:?} payload in batch {}",
-                    envelope.batch_id
-                )));
-            }
-
-            let batch = self.decode_payload(payload_type, payload)?;
-            let _ = decoded.insert(payload_type, batch);
+    fn guarded<T>(&mut self, decode: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        if let Some(cause) = &self.poisoned {
+            return Err(Error::Otap(format!(
+                "OTAP decoder is poisoned by an earlier error ({cause}); start a new decoder"
+            )));
         }
+        decode(self).inspect_err(|error| self.poisoned = Some(error.to_string()))
+    }
 
-        let logs = decoded
-            .remove(&ArrowPayloadType::Logs)
-            .ok_or_else(|| Error::Otap("missing required Logs payload".into()))?;
+    fn logs(&mut self, envelope: BatchArrowRecords, input_bytes: usize) -> Result<RecordBatch> {
+        let (root, mut p) = self.payloads(&LOGS, envelope)?;
         super::logs::normalize(
-            logs,
-            decoded.remove(&ArrowPayloadType::ResourceAttrs),
-            decoded.remove(&ArrowPayloadType::ScopeAttrs),
-            decoded.remove(&ArrowPayloadType::LogAttrs),
+            root,
+            p.take(ArrowPayloadType::ResourceAttrs),
+            p.take(ArrowPayloadType::ScopeAttrs),
+            p.take(ArrowPayloadType::LogAttrs),
             input_bytes,
         )
     }
 
-    fn decode_traces_envelope(
-        &mut self,
-        envelope: BatchArrowRecords,
-        input_bytes: usize,
-    ) -> Result<RecordBatch> {
-        let mut decoded = HashMap::new();
-        for payload in envelope.arrow_payloads {
-            let payload_type = ArrowPayloadType::try_from(payload.r#type).map_err(|_| {
-                Error::Otap(format!("unknown Arrow payload type {}", payload.r#type))
-            })?;
-            if !matches!(
-                payload_type,
-                ArrowPayloadType::ResourceAttrs
-                    | ArrowPayloadType::ScopeAttrs
-                    | ArrowPayloadType::Spans
-                    | ArrowPayloadType::SpanAttrs
-                    | ArrowPayloadType::SpanEvents
-                    | ArrowPayloadType::SpanLinks
-                    | ArrowPayloadType::SpanEventAttrs
-                    | ArrowPayloadType::SpanLinkAttrs
-            ) {
-                return Err(Error::Otap(format!(
-                    "payload type {payload_type:?} is not valid for traces"
-                )));
-            }
-            if decoded.contains_key(&payload_type) {
-                return Err(Error::Otap(format!(
-                    "duplicate {payload_type:?} payload in batch {}",
-                    envelope.batch_id
-                )));
-            }
-            let batch = self.decode_payload(payload_type, payload)?;
-            let _ = decoded.insert(payload_type, batch);
-        }
-        let spans = decoded
-            .remove(&ArrowPayloadType::Spans)
-            .ok_or_else(|| Error::Otap("missing required Spans payload".into()))?;
+    fn traces(&mut self, envelope: BatchArrowRecords, input_bytes: usize) -> Result<RecordBatch> {
+        let (root, mut p) = self.payloads(&TRACES, envelope)?;
         super::traces::normalize(
-            spans,
-            decoded.remove(&ArrowPayloadType::ResourceAttrs),
-            decoded.remove(&ArrowPayloadType::ScopeAttrs),
-            decoded.remove(&ArrowPayloadType::SpanAttrs),
-            decoded.remove(&ArrowPayloadType::SpanEvents),
-            decoded.remove(&ArrowPayloadType::SpanEventAttrs),
-            decoded.remove(&ArrowPayloadType::SpanLinks),
-            decoded.remove(&ArrowPayloadType::SpanLinkAttrs),
+            root,
+            p.take(ArrowPayloadType::ResourceAttrs),
+            p.take(ArrowPayloadType::ScopeAttrs),
+            p.take(ArrowPayloadType::SpanAttrs),
+            p.take(ArrowPayloadType::SpanEvents),
+            p.take(ArrowPayloadType::SpanEventAttrs),
+            p.take(ArrowPayloadType::SpanLinks),
+            p.take(ArrowPayloadType::SpanLinkAttrs),
             input_bytes,
         )
     }
 
-    fn decode_metrics_envelope(&mut self, envelope: BatchArrowRecords) -> Result<MetricBatches> {
+    fn metrics(&mut self, envelope: BatchArrowRecords) -> Result<MetricBatches> {
+        let (root, mut p) = self.payloads(&METRICS, envelope)?;
+        use ArrowPayloadType as T;
+        super::metrics::normalize(
+            root,
+            p.take(T::ResourceAttrs),
+            p.take(T::ScopeAttrs),
+            p.take(T::MetricAttrs),
+            p.take(T::NumberDataPoints),
+            p.take(T::SummaryDataPoints),
+            p.take(T::HistogramDataPoints),
+            p.take(T::ExpHistogramDataPoints),
+            p.take(T::NumberDpAttrs),
+            p.take(T::SummaryDpAttrs),
+            p.take(T::HistogramDpAttrs),
+            p.take(T::ExpHistogramDpAttrs),
+            p.take(T::NumberDpExemplars),
+            p.take(T::HistogramDpExemplars),
+            p.take(T::ExpHistogramDpExemplars),
+            p.take(T::NumberDpExemplarAttrs),
+            p.take(T::HistogramDpExemplarAttrs),
+            p.take(T::ExpHistogramDpExemplarAttrs),
+        )
+    }
+
+    fn payloads(
+        &mut self,
+        signal: &Signal,
+        envelope: BatchArrowRecords,
+    ) -> Result<(RecordBatch, Payloads)> {
         let mut decoded = HashMap::new();
         for payload in envelope.arrow_payloads {
             let payload_type = ArrowPayloadType::try_from(payload.r#type).map_err(|_| {
                 Error::Otap(format!("unknown Arrow payload type {}", payload.r#type))
             })?;
-            if !matches!(
-                payload_type,
-                ArrowPayloadType::ResourceAttrs
-                    | ArrowPayloadType::ScopeAttrs
-                    | ArrowPayloadType::UnivariateMetrics
-                    | ArrowPayloadType::NumberDataPoints
-                    | ArrowPayloadType::SummaryDataPoints
-                    | ArrowPayloadType::HistogramDataPoints
-                    | ArrowPayloadType::ExpHistogramDataPoints
-                    | ArrowPayloadType::NumberDpAttrs
-                    | ArrowPayloadType::SummaryDpAttrs
-                    | ArrowPayloadType::HistogramDpAttrs
-                    | ArrowPayloadType::ExpHistogramDpAttrs
-                    | ArrowPayloadType::NumberDpExemplars
-                    | ArrowPayloadType::HistogramDpExemplars
-                    | ArrowPayloadType::ExpHistogramDpExemplars
-                    | ArrowPayloadType::NumberDpExemplarAttrs
-                    | ArrowPayloadType::HistogramDpExemplarAttrs
-                    | ArrowPayloadType::ExpHistogramDpExemplarAttrs
-                    | ArrowPayloadType::MetricAttrs
-            ) {
-                if payload_type == ArrowPayloadType::MultivariateMetrics {
-                    return Err(Error::Otap(
-                        "MultivariateMetrics is not supported because upstream has no canonical schema"
-                            .into(),
-                    ));
-                }
+            if payload_type == ArrowPayloadType::MultivariateMetrics {
+                return Err(Error::Otap(
+                    "MultivariateMetrics is not supported because upstream has no canonical schema"
+                        .into(),
+                ));
+            }
+            if payload_type != signal.root && !signal.accepts.contains(&payload_type) {
                 return Err(Error::Otap(format!(
-                    "payload type {payload_type:?} is not valid for metrics"
+                    "payload type {payload_type:?} is not valid for {}",
+                    signal.name
                 )));
             }
             if decoded.contains_key(&payload_type) {
@@ -240,31 +256,13 @@ impl OtapDecoder {
                 )));
             }
             let batch = self.decode_payload(payload_type, payload)?;
-            let _ = decoded.insert(payload_type, batch);
+            decoded.insert(payload_type, batch);
         }
-        let metrics = decoded
-            .remove(&ArrowPayloadType::UnivariateMetrics)
-            .ok_or_else(|| Error::Otap("missing required UnivariateMetrics payload".into()))?;
-        super::metrics::normalize(
-            metrics,
-            decoded.remove(&ArrowPayloadType::ResourceAttrs),
-            decoded.remove(&ArrowPayloadType::ScopeAttrs),
-            decoded.remove(&ArrowPayloadType::MetricAttrs),
-            decoded.remove(&ArrowPayloadType::NumberDataPoints),
-            decoded.remove(&ArrowPayloadType::SummaryDataPoints),
-            decoded.remove(&ArrowPayloadType::HistogramDataPoints),
-            decoded.remove(&ArrowPayloadType::ExpHistogramDataPoints),
-            decoded.remove(&ArrowPayloadType::NumberDpAttrs),
-            decoded.remove(&ArrowPayloadType::SummaryDpAttrs),
-            decoded.remove(&ArrowPayloadType::HistogramDpAttrs),
-            decoded.remove(&ArrowPayloadType::ExpHistogramDpAttrs),
-            decoded.remove(&ArrowPayloadType::NumberDpExemplars),
-            decoded.remove(&ArrowPayloadType::HistogramDpExemplars),
-            decoded.remove(&ArrowPayloadType::ExpHistogramDpExemplars),
-            decoded.remove(&ArrowPayloadType::NumberDpExemplarAttrs),
-            decoded.remove(&ArrowPayloadType::HistogramDpExemplarAttrs),
-            decoded.remove(&ArrowPayloadType::ExpHistogramDpExemplarAttrs),
-        )
+        let mut payloads = Payloads(decoded);
+        let root = payloads
+            .take(signal.root)
+            .ok_or_else(|| Error::Otap(format!("missing required {:?} payload", signal.root)))?;
+        Ok((root, payloads))
     }
 
     fn decode_payload(
