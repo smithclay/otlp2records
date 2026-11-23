@@ -1,3 +1,6 @@
 disallowed-methods = [
     { path = "std::panic::catch_unwind", reason = "C ABI code catches panics only through `ffi_export::ffi_boundary`, the one place that turns a panic into the entry point's error value" },
+    { path = "tokio::spawn", reason = "spawn server work with the server's `TaskTracker` (`tracker.spawn`) so `otlp_grpc_server_stop` can await it; a detached task can call into the host after stop returns" },
+    { path = "tokio::task::spawn", reason = "spawn server work with the server's `TaskTracker` (`tracker.spawn`) so `otlp_grpc_server_stop` can await it; a detached task can call into the host after stop returns" },
+    { path = "tokio::task::spawn_blocking", reason = "blocking tasks outlive `Runtime::shutdown_timeout`; run host calls on the server's tracked tasks behind its `CallbackGate`" },
 ]

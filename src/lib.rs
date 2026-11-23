@@ -42,12 +42,17 @@ pub mod ffi;
 #[path = "bindings/export.rs"]
 mod ffi_export;
 
-// Native gRPC ingest server FFI. Gated on the `grpc` feature (which pulls in a
-// tokio runtime + tonic transport) and never compiled for wasm32, which has no
-// runtime or sockets.
 #[cfg(all(feature = "grpc", not(target_arch = "wasm32")))]
 #[path = "bindings/grpc_ffi.rs"]
 pub mod grpc_ffi;
+
+#[cfg(all(feature = "grpc", not(target_arch = "wasm32")))]
+#[path = "bindings/grpc_gate.rs"]
+mod grpc_gate;
+
+#[cfg(all(test, feature = "grpc", not(target_arch = "wasm32")))]
+#[path = "bindings/grpc_lifecycle_model.rs"]
+mod grpc_lifecycle_model;
 
 #[cfg(all(feature = "wasm", target_arch = "wasm32"))]
 #[path = "bindings/wasm.rs"]
