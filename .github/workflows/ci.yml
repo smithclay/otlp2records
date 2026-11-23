@@ -68,6 +68,29 @@ jobs:
       - name: Run tests
         run: cargo test --all-features
 
+  c-abi:
+    name: C ABI (ASan/LSan/UBSan)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1.97.1
+
+      - name: Cache cargo registry
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-c-abi-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-c-abi-
+
+      - name: Compile tests/c_abi against include/otlp2records.h and run it
+        run: ./tools/c-abi-test.sh
+
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
@@ -93,7 +116,7 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Run clippy
-        run: cargo clippy --all-features -- -D warnings
+        run: cargo clippy --all-features --all-targets -- -D warnings
 
   fmt:
     name: Format

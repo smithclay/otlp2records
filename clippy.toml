@@ -1,0 +1,3 @@
+disallowed-methods = [
+    { path = "std::panic::catch_unwind", reason = "C ABI code catches panics only through `ffi_export::ffi_boundary`, the one place that turns a panic into the entry point's error value" },
+]

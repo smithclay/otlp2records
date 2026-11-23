@@ -1,32 +1,18 @@
-//! C FFI bindings for otlp2records
-//!
-//! Exposes one-shot OTLP transforms via Arrow C Data Interface.
-//!
-//! # Safety
-//!
-//! All functions use `catch_unwind` to prevent Rust panics crossing FFI boundary.
-//! Pointer validation is performed before dereferencing.
-//!
-//! # Memory Ownership
-//!
-//! - Input data: Caller owns, Rust borrows during function call
-//! - ArrowSchema/ArrowArray: Rust allocates, caller must call `release()` callback
+//! C ABI for the one-shot transforms and the stateful OTAP decoder.
 
-use std::ffi::{c_char, c_int};
-use std::sync::Arc;
+use std::ffi::c_char;
 
 use arrow_array::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
-use arrow_array::{Array, RecordBatch};
+use arrow_array::RecordBatch;
+use arrow_schema::Schema;
 
 use crate::decode::InputFormat;
+use crate::ffi_export::{ffi_boundary, ExportError, ExportedBatch, ExportedMetrics};
+pub use crate::ffi_export::{OtlpArrowBatch, OtlpMetricsArrowBatches};
 use crate::{
     exp_histogram_schema, gauge_schema, histogram_schema, logs_schema, sum_schema, traces_schema,
     transform_logs, transform_metrics, transform_traces, ArrowProfile,
 };
-
-// ============================================================================
-// C-compatible enums
-// ============================================================================
 
 /// OTLP signal types supported by the transformer.
 ///
@@ -46,6 +32,19 @@ pub enum OtlpSignalType {
     MetricsHistogram = 4,
     /// Exponential histogram metrics (C: OTLP_SIGNAL_METRICS_EXP_HISTOGRAM)
     MetricsExpHistogram = 5,
+}
+
+impl OtlpSignalType {
+    fn schema(self) -> Schema {
+        match self {
+            OtlpSignalType::Logs => logs_schema(),
+            OtlpSignalType::Traces => traces_schema(),
+            OtlpSignalType::MetricsGauge => gauge_schema(),
+            OtlpSignalType::MetricsSum => sum_schema(),
+            OtlpSignalType::MetricsHistogram => histogram_schema(),
+            OtlpSignalType::MetricsExpHistogram => exp_histogram_schema(),
+        }
+    }
 }
 
 /// Input format for OTLP data.
@@ -114,34 +113,29 @@ pub enum OtlpStatus {
     Internal = 3,
 }
 
-/// One optional Arrow batch returned by `otlp_transform_metrics_all`.
-///
-/// If `present` is 0, `array` and `schema` are not initialized and must not be
-/// released by the caller. If `present` is non-zero, the caller owns both and
-/// must call their Arrow C Data release callbacks.
-#[repr(C)]
-pub struct OtlpArrowBatch {
-    pub array: FFI_ArrowArray,
-    pub schema: FFI_ArrowSchema,
-    pub present: c_int,
+impl From<ExportError> for OtlpStatus {
+    fn from(error: ExportError) -> Self {
+        match error {
+            ExportError::Unrepresentable => OtlpStatus::ParseFailed,
+            ExportError::SchemaNotExportable => OtlpStatus::Internal,
+        }
+    }
 }
 
-/// Output batches for all normalized metric shapes.
-#[repr(C)]
-pub struct OtlpMetricsArrowBatches {
-    pub gauge: OtlpArrowBatch,
-    pub sum: OtlpArrowBatch,
-    pub histogram: OtlpArrowBatch,
-    pub exp_histogram: OtlpArrowBatch,
-    pub skipped_summaries: u64,
-    pub skipped_nan_values: u64,
-    pub skipped_infinity_values: u64,
-    pub skipped_missing_values: u64,
+unsafe fn export_batch(
+    profile: ArrowProfile,
+    batch: RecordBatch,
+    out_array: *mut FFI_ArrowArray,
+    out_schema: *mut FFI_ArrowSchema,
+) -> OtlpStatus {
+    match ExportedBatch::new(profile, batch) {
+        Ok(exported) => {
+            exported.write_to(out_array, out_schema);
+            OtlpStatus::Ok
+        }
+        Err(error) => error.into(),
+    }
 }
-
-// ============================================================================
-// FFI Functions - Schema Access
-// ============================================================================
 
 /// Get the Arrow schema for a signal type.
 ///
@@ -149,10 +143,6 @@ pub struct OtlpMetricsArrowBatches {
 ///
 /// - `out_schema` must be a valid pointer to FFI_ArrowSchema
 /// - Caller must call `out_schema->release()` when done
-///
-/// # Returns
-///
-/// `OTLP_OK` on success, error code otherwise.
 #[no_mangle]
 pub unsafe extern "C" fn otlp_get_schema(
     signal_type: OtlpSignalType,
@@ -174,21 +164,11 @@ pub unsafe extern "C" fn otlp_get_schema_with_profile(
     profile: OtlpArrowProfile,
     out_schema: *mut FFI_ArrowSchema,
 ) -> OtlpStatus {
-    if out_schema.is_null() {
-        return OtlpStatus::InvalidArgument;
-    }
-
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let schema = match signal_type {
-            OtlpSignalType::Logs => logs_schema(),
-            OtlpSignalType::Traces => traces_schema(),
-            OtlpSignalType::MetricsGauge => gauge_schema(),
-            OtlpSignalType::MetricsSum => sum_schema(),
-            OtlpSignalType::MetricsHistogram => histogram_schema(),
-            OtlpSignalType::MetricsExpHistogram => exp_histogram_schema(),
-        };
-        let schema = ArrowProfile::from(profile).schema(&schema);
-
+    ffi_boundary(OtlpStatus::Internal, || {
+        if out_schema.is_null() {
+            return OtlpStatus::InvalidArgument;
+        }
+        let schema = ArrowProfile::from(profile).schema(&signal_type.schema());
         match FFI_ArrowSchema::try_from(&schema) {
             Ok(ffi_schema) => {
                 std::ptr::write(out_schema, ffi_schema);
@@ -196,128 +176,7 @@ pub unsafe extern "C" fn otlp_get_schema_with_profile(
             }
             Err(_) => OtlpStatus::Internal,
         }
-    }))
-    .unwrap_or(OtlpStatus::Internal)
-}
-
-// ============================================================================
-// FFI Functions - One-Shot API
-// ============================================================================
-
-unsafe fn export_record_batch(
-    batch: RecordBatch,
-    out_array: *mut FFI_ArrowArray,
-    out_schema: *mut FFI_ArrowSchema,
-) -> Result<(), OtlpStatus> {
-    let schema = batch.schema();
-    let ffi_schema =
-        FFI_ArrowSchema::try_from(schema.as_ref()).map_err(|_| OtlpStatus::Internal)?;
-
-    let struct_array: arrow_array::StructArray = batch.into();
-    let array_data = struct_array.into_data();
-    let ffi_array = FFI_ArrowArray::new(&array_data);
-
-    // Both FFI structs are fully built above; the only remaining work is two infallible
-    // `ptr::write`s. Write the array first, then the schema: the Arrow C Data Interface
-    // convention is array-before-schema, and keeping the final write infallible means no
-    // fallible call can land between them. The C++ contract is "OK => both out-params written;
-    // non-OK => nothing to release" (callers treat any non-OK status as no batch present).
-    std::ptr::write(out_array, ffi_array);
-    std::ptr::write(out_schema, ffi_schema);
-
-    Ok(())
-}
-
-unsafe fn export_optional_metric_batch(
-    batch: Option<RecordBatch>,
-    out_batch: *mut OtlpArrowBatch,
-) -> Result<(), OtlpStatus> {
-    (*out_batch).present = 0;
-    if let Some(batch) = batch {
-        export_record_batch(
-            batch,
-            std::ptr::addr_of_mut!((*out_batch).array),
-            std::ptr::addr_of_mut!((*out_batch).schema),
-        )?;
-        (*out_batch).present = 1;
-    }
-    Ok(())
-}
-
-/// Release an already-exported batch, restoring the "nothing to release" invariant.
-///
-/// If `present` is non-zero, the batch's `array`/`schema` were written by
-/// `export_optional_metric_batch` and own C Data Interface resources. We swap each field for an
-/// `empty()` FFI struct (whose `release` callback is null) and drop the old value, which invokes
-/// its release callback — the same way the `arrow` crate frees an exported
-/// `FFI_ArrowArray`/`FFI_ArrowSchema` anywhere else. Swapping (rather than reading and leaving
-/// stale bytes) means a later drop of the field is a harmless no-op, so there is no risk of a
-/// double-release. `present` is reset to 0 so the caller never observes a released batch.
-unsafe fn release_exported_metric_batch(out_batch: *mut OtlpArrowBatch) {
-    if (*out_batch).present != 0 {
-        let old_array = std::ptr::replace(
-            std::ptr::addr_of_mut!((*out_batch).array),
-            FFI_ArrowArray::empty(),
-        );
-        let old_schema = std::ptr::replace(
-            std::ptr::addr_of_mut!((*out_batch).schema),
-            FFI_ArrowSchema::empty(),
-        );
-        (*out_batch).present = 0;
-        drop(old_array);
-        drop(old_schema);
-    }
-}
-
-/// Export the four normalized metric shapes into `out_batches` and copy the
-/// skipped-metric counters.
-///
-/// Honors the C1 rollback invariant: if any shape's export fails mid-sequence,
-/// every already-exported batch is released so a non-OK return leaves nothing
-/// `present` to release. Callers must zero-initialize `out_batches` and invoke
-/// this inside `catch_unwind`. Shared by the one-shot (`transform_metrics`) and
-/// streaming OTAP (`decode_metrics`) paths so the invariant has one home.
-///
-/// # Safety
-///
-/// `out_batches` must be a valid, writable pointer to a zero-initialized
-/// `OtlpMetricsArrowBatches`.
-unsafe fn export_metric_batches(
-    batches: crate::MetricBatches,
-    profile: ArrowProfile,
-    out_batches: *mut OtlpMetricsArrowBatches,
-) -> OtlpStatus {
-    // Re-type before anything is exported, so a profile error leaves nothing present.
-    let batches = match profile.apply_metrics(batches) {
-        Ok(batches) => batches,
-        Err(_) => return OtlpStatus::ParseFailed,
-    };
-    let skipped = batches.skipped;
-
-    let gauge_ptr = std::ptr::addr_of_mut!((*out_batches).gauge);
-    let sum_ptr = std::ptr::addr_of_mut!((*out_batches).sum);
-    let histogram_ptr = std::ptr::addr_of_mut!((*out_batches).histogram);
-    let exp_histogram_ptr = std::ptr::addr_of_mut!((*out_batches).exp_histogram);
-
-    let export_result = export_optional_metric_batch(batches.gauge, gauge_ptr)
-        .and_then(|_| export_optional_metric_batch(batches.sum, sum_ptr))
-        .and_then(|_| export_optional_metric_batch(batches.histogram, histogram_ptr))
-        .and_then(|_| export_optional_metric_batch(batches.exp_histogram, exp_histogram_ptr));
-
-    if export_result.is_err() {
-        release_exported_metric_batch(gauge_ptr);
-        release_exported_metric_batch(sum_ptr);
-        release_exported_metric_batch(histogram_ptr);
-        release_exported_metric_batch(exp_histogram_ptr);
-        return OtlpStatus::Internal;
-    }
-
-    (*out_batches).skipped_summaries = skipped.summaries as u64;
-    (*out_batches).skipped_nan_values = skipped.nan_values as u64;
-    (*out_batches).skipped_infinity_values = skipped.infinity_values as u64;
-    (*out_batches).skipped_missing_values = skipped.missing_values as u64;
-
-    OtlpStatus::Ok
+    })
 }
 
 /// Transform OTLP bytes to Arrow in one call (non-streaming).
@@ -327,10 +186,6 @@ unsafe fn export_metric_batches(
 /// - `data` must be valid for `len` bytes
 /// - `out_array` and `out_schema` must be valid pointers
 /// - Caller must call `release()` on both out_array and out_schema
-///
-/// # Returns
-///
-/// `OTLP_OK` on success, error code otherwise.
 #[no_mangle]
 pub unsafe extern "C" fn otlp_transform(
     signal_type: OtlpSignalType,
@@ -353,9 +208,10 @@ pub unsafe extern "C" fn otlp_transform(
 
 /// Transform OTLP bytes to Arrow in one call, under an output profile.
 ///
-/// `OTLP_ARROW_PROFILE_CANONICAL` is identical to `otlp_transform`. Under
-/// `OTLP_ARROW_PROFILE_DUCKDB`, a value the profile cannot represent (an
-/// unsigned integer above the signed maximum) returns `OTLP_ERROR_PARSE_FAILED`.
+/// Only single-shape signals (logs, traces) are accepted; metric signals return
+/// `OTLP_ERROR_INVALID_ARGUMENT` because `otlp_transform_metrics_all` returns
+/// every shape from one parse. Under `OTLP_ARROW_PROFILE_DUCKDB`, a value the
+/// profile cannot represent returns `OTLP_ERROR_PARSE_FAILED`.
 ///
 /// # Safety
 ///
@@ -370,54 +226,25 @@ pub unsafe extern "C" fn otlp_transform_with_profile(
     out_array: *mut FFI_ArrowArray,
     out_schema: *mut FFI_ArrowSchema,
 ) -> OtlpStatus {
-    if data.is_null() || out_array.is_null() || out_schema.is_null() {
-        return OtlpStatus::InvalidArgument;
-    }
-
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let slice = std::slice::from_raw_parts(data, len);
-        let format: InputFormat = format.into();
-
-        // otlp_transform is the canonical verb for single-shape signals (Logs/Traces) only.
-        // Metric signals have four shape-specific schemas from a single parse; callers must use
-        // otlp_transform_metrics_all (which returns all shapes from one parse) instead of having
-        // this function parse-and-discard 3 of 4 shapes. Reject metric signals here.
-        let batch_result = match signal_type {
-            OtlpSignalType::Logs => transform_logs(slice, format).map(Some),
-            OtlpSignalType::Traces => transform_traces(slice, format).map(Some),
+    ffi_boundary(OtlpStatus::Internal, || {
+        if data.is_null() || out_array.is_null() || out_schema.is_null() {
+            return OtlpStatus::InvalidArgument;
+        }
+        let input = std::slice::from_raw_parts(data, len);
+        let format = InputFormat::from(format);
+        let transformed = match signal_type {
+            OtlpSignalType::Logs => transform_logs(input, format),
+            OtlpSignalType::Traces => transform_traces(input, format),
             OtlpSignalType::MetricsGauge
             | OtlpSignalType::MetricsSum
             | OtlpSignalType::MetricsHistogram
-            | OtlpSignalType::MetricsExpHistogram => {
-                return OtlpStatus::InvalidArgument;
-            }
+            | OtlpSignalType::MetricsExpHistogram => return OtlpStatus::InvalidArgument,
         };
-
-        let profile = ArrowProfile::from(profile);
-        let batch_result =
-            batch_result.and_then(|batch| batch.map(|b| profile.apply(b)).transpose());
-        match batch_result {
-            Ok(Some(batch)) => export_record_batch(batch, out_array, out_schema)
-                .map_or_else(|status| status, |_| OtlpStatus::Ok),
-            Ok(None) => {
-                // No data of this type - create empty batch
-                let schema = match signal_type {
-                    OtlpSignalType::Logs => logs_schema(),
-                    OtlpSignalType::Traces => traces_schema(),
-                    OtlpSignalType::MetricsGauge => gauge_schema(),
-                    OtlpSignalType::MetricsSum => sum_schema(),
-                    OtlpSignalType::MetricsHistogram => histogram_schema(),
-                    OtlpSignalType::MetricsExpHistogram => exp_histogram_schema(),
-                };
-
-                let empty_batch = RecordBatch::new_empty(Arc::new(profile.schema(&schema)));
-                export_record_batch(empty_batch, out_array, out_schema)
-                    .map_or_else(|status| status, |_| OtlpStatus::Ok)
-            }
-            Err(_) => OtlpStatus::ParseFailed,
-        }
-    }))
-    .unwrap_or(OtlpStatus::Internal)
+        let Ok(batch) = transformed else {
+            return OtlpStatus::ParseFailed;
+        };
+        export_batch(profile.into(), batch, out_array, out_schema)
+    })
 }
 
 /// Transform OTLP metric bytes to all metric Arrow batches in one parse.
@@ -427,10 +254,6 @@ pub unsafe extern "C" fn otlp_transform_with_profile(
 /// - `data` must be valid for `len` bytes
 /// - `out_batches` must be a valid pointer to `OtlpMetricsArrowBatches`
 /// - Caller must release array/schema for every output whose `present` is non-zero
-///
-/// # Returns
-///
-/// `OTLP_OK` on success, error code otherwise.
 #[no_mangle]
 pub unsafe extern "C" fn otlp_transform_metrics_all(
     format: OtlpInputFormat,
@@ -465,47 +288,41 @@ pub unsafe extern "C" fn otlp_transform_metrics_all_with_profile(
     len: usize,
     out_batches: *mut OtlpMetricsArrowBatches,
 ) -> OtlpStatus {
-    if data.is_null() || out_batches.is_null() {
+    if out_batches.is_null() {
         return OtlpStatus::InvalidArgument;
     }
-
-    // Make every output safely inspectable even when parsing/export fails before a
-    // specific metric shape is written.
-    (*out_batches).gauge.present = 0;
-    (*out_batches).sum.present = 0;
-    (*out_batches).histogram.present = 0;
-    (*out_batches).exp_histogram.present = 0;
-    (*out_batches).skipped_summaries = 0;
-    (*out_batches).skipped_nan_values = 0;
-    (*out_batches).skipped_infinity_values = 0;
-    (*out_batches).skipped_missing_values = 0;
-
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let slice = std::slice::from_raw_parts(data, len);
-        let format: InputFormat = format.into();
-        let batches = match transform_metrics(slice, format) {
-            Ok(batches) => batches,
-            Err(_) => return OtlpStatus::ParseFailed,
+    std::ptr::write(out_batches, OtlpMetricsArrowBatches::absent());
+    ffi_boundary(OtlpStatus::Internal, || {
+        if data.is_null() {
+            return OtlpStatus::InvalidArgument;
+        }
+        let input = std::slice::from_raw_parts(data, len);
+        let Ok(batches) = transform_metrics(input, format.into()) else {
+            return OtlpStatus::ParseFailed;
         };
-        export_metric_batches(batches, profile.into(), out_batches)
-    }))
-    .unwrap_or(OtlpStatus::Internal)
+        write_metrics(profile.into(), batches, out_batches)
+    })
 }
 
-// ============================================================================
-// FFI Functions - Native OTAP Streaming API
-// ============================================================================
+unsafe fn write_metrics(
+    profile: ArrowProfile,
+    batches: crate::MetricBatches,
+    out_batches: *mut OtlpMetricsArrowBatches,
+) -> OtlpStatus {
+    match ExportedMetrics::new(profile, batches) {
+        Ok(exported) => {
+            exported.write_to(out_batches);
+            OtlpStatus::Ok
+        }
+        Err(error) => error.into(),
+    }
+}
 
 /// Opaque, heap-owned handle wrapping a stateful OTAP decoder.
 ///
 /// Created by `otlp_otap_decoder_new`, destroyed by `otlp_otap_decoder_free`.
 /// NOT thread-safe and NOT re-entrant: keep one decoder per OTAP stream, driven
 /// by a single thread at a time (mirrors `OtapDecoder`'s `&mut self` methods).
-///
-/// On a non-OK decode the decoder's internal stream state may be partially
-/// advanced. The safe contract is that the stream is then no longer
-/// trustworthy: free the decoder and start a new one rather than feeding it
-/// more messages. Do not attempt mid-stream recovery.
 pub struct OtlpOtapDecoder {
     inner: crate::otap::OtapDecoder,
     profile: ArrowProfile,
@@ -513,9 +330,7 @@ pub struct OtlpOtapDecoder {
 
 /// Create a new stateful OTAP decoder.
 ///
-/// # Returns
-///
-/// A non-null handle owned by the caller, who must release it with
+/// Returns a non-null handle owned by the caller, who must release it with
 /// `otlp_otap_decoder_free`.
 #[no_mangle]
 pub extern "C" fn otlp_otap_decoder_new() -> *mut OtlpOtapDecoder {
@@ -528,19 +343,16 @@ pub extern "C" fn otlp_otap_decoder_new() -> *mut OtlpOtapDecoder {
 /// re-typed for `profile`. `OTLP_ARROW_PROFILE_CANONICAL` is identical to
 /// `otlp_otap_decoder_new`. Under `OTLP_ARROW_PROFILE_DUCKDB`, a value the
 /// profile cannot represent fails the decode with `OTLP_ERROR_PARSE_FAILED`.
-///
-/// # Returns
-///
-/// A non-null handle owned by the caller, who must release it with
-/// `otlp_otap_decoder_free`.
 #[no_mangle]
 pub extern "C" fn otlp_otap_decoder_new_with_profile(
     profile: OtlpArrowProfile,
 ) -> *mut OtlpOtapDecoder {
-    Box::into_raw(Box::new(OtlpOtapDecoder {
-        inner: crate::otap::OtapDecoder::new(),
-        profile: profile.into(),
-    }))
+    ffi_boundary(std::ptr::null_mut(), || {
+        Box::into_raw(Box::new(OtlpOtapDecoder {
+            inner: crate::otap::OtapDecoder::new(),
+            profile: profile.into(),
+        }))
+    })
 }
 
 /// Free an OTAP decoder created by `otlp_otap_decoder_new`.
@@ -551,42 +363,31 @@ pub extern "C" fn otlp_otap_decoder_new_with_profile(
 /// already been freed, or null. Passing null is a safe no-op.
 #[no_mangle]
 pub unsafe extern "C" fn otlp_otap_decoder_free(decoder: *mut OtlpOtapDecoder) {
-    if !decoder.is_null() {
-        drop(Box::from_raw(decoder));
-    }
+    ffi_boundary((), || {
+        if !decoder.is_null() {
+            drop(Box::from_raw(decoder));
+        }
+    })
 }
 
-/// Shared body for the single-batch OTAP decode entry points (logs and traces),
-/// which each return exactly one `RecordBatch` on success.
-///
-/// # Safety
-///
-/// Same contract as the public entry points: `decoder` from
-/// `otlp_otap_decoder_new`; `data` valid for `len` bytes; `out_array`/
-/// `out_schema` valid and writable. On `OTLP_OK` the caller owns and must
-/// release both out-params; on non-OK nothing is written.
+type DecodeOne = fn(&mut crate::otap::OtapDecoder, &[u8]) -> crate::Result<RecordBatch>;
+
 unsafe fn otap_decode_batch(
     decoder: *mut OtlpOtapDecoder,
     data: *const u8,
     len: usize,
     out_array: *mut FFI_ArrowArray,
     out_schema: *mut FFI_ArrowSchema,
-    decode: fn(&mut crate::otap::OtapDecoder, &[u8]) -> crate::Result<RecordBatch>,
+    decode: DecodeOne,
 ) -> OtlpStatus {
     if decoder.is_null() || data.is_null() || out_array.is_null() || out_schema.is_null() {
         return OtlpStatus::InvalidArgument;
     }
-
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let slice = std::slice::from_raw_parts(data, len);
-        let profile = (*decoder).profile;
-        match decode(&mut (*decoder).inner, slice).and_then(|batch| profile.apply(batch)) {
-            Ok(batch) => export_record_batch(batch, out_array, out_schema)
-                .map_or_else(|status| status, |_| OtlpStatus::Ok),
-            Err(_) => OtlpStatus::ParseFailed,
-        }
-    }))
-    .unwrap_or(OtlpStatus::Internal)
+    let decoder = &mut *decoder;
+    let Ok(batch) = decode(&mut decoder.inner, std::slice::from_raw_parts(data, len)) else {
+        return OtlpStatus::ParseFailed;
+    };
+    export_batch(decoder.profile, batch, out_array, out_schema)
 }
 
 /// Decode one canonical OTAP `BatchArrowRecords` message into a normalized logs
@@ -599,7 +400,7 @@ unsafe fn otap_decode_batch(
 /// - `data` must be valid for `len` bytes
 /// - `out_array` and `out_schema` must be valid, writable pointers
 /// - On `OTLP_OK` the caller owns and must release both out_array and out_schema
-/// - On any non-OK status nothing is written and the stream should be discarded
+/// - On any non-OK status nothing is written
 #[no_mangle]
 pub unsafe extern "C" fn otlp_otap_decode_logs(
     decoder: *mut OtlpOtapDecoder,
@@ -608,14 +409,16 @@ pub unsafe extern "C" fn otlp_otap_decode_logs(
     out_array: *mut FFI_ArrowArray,
     out_schema: *mut FFI_ArrowSchema,
 ) -> OtlpStatus {
-    otap_decode_batch(
-        decoder,
-        data,
-        len,
-        out_array,
-        out_schema,
-        crate::otap::OtapDecoder::decode_logs,
-    )
+    ffi_boundary(OtlpStatus::Internal, || {
+        otap_decode_batch(
+            decoder,
+            data,
+            len,
+            out_array,
+            out_schema,
+            crate::otap::OtapDecoder::decode_logs,
+        )
+    })
 }
 
 /// Decode one canonical OTAP `BatchArrowRecords` message into a normalized
@@ -633,14 +436,16 @@ pub unsafe extern "C" fn otlp_otap_decode_traces(
     out_array: *mut FFI_ArrowArray,
     out_schema: *mut FFI_ArrowSchema,
 ) -> OtlpStatus {
-    otap_decode_batch(
-        decoder,
-        data,
-        len,
-        out_array,
-        out_schema,
-        crate::otap::OtapDecoder::decode_traces,
-    )
+    ffi_boundary(OtlpStatus::Internal, || {
+        otap_decode_batch(
+            decoder,
+            data,
+            len,
+            out_array,
+            out_schema,
+            crate::otap::OtapDecoder::decode_traces,
+        )
+    })
 }
 
 /// Decode one canonical OTAP `BatchArrowRecords` message into the normalized
@@ -651,11 +456,11 @@ pub unsafe extern "C" fn otlp_otap_decode_traces(
 ///
 /// - `decoder` must come from `otlp_otap_decoder_new` and not be freed
 /// - `data` must be valid for `len` bytes
-/// - `out_batches` must be a valid pointer to `OtlpMetricsArrowBatches`
-/// - Caller should zero-initialize `out_batches` before calling
+/// - `out_batches` must be a valid pointer to `OtlpMetricsArrowBatches`; it is
+///   fully overwritten, so it need not be initialized
 /// - For each output with `present != 0`, caller must release array and schema;
 ///   outputs with `present == 0` must not be released
-/// - On any non-OK status no batch is present and the stream should be discarded
+/// - On any non-OK status no batch is present
 #[no_mangle]
 pub unsafe extern "C" fn otlp_otap_decode_metrics(
     decoder: *mut OtlpOtapDecoder,
@@ -663,53 +468,37 @@ pub unsafe extern "C" fn otlp_otap_decode_metrics(
     len: usize,
     out_batches: *mut OtlpMetricsArrowBatches,
 ) -> OtlpStatus {
-    if decoder.is_null() || data.is_null() || out_batches.is_null() {
+    if out_batches.is_null() {
         return OtlpStatus::InvalidArgument;
     }
-
-    // Make every output safely inspectable even when decoding/export fails
-    // before a specific metric shape is written.
-    (*out_batches).gauge.present = 0;
-    (*out_batches).sum.present = 0;
-    (*out_batches).histogram.present = 0;
-    (*out_batches).exp_histogram.present = 0;
-    (*out_batches).skipped_summaries = 0;
-    (*out_batches).skipped_nan_values = 0;
-    (*out_batches).skipped_infinity_values = 0;
-    (*out_batches).skipped_missing_values = 0;
-
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let slice = std::slice::from_raw_parts(data, len);
-        let batches = match (*decoder).inner.decode_metrics(slice) {
-            Ok(batches) => batches,
-            Err(_) => return OtlpStatus::ParseFailed,
+    std::ptr::write(out_batches, OtlpMetricsArrowBatches::absent());
+    ffi_boundary(OtlpStatus::Internal, || {
+        if decoder.is_null() || data.is_null() {
+            return OtlpStatus::InvalidArgument;
+        }
+        let decoder = &mut *decoder;
+        let Ok(batches) = decoder
+            .inner
+            .decode_metrics(std::slice::from_raw_parts(data, len))
+        else {
+            return OtlpStatus::ParseFailed;
         };
-        export_metric_batches(batches, (*decoder).profile, out_batches)
-    }))
-    .unwrap_or(OtlpStatus::Internal)
+        write_metrics(decoder.profile, batches, out_batches)
+    })
 }
 
-/// Get a static message for a status code.
-///
-/// # Returns
-///
-/// Static string describing the status (never null).
+/// Get a static, never-null, NUL-terminated message for a status code.
 #[no_mangle]
 pub extern "C" fn otlp_status_message(status: OtlpStatus) -> *const c_char {
-    // Static strings with null terminators
-    static OK: &[u8] = b"Success\0";
-    static INVALID_ARG: &[u8] = b"Invalid argument\0";
-    static PARSE_FAILED: &[u8] = b"Parse failed\0";
-    static INTERNAL: &[u8] = b"Internal error\0";
-
-    let msg = match status {
-        OtlpStatus::Ok => OK,
-        OtlpStatus::InvalidArgument => INVALID_ARG,
-        OtlpStatus::ParseFailed => PARSE_FAILED,
-        OtlpStatus::Internal => INTERNAL,
-    };
-
-    msg.as_ptr() as *const c_char
+    ffi_boundary(c"Internal error".as_ptr(), || {
+        match status {
+            OtlpStatus::Ok => c"Success",
+            OtlpStatus::InvalidArgument => c"Invalid argument",
+            OtlpStatus::ParseFailed => c"Parse failed",
+            OtlpStatus::Internal => c"Internal error",
+        }
+        .as_ptr()
+    })
 }
 
 // ============================================================================
@@ -730,9 +519,9 @@ mod tests {
         resource::v1::Resource,
     };
     use prost::Message;
+    use std::ffi::c_int;
 
     const OTAP_LOGS_INITIAL: &[u8] = include_bytes!("../../tests/fixtures/otap/logs-initial.bar");
-    const OTAP_LOGS_REUSE: &[u8] = include_bytes!("../../tests/fixtures/otap/logs-reuse.bar");
     const OTAP_TRACES_INITIAL: &[u8] =
         include_bytes!("../../tests/fixtures/otap/traces-initial.bar");
     const OTAP_METRICS_INITIAL: &[u8] =
@@ -803,58 +592,6 @@ mod tests {
             }],
         };
         request.encode_to_vec()
-    }
-
-    #[test]
-    fn test_get_schema() {
-        unsafe {
-            let mut ffi_schema = std::mem::MaybeUninit::<FFI_ArrowSchema>::uninit();
-            let status = otlp_get_schema(OtlpSignalType::Logs, ffi_schema.as_mut_ptr());
-            assert_eq!(status, OtlpStatus::Ok);
-
-            let ffi_schema = ffi_schema.assume_init();
-
-            // Convert back to Rust Schema to verify
-            let schema =
-                arrow_schema::Schema::try_from(&ffi_schema).expect("Failed to convert schema");
-
-            // Verify schema has columns (logs schema has 14+ columns)
-            assert!(!schema.fields().is_empty());
-            assert!(schema.field_with_name("time_unix_nano").is_ok());
-            assert!(schema.field_with_name("service_name").is_ok());
-
-            // Schema is automatically released when dropped via try_from
-        }
-    }
-
-    #[test]
-    fn test_one_shot_transform() {
-        unsafe {
-            let bytes = create_test_log_bytes();
-
-            let mut ffi_array = std::mem::MaybeUninit::<FFI_ArrowArray>::uninit();
-            let mut ffi_schema = std::mem::MaybeUninit::<FFI_ArrowSchema>::uninit();
-
-            let status = otlp_transform(
-                OtlpSignalType::Logs,
-                OtlpInputFormat::Protobuf,
-                bytes.as_ptr(),
-                bytes.len(),
-                ffi_array.as_mut_ptr(),
-                ffi_schema.as_mut_ptr(),
-            );
-            assert_eq!(status, OtlpStatus::Ok);
-
-            let ffi_array = ffi_array.assume_init();
-            let ffi_schema = ffi_schema.assume_init();
-
-            // Import back to Rust types to verify
-            let array_data =
-                arrow_array::ffi::from_ffi(ffi_array, &ffi_schema).expect("Failed to import array");
-
-            // Verify we got data (should be a struct array with 1 row)
-            assert_eq!(array_data.len(), 1);
-        }
     }
 
     #[test]
@@ -943,94 +680,6 @@ mod tests {
         }
     }
 
-    fn create_test_gauge_bytes() -> Vec<u8> {
-        let request = ExportMetricsServiceRequest {
-            resource_metrics: vec![ResourceMetrics {
-                resource: Some(Resource {
-                    attributes: vec![KeyValue {
-                        key: "service.name".to_string(),
-                        key_strindex: 0,
-                        value: Some(AnyValue {
-                            value: Some(any_value::Value::StringValue("test-service".to_string())),
-                        }),
-                    }],
-                    ..Default::default()
-                }),
-                scope_metrics: vec![ScopeMetrics {
-                    scope: Some(InstrumentationScope {
-                        name: "test-lib".to_string(),
-                        ..Default::default()
-                    }),
-                    metrics: vec![Metric {
-                        name: "valid_gauge".to_string(),
-                        data: Some(metric::Data::Gauge(Gauge {
-                            data_points: vec![NumberDataPoint {
-                                time_unix_nano: 1_700_000_000_000_000_000,
-                                value: Some(number_data_point::Value::AsDouble(42.0)),
-                                ..Default::default()
-                            }],
-                        })),
-                        ..Default::default()
-                    }],
-                    ..Default::default()
-                }],
-                ..Default::default()
-            }],
-        };
-        request.encode_to_vec()
-    }
-
-    /// C1 regression: `release_exported_metric_batch` must invoke the C Data Interface
-    /// release callbacks of an exported batch and clear `present`, restoring the
-    /// "nothing to release" invariant. This is the path taken when a later metric shape's
-    /// export fails after an earlier shape was already exported.
-    #[test]
-    fn test_release_exported_metric_batch_releases_and_clears() {
-        let bytes = create_test_gauge_bytes();
-
-        unsafe {
-            let mut batches = std::mem::zeroed::<OtlpMetricsArrowBatches>();
-            let status = otlp_transform_metrics_all(
-                OtlpInputFormat::Protobuf,
-                bytes.as_ptr(),
-                bytes.len(),
-                &mut batches,
-            );
-            assert_eq!(status, OtlpStatus::Ok);
-            // Valid gauge data must produce a present gauge batch with live FFI resources.
-            assert_eq!(batches.gauge.present, 1);
-
-            // Releasing the present batch invokes the release callbacks (drop) and clears present.
-            release_exported_metric_batch(std::ptr::addr_of_mut!(batches.gauge));
-            assert_eq!(batches.gauge.present, 0);
-
-            // Idempotent: releasing an already-released (or never-present) batch is a no-op and
-            // must not double-free. The other shapes were absent for this payload.
-            release_exported_metric_batch(std::ptr::addr_of_mut!(batches.gauge));
-            release_exported_metric_batch(std::ptr::addr_of_mut!(batches.sum));
-            release_exported_metric_batch(std::ptr::addr_of_mut!(batches.histogram));
-            release_exported_metric_batch(std::ptr::addr_of_mut!(batches.exp_histogram));
-            assert_eq!(batches.gauge.present, 0);
-            assert_eq!(batches.sum.present, 0);
-            assert_eq!(batches.histogram.present, 0);
-            assert_eq!(batches.exp_histogram.present, 0);
-        }
-    }
-
-    #[test]
-    fn otap_decode_logs_and_traces_happy_path() {
-        unsafe {
-            let decoder = otlp_otap_decoder_new();
-            assert!(!decoder.is_null());
-            assert!(ffi_decode_rows(decoder, OTAP_LOGS_INITIAL, otlp_otap_decode_logs) > 0);
-            otlp_otap_decoder_free(decoder);
-
-            let decoder = otlp_otap_decoder_new();
-            assert!(ffi_decode_rows(decoder, OTAP_TRACES_INITIAL, otlp_otap_decode_traces) > 0);
-            otlp_otap_decoder_free(decoder);
-        }
-    }
-
     #[test]
     fn otap_decode_metrics_reports_present_and_skipped() {
         unsafe {
@@ -1081,43 +730,7 @@ mod tests {
                 0
             );
 
-            // Honor the ownership contract: release every present batch.
-            release_exported_metric_batch(std::ptr::addr_of_mut!(batches.gauge));
-            release_exported_metric_batch(std::ptr::addr_of_mut!(batches.sum));
-            release_exported_metric_batch(std::ptr::addr_of_mut!(batches.histogram));
-            release_exported_metric_batch(std::ptr::addr_of_mut!(batches.exp_histogram));
-            otlp_otap_decoder_free(decoder);
-        }
-    }
-
-    #[test]
-    fn otap_dictionary_reuse_persists_across_ffi_calls() {
-        unsafe {
-            let decoder = otlp_otap_decoder_new();
-            assert!(ffi_decode_rows(decoder, OTAP_LOGS_INITIAL, otlp_otap_decode_logs) > 0);
-            // The reuse message omits the Arrow schema/dictionary; it only decodes
-            // because the decoder retained state from the initial message.
-            assert!(ffi_decode_rows(decoder, OTAP_LOGS_REUSE, otlp_otap_decode_logs) > 0);
-            otlp_otap_decoder_free(decoder);
-        }
-    }
-
-    #[test]
-    fn otap_reuse_on_fresh_decoder_fails() {
-        unsafe {
-            // The documented "one decoder per stream" guarantee: a reuse message
-            // has no schema/dictionary, so a fresh decoder cannot decode it.
-            let decoder = otlp_otap_decoder_new();
-            let mut ffi_array = std::mem::MaybeUninit::<FFI_ArrowArray>::uninit();
-            let mut ffi_schema = std::mem::MaybeUninit::<FFI_ArrowSchema>::uninit();
-            let status = otlp_otap_decode_logs(
-                decoder,
-                OTAP_LOGS_REUSE.as_ptr(),
-                OTAP_LOGS_REUSE.len(),
-                ffi_array.as_mut_ptr(),
-                ffi_schema.as_mut_ptr(),
-            );
-            assert_eq!(status, OtlpStatus::ParseFailed);
+            present_batches(&mut batches);
             otlp_otap_decoder_free(decoder);
         }
     }
@@ -1490,17 +1103,6 @@ mod tests {
             arrow_array::ffi::from_ffi(arr.assume_init(), &schema).unwrap();
             assert!(child_formats(&schema).contains(&("trace_id".into(), "w:16".into())));
             otlp_otap_decoder_free(decoder);
-        }
-    }
-
-    #[test]
-    fn test_status_message() {
-        let msg = otlp_status_message(OtlpStatus::Ok);
-        assert!(!msg.is_null());
-
-        unsafe {
-            let c_str = std::ffi::CStr::from_ptr(msg);
-            assert_eq!(c_str.to_str().unwrap(), "Success");
         }
     }
 }
