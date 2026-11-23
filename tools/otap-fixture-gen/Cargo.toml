@@ -10,5 +10,5 @@ publish = false
 arrow-ipc = "59.3"
 # Exact pin: the upstream workspace is 0.x and releases weekly, and these
 # fixtures are only meaningful against a known Producer.
-otap-df-pdata = { package = "otel-arrow-dfe-pdata", version = "=0.66.0" }
+otap-df-pdata = { package = "otel-arrow-dfe-pdata", version = "=0.67.0" }
 prost = "0.14"
