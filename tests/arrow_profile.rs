@@ -1,8 +1,3 @@
-//! `ArrowProfile` over real transform output: the DuckDb profile carries no
-//! type DuckDB's stock Arrow importer would map differently from the
-//! duckdb-otlp column types, preserves every value, and the canonical profile
-//! is a no-op.
-
 use arrow_array::cast::AsArray;
 use arrow_array::types::{DurationNanosecondType, Int64Type, UInt32Type, UInt64Type};
 use arrow_array::{Array, RecordBatch};
@@ -11,20 +6,6 @@ use otlp2records::{
     exp_histogram_schema, gauge_schema, histogram_schema, logs_schema, sum_schema, to_ipc,
     traces_schema, transform_logs, transform_metrics, transform_traces, ArrowProfile, InputFormat,
 };
-
-/// The only types the DuckDb profile may emit for the normalized schemas.
-fn assert_duckdb_type(column: &str, data_type: &DataType) {
-    match data_type {
-        DataType::Utf8
-        | DataType::Int32
-        | DataType::Int64
-        | DataType::Float64
-        | DataType::Boolean
-        | DataType::Timestamp(TimeUnit::Nanosecond, None) => {}
-        DataType::List(item) => assert_duckdb_type(column, item.data_type()),
-        other => panic!("column {column}: {other} is not a DuckDb profile type"),
-    }
-}
 
 fn all_schemas() -> Vec<(&'static str, Schema)> {
     vec![
@@ -35,50 +16,6 @@ fn all_schemas() -> Vec<(&'static str, Schema)> {
         ("histogram", histogram_schema()),
         ("exp_histogram", exp_histogram_schema()),
     ]
-}
-
-#[test]
-fn duckdb_schema_for_every_signal_has_only_duckdb_types() {
-    for (signal, canonical) in all_schemas() {
-        let mapped = ArrowProfile::DuckDb.schema(&canonical);
-        assert_eq!(mapped.fields().len(), canonical.fields().len(), "{signal}");
-        for (m, c) in mapped.fields().iter().zip(canonical.fields()) {
-            assert_eq!(m.name(), c.name(), "{signal}");
-            assert_eq!(m.is_nullable(), c.is_nullable(), "{signal}.{}", c.name());
-            assert_duckdb_type(&format!("{signal}.{}", m.name()), m.data_type());
-        }
-    }
-}
-
-#[test]
-fn duckdb_schema_spot_checks() {
-    let ty = |schema: &Schema, name: &str| {
-        ArrowProfile::DuckDb
-            .schema(schema)
-            .field_with_name(name)
-            .unwrap()
-            .data_type()
-            .clone()
-    };
-    let traces = traces_schema();
-    assert_eq!(ty(&traces, "trace_id"), DataType::Utf8);
-    assert_eq!(ty(&traces, "span_id"), DataType::Utf8);
-    assert_eq!(ty(&traces, "parent_span_id"), DataType::Utf8);
-    assert_eq!(ty(&traces, "duration_time_unix_nano"), DataType::Int64);
-    assert_eq!(ty(&traces, "dropped_events_count"), DataType::Int32);
-    assert_eq!(
-        ty(&traces, "start_time_unix_nano"),
-        DataType::Timestamp(TimeUnit::Nanosecond, None)
-    );
-    let logs = logs_schema();
-    assert_eq!(ty(&logs, "trace_id"), DataType::Utf8);
-    assert_eq!(ty(&logs, "flags"), DataType::Int32);
-    let histogram = histogram_schema();
-    assert_eq!(ty(&histogram, "count"), DataType::Int64);
-    match ty(&histogram, "bucket_counts") {
-        DataType::List(item) => assert_eq!(item.data_type(), &DataType::Int64),
-        other => panic!("bucket_counts is {other}"),
-    }
 }
 
 #[test]

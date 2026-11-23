@@ -70,14 +70,11 @@ mod tests {
         let batch = create_test_batch();
         let result = to_ipc(&batch).unwrap();
 
-        // Verify it's not empty
         assert!(!result.is_empty());
 
-        // Verify we can read it back
         let cursor = Cursor::new(result);
         let reader = StreamReader::try_new(cursor, None).unwrap();
 
-        // Read back the batches
         let batches: Vec<RecordBatch> = reader.map(|r| r.unwrap()).collect();
         assert_eq!(batches.len(), 1);
 
@@ -85,7 +82,6 @@ mod tests {
         assert_eq!(read_batch.num_rows(), 3);
         assert_eq!(read_batch.num_columns(), 2);
 
-        // Verify schema
         assert_eq!(read_batch.schema().field(0).name(), "name");
         assert_eq!(read_batch.schema().field(1).name(), "value");
     }
@@ -95,14 +91,12 @@ mod tests {
         let original_batch = create_test_batch();
         let ipc_bytes = to_ipc(&original_batch).unwrap();
 
-        // Read back
         let cursor = Cursor::new(ipc_bytes);
         let reader = StreamReader::try_new(cursor, None).unwrap();
         let batches: Vec<RecordBatch> = reader.map(|r| r.unwrap()).collect();
 
         let read_batch = &batches[0];
 
-        // Verify data integrity
         let name_col = read_batch
             .column(0)
             .as_any()
@@ -136,10 +130,8 @@ mod tests {
         let batch = RecordBatch::try_new(schema, vec![name_array, value_array]).unwrap();
         let result = to_ipc(&batch).unwrap();
 
-        // Should still produce valid IPC (with schema at minimum)
         assert!(!result.is_empty());
 
-        // Verify we can read it back
         let cursor = Cursor::new(result);
         let reader = StreamReader::try_new(cursor, None).unwrap();
         let batches: Vec<RecordBatch> = reader.map(|r| r.unwrap()).collect();
@@ -161,7 +153,6 @@ mod tests {
         let batch = RecordBatch::try_new(schema, vec![name_array, value_array]).unwrap();
         let result = to_ipc(&batch).unwrap();
 
-        // Verify roundtrip preserves nulls
         let cursor = Cursor::new(result);
         let reader = StreamReader::try_new(cursor, None).unwrap();
         let batches: Vec<RecordBatch> = reader.map(|r| r.unwrap()).collect();

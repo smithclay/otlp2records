@@ -104,7 +104,6 @@ pub fn group_batch_by_service(batch: RecordBatch) -> ServiceGroupedBatches {
         .as_string_opt::<i32>()
         .expect("service_name must be Utf8 string type");
 
-    // Group row indices by service name (preserving insertion order)
     let mut groups: IndexMap<&str, Vec<u32>> = IndexMap::new();
     for (idx, service) in service_array.iter().enumerate() {
         let service = service.unwrap_or("unknown");
@@ -280,7 +279,6 @@ mod tests {
         assert_eq!(grouped.len(), 3);
         assert_eq!(grouped.total_records, 5);
 
-        // Check order is preserved (first occurrence)
         assert_eq!(grouped.batches[0].service_name.as_ref(), "svc-a");
         assert_eq!(grouped.batches[0].record_count, 2);
         assert_eq!(grouped.batches[0].min_timestamp_micros, 100); // min(100, 150)
