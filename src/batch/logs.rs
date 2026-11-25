@@ -25,7 +25,7 @@ use super::{
         TransformCounter, TransformObserver, TransformPhase, TransformSignal,
     },
     util::{
-        append_fixed_or_null, append_opt_n, append_required_service_name_n, array, finish_batch,
+        append_fixed_or_null, append_opt_n, append_required_service_name_n, array,
         string_builder_bytes, u64_to_i64,
     },
     view_json,
@@ -506,9 +506,8 @@ impl LogBuilders {
     fn finish(mut self) -> Result<RecordBatch> {
         // Every kept record appends its time, whatever the plan builds.
         let rows = self.time_unix_nano.len();
-        finish_batch(
+        self.plan.finish(
             logs_schema_arc(),
-            &self.plan,
             vec![
                 array(self.time_unix_nano.finish()),
                 array(self.observed_time_unix_nano.finish()),

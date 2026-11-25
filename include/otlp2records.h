@@ -9,6 +9,7 @@
 #ifndef OTLP2RECORDS_H
 #define OTLP2RECORDS_H
 
+#include <stdbool.h>
 #include <stdint.h>
 #include <stddef.h>
 
@@ -153,14 +154,6 @@ typedef struct OtlpMetricsArrowBatches {
 } OtlpMetricsArrowBatches;
 
 /**
- * @brief A borrowed UTF-8 string: len bytes at data, not NUL-terminated.
- */
-typedef struct OtlpStr {
-    const uint8_t* data;
-    size_t len;
-} OtlpStr;
-
-/**
  * @brief Rows whose timestamp column is within [min, max] (inclusive, ns).
  *
  * column indexes the signal's schema (for metrics, the shape's) and must be a
@@ -172,29 +165,35 @@ typedef struct OtlpTimeRange {
     int64_t max;
 } OtlpTimeRange;
 
-/** @brief OtlpReadOptions.columns value that builds every column. */
-#define OTLP_COLUMNS_ALL UINT64_MAX
+/**
+ * @brief Decides whether a resource's rows are kept, from its service_name.
+ *
+ * service_name is the value the transform emits (len UTF-8 bytes, not
+ * NUL-terminated), so a resource without service.name is asked about
+ * "unknown". Called once per resource, on the calling thread, during the
+ * *_with_options call. It must not unwind.
+ */
+typedef bool (*OtlpServiceFilter)(void* user_data, const uint8_t* service_name, size_t len);
 
 /**
  * @brief What a *_with_options call builds: some columns of some rows.
  *
  * A reader that needs a few columns of a few rows says so, and the transform
- * skips the work for the rest. Columns not built are still in the output, as
- * all-null arrays, so the schema keeps its column order and names.
+ * skips the work for the rest: the batch holds exactly the requested columns,
+ * in the requested order, and only the rows that pass the filters. Rows of a
+ * resource keep_service rejects, or outside a time range, are dropped before
+ * any of their columns are built.
  *
- * The row predicates prune; they are not query evaluation. A row is kept only
- * if its service_name is in service_names (when given) and it is inside every
- * time range. service_name is compared as emitted, so a resource without
- * service.name matches "unknown".
- *
- * A zero-initialized struct builds no columns of every row: set columns.
+ * A zero-initialized struct builds every column of every row.
  */
 typedef struct OtlpReadOptions {
-    /** Bit i builds column i of the signal's schema; OTLP_COLUMNS_ALL builds every column. */
-    uint64_t columns;
-    /** Keep only rows whose service_name is one of these. NULL: no filter. */
-    const OtlpStr* service_names;
-    size_t service_names_len;
+    /** Columns to return, in order, by index in the signal's schema. NULL: every column, in schema order.
+     *  A non-NULL pointer with columns_len 0 returns no columns, only the row count. */
+    const uint32_t* columns;
+    size_t columns_len;
+    /** Keep only the rows of resources this accepts. NULL: every resource. */
+    OtlpServiceFilter keep_service;
+    void* keep_service_data;
     /** Keep only rows inside every range. NULL or 0: no ranges. */
     const OtlpTimeRange* time_ranges;
     size_t time_ranges_len;
@@ -284,8 +283,8 @@ OtlpStatus otlp_transform_with_profile(
  *
  * @param options NULL for every column of every row
  * @return OTLP_ERROR_INVALID_ARGUMENT if options does not fit the signal's
- *         schema (a column past it, a range on a non-timestamp column) or a
- *         service name is not UTF-8; otherwise as otlp_transform_with_profile()
+ *         schema (a column past it, a range on a non-timestamp column);
+ *         otherwise as otlp_transform_with_profile()
  *
  * @note Caller must call out_array->release() and out_schema->release().
  */

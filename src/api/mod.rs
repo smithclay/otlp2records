@@ -8,11 +8,9 @@ mod partitioned;
 mod traces;
 mod types;
 
-pub(crate) use logs::transform_logs_planned;
 pub use logs::{
     transform_logs, transform_logs_json, transform_logs_with_observer, transform_logs_with_options,
 };
-pub(crate) use metrics::transform_metrics_planned;
 pub use metrics::{
     transform_metrics, transform_metrics_json, transform_metrics_with_observer,
     transform_metrics_with_options,
@@ -20,7 +18,6 @@ pub use metrics::{
 pub use partitioned::{
     transform_logs_partitioned, transform_metrics_partitioned, transform_traces_partitioned,
 };
-pub(crate) use traces::transform_traces_planned;
 pub use traces::{
     transform_traces, transform_traces_json, transform_traces_with_observer,
     transform_traces_with_options,

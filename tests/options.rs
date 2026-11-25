@@ -1,5 +1,5 @@
 //! `TransformOptions`: a narrowed transform equals the full transform, filtered
-//! by the same predicates, with the unrequested columns all-null.
+//! by the same predicates and projected to the requested columns.
 
 use std::collections::BTreeSet;
 
@@ -37,8 +37,8 @@ impl Predicates {
         if let Some(columns) = &self.columns {
             options = options.with_columns(columns.iter().copied());
         }
-        if let Some(services) = &self.services {
-            options = options.with_service_names(services.iter().cloned());
+        if let Some(services) = self.services.clone() {
+            options = options.with_service_filter(move |name| services.iter().any(|s| s == name));
         }
         for &(column, min, max) in &self.ranges {
             options = options.with_time_range(column, min, max);
@@ -46,7 +46,8 @@ impl Predicates {
         options
     }
 
-    /// `full` filtered by the predicates (SQL semantics: NULL fails a range).
+    /// `full` filtered by the predicates (SQL semantics: NULL fails a range)
+    /// and projected to the requested columns.
     fn expected(&self, full: &RecordBatch) -> RecordBatch {
         let rows = full.num_rows();
         let mut keep = vec![true; rows];
@@ -66,35 +67,17 @@ impl Predicates {
                 *keep &= values.is_valid(row) && (min..=max).contains(&values.value(row));
             }
         }
-        filter_record_batch(full, &BooleanArray::from(keep)).unwrap()
+        let filtered = filter_record_batch(full, &BooleanArray::from(keep)).unwrap();
+        match &self.columns {
+            Some(columns) => filtered.project(columns).unwrap(),
+            None => filtered,
+        }
     }
 
     fn check(&self, full: &RecordBatch, actual: &RecordBatch) {
         let expected = self.expected(full);
         assert_eq!(actual.num_rows(), expected.num_rows(), "row count");
-        assert_eq!(actual.num_columns(), expected.num_columns(), "column count");
-        for (index, field) in expected.schema().fields().iter().enumerate() {
-            let actual_field = actual.schema().field(index).clone();
-            assert_eq!(actual_field.name(), field.name());
-            assert_eq!(actual_field.data_type(), field.data_type());
-            let built = self.columns.as_ref().is_none_or(|c| c.contains(&index));
-            if built {
-                assert_eq!(
-                    actual.column(index).as_ref(),
-                    expected.column(index).as_ref(),
-                    "column {}",
-                    field.name()
-                );
-            } else {
-                assert_eq!(
-                    actual.column(index).null_count(),
-                    actual.num_rows(),
-                    "column {} should be all-null",
-                    field.name()
-                );
-                assert!(actual_field.is_nullable());
-            }
-        }
+        assert_eq!(actual, &expected);
     }
 }
 
@@ -175,6 +158,11 @@ fn cases(full: &RecordBatch, time_columns: &[&str]) -> Vec<Predicates> {
             ..Default::default()
         });
     }
+    // Columns come back in the order asked, and may repeat.
+    cases.push(Predicates {
+        columns: Some(vec![full.num_columns() - 1, 0, full.num_columns() - 1]),
+        ..Default::default()
+    });
     cases.push(Predicates {
         columns: Some(vec![index(full, "service_name"), full.num_columns() - 1]),
         services: Some(vec![service]),
@@ -239,10 +227,8 @@ fn metric_options_build_only_their_shape() {
                 );
             }
             assert_eq!(batches.skipped.summaries, all.skipped.summaries);
-            match shape_batch(&batches, shape) {
-                Some(actual) => case.check(full, actual),
-                None => assert_eq!(case.expected(full).num_rows(), 0),
-            }
+            // The selected shape is always returned, empty if nothing is kept.
+            case.check(full, shape_batch(&batches, shape).expect("selected shape"));
         }
         checked += 1;
     }
@@ -282,10 +268,8 @@ fn otap_options_match_the_equivalent_otlp() {
             let batches = OtapDecoder::new()
                 .decode_metrics_with_options(metrics_bar, shape, &case.options())
                 .unwrap();
-            match shape_batch(&batches, shape) {
-                Some(actual) => case.check(full, actual),
-                None => assert_eq!(case.expected(full).num_rows(), 0),
-            }
+            // The selected shape is always returned, empty if nothing is kept.
+            case.check(full, shape_batch(&batches, shape).expect("selected shape"));
         }
     }
 }
@@ -312,10 +296,7 @@ fn invalid_options_are_rejected_before_decoding() {
         // Garbage input: the options error must win over the decode error.
         let error =
             transform_logs_with_options(b"\xff\xff", InputFormat::Auto, &options).unwrap_err();
-        assert!(
-            matches!(&error, Error::InvalidInput(m) if m.starts_with("transform options")),
-            "{error}"
-        );
+        assert!(matches!(&error, Error::InvalidOptions(_)), "{error}");
     }
 }
 
@@ -360,4 +341,23 @@ fn a_resource_without_service_name_matches_unknown() {
         assert_eq!(actual.num_rows(), rows, "{service}");
         case.check(&full, &actual);
     }
+}
+
+#[test]
+fn a_shape_the_input_lacks_is_an_empty_projected_batch() {
+    let gauges = include_bytes!("../testdata/metrics_gauge.pb");
+    let schema = MetricShape::Histogram.schema();
+    let bounds = schema.index_of("explicit_bounds").unwrap();
+    let batches = transform_metrics_with_options(
+        gauges,
+        InputFormat::Protobuf,
+        MetricShape::Histogram,
+        &TransformOptions::new().with_columns([bounds]),
+    )
+    .unwrap();
+    let histogram = batches.histogram.expect("the selected shape is returned");
+    assert_eq!(histogram.num_rows(), 0);
+    assert_eq!(histogram.schema().fields().len(), 1);
+    assert_eq!(histogram.schema().field(0).name(), "explicit_bounds");
+    assert!(batches.gauge.is_none());
 }

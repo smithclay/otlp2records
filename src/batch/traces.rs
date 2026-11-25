@@ -26,8 +26,8 @@ use super::{
     },
     util::{
         append_empty_as_null, append_fixed_or_null, append_fixed_required, append_opt_n,
-        append_required_service_name_n, append_required_ts_ns, array, finish_batch,
-        string_builder_bytes, u64_to_i64,
+        append_required_service_name_n, append_required_ts_ns, array, string_builder_bytes,
+        u64_to_i64,
     },
     view_json,
 };
@@ -535,9 +535,8 @@ impl TraceBuilders {
     fn finish(mut self) -> Result<RecordBatch> {
         // Every kept span appends its start time, whatever the plan builds.
         let rows = self.start_time_unix_nano.len();
-        finish_batch(
+        self.plan.finish(
             traces_schema_arc(),
-            &self.plan,
             vec![
                 array(self.start_time_unix_nano.finish()),
                 array(self.duration_time_unix_nano.finish()),

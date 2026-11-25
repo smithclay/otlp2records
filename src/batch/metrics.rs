@@ -32,8 +32,8 @@ use super::{
     },
     util::{
         append_f64_list, append_finite, append_finite_opt, append_opt_n, append_opt_ts_ns,
-        append_required_service_name_n, append_required_ts_ns, append_u64_list, array,
-        finish_batch, opt_ts, string_builder,
+        append_required_service_name_n, append_required_ts_ns, append_u64_list, array, opt_ts,
+        string_builder,
     },
     view_json,
 };
@@ -47,7 +47,7 @@ pub(crate) enum MetricsSelection<'a> {
     Shape(MetricShape, &'a Plan),
 }
 
-impl MetricsSelection<'_> {
+impl<'a> MetricsSelection<'a> {
     /// The plan of each shape, in gauge/sum/histogram/exp-histogram order;
     /// `None` for a shape that is not built.
     fn plans(self) -> [Option<ShapePlan>; 4] {
@@ -68,6 +68,21 @@ impl MetricsSelection<'_> {
             };
         }
         plans
+    }
+
+    /// The plan narrowing the one selected shape; `None` when every shape is
+    /// built in full.
+    fn narrowing(self) -> Option<&'a Plan> {
+        match self {
+            MetricsSelection::All => None,
+            MetricsSelection::Shape(_, plan) => Some(plan),
+        }
+    }
+
+    /// Whether `shape` is returned even when the input has none of it: the
+    /// one selected shape always is.
+    fn returns(self, shape: MetricShape) -> bool {
+        matches!(self, MetricsSelection::Shape(selected, _) if selected == shape)
     }
 }
 
@@ -240,17 +255,10 @@ pub(crate) fn transform_metrics_view_observed<V: MetricsView>(
             TransformSignal::Metrics,
             observer,
             duplicates.as_mut(),
-            // Only one shape is built when any has a service filter.
             |service| {
-                [
-                    &gauge.shape,
-                    &sum.shape,
-                    &histogram.shape,
-                    &exp_histogram.shape,
-                ]
-                .into_iter()
-                .zip(builds)
-                .any(|(shape, built)| built && shape.plan.keeps_service(service))
+                selection
+                    .narrowing()
+                    .is_none_or(|plan| plan.keeps_service(service))
             },
             resource_attributes,
         ) else {
@@ -441,10 +449,11 @@ pub(crate) fn transform_metrics_view_observed<V: MetricsView>(
         TransformPhase::ArrowFinalize,
         || {
             Ok(MetricBatches {
-                gauge: gauge.finish_if_non_empty()?,
-                sum: sum.finish_if_non_empty()?,
-                histogram: histogram.finish_if_non_empty()?,
-                exp_histogram: exp_histogram.finish_if_non_empty()?,
+                gauge: gauge.finish(selection.returns(MetricShape::Gauge))?,
+                sum: sum.finish(selection.returns(MetricShape::Sum))?,
+                histogram: histogram.finish(selection.returns(MetricShape::Histogram))?,
+                exp_histogram: exp_histogram
+                    .finish(selection.returns(MetricShape::ExponentialHistogram))?,
                 skipped,
             })
         },
@@ -524,35 +533,37 @@ impl GaugeBuilders {
         Ok(())
     }
 
-    fn finish_if_non_empty(mut self) -> Result<Option<RecordBatch>> {
-        if self.rows == 0 {
+    /// `None` when no row was built, unless `keep_empty`.
+    fn finish(mut self, keep_empty: bool) -> Result<Option<RecordBatch>> {
+        if self.rows == 0 && !keep_empty {
             return Ok(None);
         }
-        finish_batch(
-            gauge_schema_arc(),
-            &self.shape.plan,
-            vec![
-                array(self.time_unix_nano.finish()),
-                array(self.start_time_unix_nano.finish()),
-                array(self.name.finish()),
-                array(self.description.finish()),
-                array(self.unit.finish()),
-                array(self.int_value.finish()),
-                array(self.double_value.finish()),
-                array(self.service_name.finish()),
-                array(self.service_namespace.finish()),
-                array(self.service_instance_id.finish()),
-                array(self.resource_attributes.finish()),
-                array(self.scope_name.finish()),
-                array(self.scope_version.finish()),
-                array(self.scope_attributes.finish()),
-                array(self.metric_attributes.finish()),
-                array(self.flags.finish()),
-                array(self.exemplars_json.finish()),
-            ],
-            self.rows,
-        )
-        .map(Some)
+        self.shape
+            .plan
+            .finish(
+                gauge_schema_arc(),
+                vec![
+                    array(self.time_unix_nano.finish()),
+                    array(self.start_time_unix_nano.finish()),
+                    array(self.name.finish()),
+                    array(self.description.finish()),
+                    array(self.unit.finish()),
+                    array(self.int_value.finish()),
+                    array(self.double_value.finish()),
+                    array(self.service_name.finish()),
+                    array(self.service_namespace.finish()),
+                    array(self.service_instance_id.finish()),
+                    array(self.resource_attributes.finish()),
+                    array(self.scope_name.finish()),
+                    array(self.scope_version.finish()),
+                    array(self.scope_attributes.finish()),
+                    array(self.metric_attributes.finish()),
+                    array(self.flags.finish()),
+                    array(self.exemplars_json.finish()),
+                ],
+                self.rows,
+            )
+            .map(Some)
     }
 }
 
@@ -626,37 +637,39 @@ impl SumBuilders {
         Ok(())
     }
 
-    fn finish_if_non_empty(mut self) -> Result<Option<RecordBatch>> {
-        if self.rows == 0 {
+    /// `None` when no row was built, unless `keep_empty`.
+    fn finish(mut self, keep_empty: bool) -> Result<Option<RecordBatch>> {
+        if self.rows == 0 && !keep_empty {
             return Ok(None);
         }
-        finish_batch(
-            sum_schema_arc(),
-            &self.shape.plan,
-            vec![
-                array(self.time_unix_nano.finish()),
-                array(self.start_time_unix_nano.finish()),
-                array(self.name.finish()),
-                array(self.description.finish()),
-                array(self.unit.finish()),
-                array(self.int_value.finish()),
-                array(self.double_value.finish()),
-                array(self.service_name.finish()),
-                array(self.service_namespace.finish()),
-                array(self.service_instance_id.finish()),
-                array(self.resource_attributes.finish()),
-                array(self.scope_name.finish()),
-                array(self.scope_version.finish()),
-                array(self.scope_attributes.finish()),
-                array(self.metric_attributes.finish()),
-                array(self.flags.finish()),
-                array(self.exemplars_json.finish()),
-                array(self.aggregation_temporality.finish()),
-                array(self.is_monotonic.finish()),
-            ],
-            self.rows,
-        )
-        .map(Some)
+        self.shape
+            .plan
+            .finish(
+                sum_schema_arc(),
+                vec![
+                    array(self.time_unix_nano.finish()),
+                    array(self.start_time_unix_nano.finish()),
+                    array(self.name.finish()),
+                    array(self.description.finish()),
+                    array(self.unit.finish()),
+                    array(self.int_value.finish()),
+                    array(self.double_value.finish()),
+                    array(self.service_name.finish()),
+                    array(self.service_namespace.finish()),
+                    array(self.service_instance_id.finish()),
+                    array(self.resource_attributes.finish()),
+                    array(self.scope_name.finish()),
+                    array(self.scope_version.finish()),
+                    array(self.scope_attributes.finish()),
+                    array(self.metric_attributes.finish()),
+                    array(self.flags.finish()),
+                    array(self.exemplars_json.finish()),
+                    array(self.aggregation_temporality.finish()),
+                    array(self.is_monotonic.finish()),
+                ],
+                self.rows,
+            )
+            .map(Some)
     }
 }
 
@@ -997,40 +1010,42 @@ impl HistogramBuilders {
         );
     }
 
-    fn finish_if_non_empty(mut self) -> Result<Option<RecordBatch>> {
-        if self.rows == 0 {
+    /// `None` when no row was built, unless `keep_empty`.
+    fn finish(mut self, keep_empty: bool) -> Result<Option<RecordBatch>> {
+        if self.rows == 0 && !keep_empty {
             return Ok(None);
         }
-        finish_batch(
-            histogram_schema_arc(),
-            &self.shape.plan,
-            vec![
-                array(self.time_unix_nano.finish()),
-                array(self.start_time_unix_nano.finish()),
-                array(self.name.finish()),
-                array(self.description.finish()),
-                array(self.unit.finish()),
-                array(self.count.finish()),
-                array(self.sum.finish()),
-                array(self.min.finish()),
-                array(self.max.finish()),
-                array(self.bucket_counts.finish()),
-                array(self.explicit_bounds.finish()),
-                array(self.service_name.finish()),
-                array(self.service_namespace.finish()),
-                array(self.service_instance_id.finish()),
-                array(self.resource_attributes.finish()),
-                array(self.scope_name.finish()),
-                array(self.scope_version.finish()),
-                array(self.scope_attributes.finish()),
-                array(self.metric_attributes.finish()),
-                array(self.flags.finish()),
-                array(self.exemplars_json.finish()),
-                array(self.aggregation_temporality.finish()),
-            ],
-            self.rows,
-        )
-        .map(Some)
+        self.shape
+            .plan
+            .finish(
+                histogram_schema_arc(),
+                vec![
+                    array(self.time_unix_nano.finish()),
+                    array(self.start_time_unix_nano.finish()),
+                    array(self.name.finish()),
+                    array(self.description.finish()),
+                    array(self.unit.finish()),
+                    array(self.count.finish()),
+                    array(self.sum.finish()),
+                    array(self.min.finish()),
+                    array(self.max.finish()),
+                    array(self.bucket_counts.finish()),
+                    array(self.explicit_bounds.finish()),
+                    array(self.service_name.finish()),
+                    array(self.service_namespace.finish()),
+                    array(self.service_instance_id.finish()),
+                    array(self.resource_attributes.finish()),
+                    array(self.scope_name.finish()),
+                    array(self.scope_version.finish()),
+                    array(self.scope_attributes.finish()),
+                    array(self.metric_attributes.finish()),
+                    array(self.flags.finish()),
+                    array(self.exemplars_json.finish()),
+                    array(self.aggregation_temporality.finish()),
+                ],
+                self.rows,
+            )
+            .map(Some)
     }
 }
 
@@ -1181,45 +1196,47 @@ impl ExpHistogramBuilders {
         );
     }
 
-    fn finish_if_non_empty(mut self) -> Result<Option<RecordBatch>> {
-        if self.rows == 0 {
+    /// `None` when no row was built, unless `keep_empty`.
+    fn finish(mut self, keep_empty: bool) -> Result<Option<RecordBatch>> {
+        if self.rows == 0 && !keep_empty {
             return Ok(None);
         }
-        finish_batch(
-            exp_histogram_schema_arc(),
-            &self.shape.plan,
-            vec![
-                array(self.time_unix_nano.finish()),
-                array(self.start_time_unix_nano.finish()),
-                array(self.name.finish()),
-                array(self.description.finish()),
-                array(self.unit.finish()),
-                array(self.count.finish()),
-                array(self.sum.finish()),
-                array(self.min.finish()),
-                array(self.max.finish()),
-                array(self.scale.finish()),
-                array(self.zero_count.finish()),
-                array(self.zero_threshold.finish()),
-                array(self.positive_offset.finish()),
-                array(self.positive_bucket_counts.finish()),
-                array(self.negative_offset.finish()),
-                array(self.negative_bucket_counts.finish()),
-                array(self.service_name.finish()),
-                array(self.service_namespace.finish()),
-                array(self.service_instance_id.finish()),
-                array(self.resource_attributes.finish()),
-                array(self.scope_name.finish()),
-                array(self.scope_version.finish()),
-                array(self.scope_attributes.finish()),
-                array(self.metric_attributes.finish()),
-                array(self.flags.finish()),
-                array(self.exemplars_json.finish()),
-                array(self.aggregation_temporality.finish()),
-            ],
-            self.rows,
-        )
-        .map(Some)
+        self.shape
+            .plan
+            .finish(
+                exp_histogram_schema_arc(),
+                vec![
+                    array(self.time_unix_nano.finish()),
+                    array(self.start_time_unix_nano.finish()),
+                    array(self.name.finish()),
+                    array(self.description.finish()),
+                    array(self.unit.finish()),
+                    array(self.count.finish()),
+                    array(self.sum.finish()),
+                    array(self.min.finish()),
+                    array(self.max.finish()),
+                    array(self.scale.finish()),
+                    array(self.zero_count.finish()),
+                    array(self.zero_threshold.finish()),
+                    array(self.positive_offset.finish()),
+                    array(self.positive_bucket_counts.finish()),
+                    array(self.negative_offset.finish()),
+                    array(self.negative_bucket_counts.finish()),
+                    array(self.service_name.finish()),
+                    array(self.service_namespace.finish()),
+                    array(self.service_instance_id.finish()),
+                    array(self.resource_attributes.finish()),
+                    array(self.scope_name.finish()),
+                    array(self.scope_version.finish()),
+                    array(self.scope_attributes.finish()),
+                    array(self.metric_attributes.finish()),
+                    array(self.flags.finish()),
+                    array(self.exemplars_json.finish()),
+                    array(self.aggregation_temporality.finish()),
+                ],
+                self.rows,
+            )
+            .map(Some)
     }
 }
 

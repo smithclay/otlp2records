@@ -2,16 +2,20 @@
 //!
 //! A query engine that reads OTLP files usually wants a few columns of a few
 //! rows. [`TransformOptions`] lets it say so, and the transform then skips the
-//! work for everything else: unrequested columns are not built (attribute and
-//! body JSON is most of a transform's cost), and rows that fail a predicate are
-//! dropped before any of their columns are.
+//! work for everything else: a column that is not requested is not built
+//! (attribute and body JSON is most of a transform's cost) and not returned,
+//! and a row that fails a predicate is dropped before any of its columns are
+//! built.
 //!
-//! The predicates are pruning, not query evaluation. They are deliberately
-//! limited to what can be decided cheaply while walking the request
-//! (`service_name` membership and inclusive timestamp ranges), and they follow
-//! SQL comparison semantics: a NULL timestamp fails a range. A caller that has
-//! richer filters applies them itself after the transform.
+//! The row predicates are those that can be decided while walking the request:
+//! a filter on `service_name`, asked once per resource, and inclusive ranges on
+//! timestamp columns, which follow SQL comparison semantics (a NULL timestamp
+//! is outside every range). A caller with other filters applies them itself
+//! after the transform.
 
+use std::{fmt, sync::Arc};
+
+use arrow_array::{ArrayRef, RecordBatch, RecordBatchOptions};
 use arrow_schema::{DataType, Schema, SchemaRef, TimeUnit};
 
 use crate::{
@@ -45,6 +49,9 @@ impl MetricShape {
     }
 }
 
+/// Decides, from a resource's emitted `service_name`, whether its rows are kept.
+type ServiceFilter = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
 /// An inclusive range of nanosecond timestamps on one timestamp column.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TimeRange {
@@ -57,14 +64,22 @@ struct TimeRange {
 /// What a transform builds. The default builds every column of every row.
 ///
 /// Columns are addressed by their index in the signal's schema (for metrics,
-/// the requested shape's). A column that is not requested is still present in
-/// the output, as an all-null array whose field is marked nullable, so the
-/// output schema keeps its column order and names.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// the requested shape's).
+#[derive(Clone, Default)]
 pub struct TransformOptions {
     columns: Option<Vec<usize>>,
-    service_names: Option<Vec<String>>,
+    service_filter: Option<ServiceFilter>,
     time_ranges: Vec<TimeRange>,
+}
+
+impl fmt::Debug for TransformOptions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TransformOptions")
+            .field("columns", &self.columns)
+            .field("service_filter", &self.service_filter.is_some())
+            .field("time_ranges", &self.time_ranges)
+            .finish()
+    }
 }
 
 impl TransformOptions {
@@ -74,23 +89,23 @@ impl TransformOptions {
         Self::default()
     }
 
-    /// Build only these columns. An index past the schema is rejected when the
-    /// transform validates the options.
+    /// Build and return only these columns, in this order. An index past the
+    /// schema is rejected when the transform validates the options.
     #[must_use]
     pub fn with_columns(mut self, columns: impl IntoIterator<Item = usize>) -> Self {
         self.columns = Some(columns.into_iter().collect());
         self
     }
 
-    /// Keep only rows whose `service_name` is one of `names`. The comparison is
-    /// on the value the transform emits, so a resource without `service.name`
-    /// matches `"unknown"`.
+    /// Keep only the rows of resources whose `service_name` passes `filter`.
+    /// It is called once per resource with the value the transform emits, so a
+    /// resource without `service.name` is asked about `"unknown"`.
     #[must_use]
-    pub fn with_service_names<S: Into<String>>(
+    pub fn with_service_filter(
         mut self,
-        names: impl IntoIterator<Item = S>,
+        filter: impl Fn(&str) -> bool + Send + Sync + 'static,
     ) -> Self {
-        self.service_names = Some(names.into_iter().map(Into::into).collect());
+        self.service_filter = Some(Arc::new(filter));
         self
     }
 
@@ -107,21 +122,15 @@ impl TransformOptions {
     /// is reported as such rather than retried as a decode failure.
     pub(crate) fn plan(&self, schema: &Schema) -> Result<Plan> {
         let width = schema.fields().len();
-        let columns = match &self.columns {
-            None => vec![true; width],
-            Some(requested) => {
-                let mut columns = vec![false; width];
-                for &column in requested {
-                    let Some(slot) = columns.get_mut(column) else {
-                        return Err(invalid(format!(
-                            "column {column} is past the schema's {width}"
-                        )));
-                    };
-                    *slot = true;
-                }
-                columns
-            }
-        };
+        let mut built = vec![self.columns.is_none(); width];
+        for &column in self.columns.iter().flatten() {
+            let Some(slot) = built.get_mut(column) else {
+                return Err(invalid(format!(
+                    "column {column} is past the schema's {width}"
+                )));
+            };
+            *slot = true;
+        }
         let mut time_ranges: Vec<TimeRange> = Vec::new();
         for range in &self.time_ranges {
             let Some(field) = schema.fields().get(range.column) else {
@@ -149,23 +158,26 @@ impl TransformOptions {
             }
         }
         Ok(Plan {
-            columns,
-            service_names: self.service_names.clone(),
+            built,
+            output: self.columns.clone(),
+            service_filter: self.service_filter.clone(),
             time_ranges,
         })
     }
 }
 
 fn invalid(message: String) -> Error {
-    Error::InvalidInput(format!("transform options: {message}"))
+    Error::InvalidOptions(message)
 }
 
 /// [`TransformOptions`] resolved against one schema.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct Plan {
     /// Whether each column of the schema is built.
-    columns: Vec<bool>,
-    service_names: Option<Vec<String>>,
+    built: Vec<bool>,
+    /// The columns returned, in order; `None` for the whole schema.
+    output: Option<Vec<usize>>,
+    service_filter: Option<ServiceFilter>,
     time_ranges: Vec<TimeRange>,
 }
 
@@ -173,41 +185,28 @@ impl Plan {
     /// Every column of every row of `schema`.
     pub(crate) fn all(schema: &Schema) -> Self {
         Self {
-            columns: vec![true; schema.fields().len()],
-            service_names: None,
+            built: vec![true; schema.fields().len()],
+            output: None,
+            service_filter: None,
             time_ranges: Vec::new(),
         }
-    }
-
-    /// Whether the column at `index` is built.
-    #[inline]
-    pub(crate) fn builds(&self, index: usize) -> bool {
-        self.columns[index]
     }
 
     /// Whether the named column is built. Panics on a name the schema lacks,
     /// which is a bug in the builder asking.
     pub(crate) fn builds_named(&self, schema: &Schema, name: &str) -> bool {
-        self.builds(
-            schema
-                .index_of(name)
-                .unwrap_or_else(|_| panic!("no column {name}")),
-        )
-    }
-
-    /// Whether every column is built.
-    pub(crate) fn builds_everything(&self) -> bool {
-        self.columns.iter().all(|built| *built)
+        let index = schema
+            .index_of(name)
+            .unwrap_or_else(|_| panic!("no column {name}"));
+        self.built[index]
     }
 
     /// Whether a resource whose emitted `service_name` is `service_name`
     /// (`None` emits `"unknown"`) keeps its rows.
     pub(crate) fn keeps_service(&self, service_name: Option<&str>) -> bool {
-        let Some(names) = &self.service_names else {
-            return true;
-        };
-        let value = service_name.unwrap_or(crate::batch::UNKNOWN_SERVICE_NAME);
-        names.iter().any(|name| name == value)
+        self.service_filter
+            .as_ref()
+            .is_none_or(|filter| filter(service_name.unwrap_or(crate::batch::UNKNOWN_SERVICE_NAME)))
     }
 
     /// The range rows must fall in on the named column, if any.
@@ -217,6 +216,25 @@ impl Plan {
             .iter()
             .find(|range| range.column == index)
             .map(|range| (range.min, range.max))
+    }
+
+    /// The batch of `rows` rows this plan returns from one array per schema
+    /// column. Arrays of columns that were not built are dropped unread.
+    pub(crate) fn finish(
+        &self,
+        schema: SchemaRef,
+        arrays: Vec<ArrayRef>,
+        rows: usize,
+    ) -> Result<RecordBatch> {
+        let Some(output) = &self.output else {
+            return Ok(RecordBatch::try_new(schema, arrays)?);
+        };
+        let schema = Arc::new(schema.project(output)?);
+        let columns = output.iter().map(|&i| Arc::clone(&arrays[i])).collect();
+        let options = RecordBatchOptions::new().with_row_count(Some(rows));
+        Ok(RecordBatch::try_new_with_options(
+            schema, columns, &options,
+        )?)
     }
 }
 
@@ -243,8 +261,10 @@ mod tests {
 
     #[test]
     fn default_plan_builds_everything() {
-        let plan = TransformOptions::new().plan(&crate::logs_schema()).unwrap();
-        assert!(plan.builds_everything());
+        let schema = crate::logs_schema();
+        let plan = TransformOptions::new().plan(&schema).unwrap();
+        assert!(plan.built.iter().all(|built| *built));
+        assert!(plan.output.is_none());
         assert!(plan.keeps_service(None));
     }
 
@@ -252,14 +272,14 @@ mod tests {
     fn rejects_columns_past_the_schema() {
         let schema = crate::logs_schema();
         let width = schema.fields().len();
-        assert!(TransformOptions::new()
-            .with_columns([width])
-            .plan(&schema)
-            .is_err());
-        assert!(TransformOptions::new()
-            .with_columns([usize::MAX])
-            .plan(&schema)
-            .is_err());
+        for column in [width, usize::MAX] {
+            let error = TransformOptions::new()
+                .with_columns([column])
+                .plan(&schema)
+                .err()
+                .expect("rejected");
+            assert!(matches!(error, Error::InvalidOptions(_)), "{error}");
+        }
     }
 
     #[test]
@@ -269,7 +289,8 @@ mod tests {
         let error = TransformOptions::new()
             .with_time_range(body, 0, 1)
             .plan(&schema)
-            .unwrap_err();
+            .err()
+            .expect("rejected");
         assert!(error.to_string().contains("not a nanosecond timestamp"));
     }
 
@@ -286,9 +307,9 @@ mod tests {
     }
 
     #[test]
-    fn missing_service_name_matches_unknown() {
+    fn missing_service_name_is_asked_about_unknown() {
         let plan = TransformOptions::new()
-            .with_service_names(["unknown"])
+            .with_service_filter(|name| name == "unknown")
             .plan(&crate::logs_schema())
             .unwrap();
         assert!(plan.keeps_service(None));

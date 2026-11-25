@@ -200,6 +200,18 @@ static int column_index(const struct ArrowSchema* schema, const char* name) {
     return -1;
 }
 
+/* Keeps the service named by user_data and counts how often it is asked. */
+typedef struct {
+    const char* keep;
+    int calls;
+} ServiceQuery;
+
+static bool keep_service(void* user_data, const uint8_t* name, size_t len) {
+    ServiceQuery* query = user_data;
+    query->calls++;
+    return len == strlen(query->keep) && memcmp(name, query->keep, len) == 0;
+}
+
 static void test_options(const char* root) {
     Bytes logs = read_file(root, "testdata/logs_large.pb");
     struct ArrowArray full, array;
@@ -210,34 +222,51 @@ static void test_options(const char* root) {
     int service = column_index(&full_schema, "service_name");
     CHECK(body >= 0 && service >= 0);
 
-    /* Only service_name: every other column is all-null, the row count is unchanged. */
+    /* A zero-initialized struct is everything. */
     OtlpReadOptions options;
     memset(&options, 0, sizeof options);
-    options.columns = UINT64_C(1) << service;
     CHECK(otlp_transform_with_options(OTLP_SIGNAL_LOGS, OTLP_FORMAT_PROTOBUF, OTLP_ARROW_PROFILE_DUCKDB, &options,
                                       logs.data, logs.len, &array, &schema) == OTLP_OK);
-    CHECK(array.length == full.length);
-    CHECK(array.n_children == full.n_children);
-    CHECK(array.children[body]->null_count == array.length);
-    CHECK(array.children[service]->null_count == 0);
+    CHECK(array.length == full.length && array.n_children == full.n_children);
     array.release(&array);
     schema.release(&schema);
 
-    /* A service no resource has keeps no rows. */
-    OtlpStr nobody = {(const uint8_t*)"no-such-service", strlen("no-such-service")};
-    options.columns = OTLP_COLUMNS_ALL;
-    options.service_names = &nobody;
-    options.service_names_len = 1;
+    /* Columns come back as asked: these two, in this order. */
+    uint32_t columns[] = {(uint32_t)service, (uint32_t)body};
+    options.columns = columns;
+    options.columns_len = 2;
+    CHECK(otlp_transform_with_options(OTLP_SIGNAL_LOGS, OTLP_FORMAT_PROTOBUF, OTLP_ARROW_PROFILE_DUCKDB, &options,
+                                      logs.data, logs.len, &array, &schema) == OTLP_OK);
+    CHECK(array.length == full.length);
+    CHECK(schema.n_children == 2);
+    CHECK(strcmp(schema.children[0]->name, "service_name") == 0);
+    CHECK(strcmp(schema.children[1]->name, "body") == 0);
+    array.release(&array);
+    schema.release(&schema);
+
+    /* No columns: only the row count. */
+    options.columns_len = 0;
+    CHECK(otlp_transform_with_options(OTLP_SIGNAL_LOGS, OTLP_FORMAT_PROTOBUF, OTLP_ARROW_PROFILE_DUCKDB, &options,
+                                      logs.data, logs.len, &array, &schema) == OTLP_OK);
+    CHECK(array.length == full.length && schema.n_children == 0);
+    array.release(&array);
+    schema.release(&schema);
+
+    /* The service filter is asked about each resource; rejecting every service keeps no rows. */
+    ServiceQuery nobody = {"no-such-service", 0};
+    memset(&options, 0, sizeof options);
+    options.keep_service = keep_service;
+    options.keep_service_data = &nobody;
     CHECK(otlp_transform_with_options(OTLP_SIGNAL_LOGS, OTLP_FORMAT_AUTO, OTLP_ARROW_PROFILE_DUCKDB, &options,
                                       logs.data, logs.len, &array, &schema) == OTLP_OK);
     CHECK(array.length == 0);
+    CHECK(nobody.calls > 0);
     array.release(&array);
     schema.release(&schema);
 
     /* A range covering everything keeps every row with a timestamp. */
     OtlpTimeRange everything = {0, INT64_MIN, INT64_MAX};
     memset(&options, 0, sizeof options);
-    options.columns = OTLP_COLUMNS_ALL;
     options.time_ranges = &everything;
     options.time_ranges_len = 1;
     CHECK(otlp_transform_with_options(OTLP_SIGNAL_LOGS, OTLP_FORMAT_PROTOBUF, OTLP_ARROW_PROFILE_CANONICAL,
@@ -251,14 +280,10 @@ static void test_options(const char* root) {
     options.time_ranges = &on_body;
     CHECK(otlp_transform_with_options(OTLP_SIGNAL_LOGS, OTLP_FORMAT_PROTOBUF, OTLP_ARROW_PROFILE_DUCKDB, &options,
                                       logs.data, logs.len, &array, &schema) == OTLP_ERROR_INVALID_ARGUMENT);
+    uint32_t past[] = {(uint32_t)full_schema.n_children};
     memset(&options, 0, sizeof options);
-    options.columns = UINT64_C(1) << full_schema.n_children;
-    CHECK(otlp_transform_with_options(OTLP_SIGNAL_LOGS, OTLP_FORMAT_PROTOBUF, OTLP_ARROW_PROFILE_DUCKDB, &options,
-                                      logs.data, logs.len, &array, &schema) == OTLP_ERROR_INVALID_ARGUMENT);
-    OtlpStr not_utf8 = {(const uint8_t*)"\xff", 1};
-    options.columns = OTLP_COLUMNS_ALL;
-    options.service_names = &not_utf8;
-    options.service_names_len = 1;
+    options.columns = past;
+    options.columns_len = 1;
     CHECK(otlp_transform_with_options(OTLP_SIGNAL_LOGS, OTLP_FORMAT_PROTOBUF, OTLP_ARROW_PROFILE_DUCKDB, &options,
                                       logs.data, logs.len, &array, &schema) == OTLP_ERROR_INVALID_ARGUMENT);
     full.release(&full);
@@ -281,12 +306,13 @@ static void test_options(const char* root) {
     /* OTAP: the same options through the stateful decoder. */
     Bytes bar = read_file(root, "tests/fixtures/otap/logs-initial.bar");
     OtlpOtapDecoder* decoder = otlp_otap_decoder_new_with_profile(OTLP_ARROW_PROFILE_DUCKDB);
+    uint32_t service_only[] = {(uint32_t)service};
     memset(&options, 0, sizeof options);
-    options.columns = UINT64_C(1) << service;
+    options.columns = service_only;
+    options.columns_len = 1;
     CHECK(otlp_otap_decode_with_options(decoder, OTLP_SIGNAL_LOGS, &options, bar.data, bar.len, &array, &schema) ==
           OTLP_OK);
-    CHECK(array.length > 0);
-    CHECK(array.children[body]->null_count == array.length);
+    CHECK(array.length > 0 && schema.n_children == 1);
     array.release(&array);
     schema.release(&schema);
     CHECK(otlp_otap_decode_with_options(NULL, OTLP_SIGNAL_LOGS, &options, bar.data, bar.len, &array, &schema) ==

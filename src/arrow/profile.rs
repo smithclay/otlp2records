@@ -29,8 +29,8 @@ use std::sync::Arc;
 use arrow_array::types::{Int32Type, Int64Type, UInt16Type, UInt32Type, UInt64Type, UInt8Type};
 use arrow_array::ArrowPrimitiveType;
 use arrow_array::{
-    make_array, new_null_array, Array, ArrayRef, FixedSizeBinaryArray, LargeListArray, ListArray,
-    PrimitiveArray, RecordBatch, RecordBatchOptions, StringArray,
+    make_array, Array, ArrayRef, FixedSizeBinaryArray, LargeListArray, ListArray, PrimitiveArray,
+    RecordBatch, RecordBatchOptions, StringArray,
 };
 use arrow_schema::{DataType, Field, FieldRef, Schema};
 
@@ -141,12 +141,6 @@ fn apply_duckdb(batch: RecordBatch) -> Result<RecordBatch> {
 
 /// Re-type one column. `column` names the source column in error messages.
 fn duckdb_array(column: &str, array: &ArrayRef) -> Result<ArrayRef> {
-    // An all-null column (one a reader did not ask for) has no values to
-    // convert; one whose type is unchanged takes the zero-copy path below.
-    let target = duckdb_type(array.data_type());
-    if array.null_count() == array.len() && &target != array.data_type() {
-        return Ok(new_null_array(&target, array.len()));
-    }
     Ok(match array.data_type() {
         DataType::FixedSizeBinary(_) => Arc::new(hex_encode(
             array

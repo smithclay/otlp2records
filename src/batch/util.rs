@@ -7,10 +7,10 @@ use arrow_array::{
         FixedSizeBinaryBuilder, Float64Builder, ListBuilder, StringBuilder,
         TimestampNanosecondBuilder, UInt64Builder,
     },
-    new_null_array, Array, ArrayRef, RecordBatch, RecordBatchOptions,
+    Array, ArrayRef,
 };
 
-use crate::{options::Plan, DecodeError, Error, Result};
+use crate::{DecodeError, Error, Result};
 
 #[inline]
 pub(super) fn append_opt_n(builder: &mut StringBuilder, value: Option<&str>, n: usize) {
@@ -155,47 +155,6 @@ pub(super) fn string_builder_bytes(rows: usize, data_capacity: usize) -> StringB
 #[inline]
 pub(super) fn array<A: Array + 'static>(array: A) -> ArrayRef {
     Arc::new(array)
-}
-
-#[inline]
-pub(super) fn record_batch(
-    schema: Arc<arrow_schema::Schema>,
-    arrays: Vec<ArrayRef>,
-) -> Result<RecordBatch> {
-    Ok(RecordBatch::try_new(schema, arrays)?)
-}
-
-/// Assembles a batch of `rows` rows from builder output, replacing every
-/// column `plan` does not build with an all-null array (its field marked
-/// nullable). Builders skip the appends for those columns, so their arrays
-/// are discarded here unread.
-pub(super) fn finish_batch(
-    schema: Arc<arrow_schema::Schema>,
-    plan: &Plan,
-    arrays: Vec<ArrayRef>,
-    rows: usize,
-) -> Result<RecordBatch> {
-    if plan.builds_everything() {
-        return record_batch(schema, arrays);
-    }
-    let mut fields = Vec::with_capacity(arrays.len());
-    let mut columns = Vec::with_capacity(arrays.len());
-    for (index, (field, array)) in schema.fields().iter().zip(arrays).enumerate() {
-        if plan.builds(index) {
-            fields.push(Arc::clone(field));
-            columns.push(array);
-        } else {
-            fields.push(Arc::new(field.as_ref().clone().with_nullable(true)));
-            columns.push(new_null_array(field.data_type(), rows));
-        }
-    }
-    let schema = arrow_schema::Schema::new_with_metadata(fields, schema.metadata().clone());
-    let options = RecordBatchOptions::new().with_row_count(Some(rows));
-    Ok(RecordBatch::try_new_with_options(
-        Arc::new(schema),
-        columns,
-        &options,
-    )?)
 }
 
 /// The value a nullable timestamp column emits for a raw OTLP field, where

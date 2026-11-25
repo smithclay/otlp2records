@@ -184,25 +184,26 @@ use otlp2records::{transform_traces_with_options, InputFormat, TransformOptions}
 let schema = otlp2records::traces_schema();
 let options = TransformOptions::new()
     .with_columns([schema.index_of("name")?, schema.index_of("service_name")?])
-    .with_service_names(["checkout"])
+    .with_service_filter(|service| service == "checkout")
     .with_time_range(schema.index_of("start_time_unix_nano")?, start_ns, end_ns);
 let batch = transform_traces_with_options(bytes, InputFormat::Auto, &options)?;
 ```
 
-Columns that were not requested are still in the batch, as all-null arrays (their fields
-are marked nullable), so column order and names never change. The row predicates are
-pruning, not query evaluation:
+The batch holds exactly the requested columns, in the requested order. Rows are kept only
+if their resource passes the service filter and they fall inside every time range:
 
-- A row is kept if its emitted `service_name` is in the set and it falls inside every time
-  range.
-- A resource without `service.name` matches `"unknown"`.
+- The service filter is called once per resource with the emitted `service_name`, so a
+  resource without `service.name` is asked about `"unknown"`. A rejected resource costs
+  nothing beyond decoding it.
 - A range is inclusive, in nanoseconds, and only allowed on a `Timestamp(Nanosecond)`
-  column.
-- A NULL timestamp falls outside every range.
+  column. A NULL timestamp falls outside every range.
+- For metrics, only the requested shape is built, and it is always returned (empty when
+  the input has none of it).
 
-Options that do not fit the schema are rejected with `Error::InvalidInput` before
-decoding. The C ABI exposes the same options as `OtlpReadOptions` through
-`otlp_transform_with_options()` and `otlp_otap_decode_with_options()`.
+Options that do not fit the schema are rejected with `Error::InvalidOptions` before
+decoding. The C ABI exposes the same options as `OtlpReadOptions` (a column list, an
+`OtlpServiceFilter` callback, time ranges) through `otlp_transform_with_options()` and
+`otlp_otap_decode_with_options()`.
 
 ### Transform Observation
 

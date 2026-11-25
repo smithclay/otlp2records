@@ -20,28 +20,24 @@ pub fn transform_metrics(bytes: &[u8], format: InputFormat) -> Result<MetricBatc
 }
 
 /// Transform one metric shape of OTLP metrics, building only the columns and
-/// rows `options` asks for (column indexes are the shape's). The other shapes
-/// are not built, so their fields in the result are `None`; `skipped` still
-/// counts summary points. See [`TransformOptions`].
+/// rows `options` asks for (column indexes are the shape's). That shape's
+/// field is always `Some`, an empty batch when the input has none of it; the
+/// other shapes are not built, so theirs are `None`. `skipped` still counts
+/// summary points. See [`TransformOptions`].
 pub fn transform_metrics_with_options(
     bytes: &[u8],
     format: InputFormat,
     shape: MetricShape,
     options: &TransformOptions,
 ) -> Result<MetricBatches> {
+    // Planned first, so an options error is never retried as another format.
     let plan = options.plan(&shape.schema_ref())?;
-    transform_metrics_planned(bytes, format, MetricsSelection::Shape(shape, &plan))
-}
-
-/// The transform behind the public entry points, for a selection whose plan
-/// is already made. Planning first keeps an options error from being
-/// mistaken for a decode failure and retried as another format.
-pub(crate) fn transform_metrics_planned(
-    bytes: &[u8],
-    format: InputFormat,
-    selection: MetricsSelection<'_>,
-) -> Result<MetricBatches> {
-    transform_metrics_observed(bytes, format, &mut None, selection)
+    transform_metrics_observed(
+        bytes,
+        format,
+        &mut None,
+        MetricsSelection::Shape(shape, &plan),
+    )
 }
 
 /// Transform OTLP metrics while reporting phase timings to an observer.
