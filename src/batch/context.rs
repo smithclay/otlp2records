@@ -11,13 +11,11 @@ use crate::views::pdata::{
 };
 
 use super::{
-    profile::{
-        measure_phase, observe_counter, TransformCounter, TransformObserver, TransformPhase,
-        TransformSignal,
-    },
+    profile::{Observation, TransformCounter, TransformPhase},
     view_json,
 };
 
+/// The resource and scope contexts seen so far in one observed transform.
 #[derive(Default)]
 pub(super) struct ContextDuplicateTracker {
     resource_contexts: HashSet<u64>,
@@ -25,38 +23,28 @@ pub(super) struct ContextDuplicateTracker {
 }
 
 impl ContextDuplicateTracker {
-    pub(super) fn observe_resource_view<R: ResourceView>(
-        &mut self,
-        resource: &R,
-        signal: TransformSignal,
-        observer: &mut Option<&mut dyn TransformObserver>,
-    ) {
+    /// Whether `resource`'s context was seen before, as the counter to bump.
+    pub(super) fn resource<R: ResourceView>(&mut self, resource: &R) -> TransformCounter {
         let mut hasher = DefaultHasher::new();
         hash_view_attrs(resource.attributes(), &mut hasher);
-        let counter = if self.resource_contexts.insert(hasher.finish()) {
+        if self.resource_contexts.insert(hasher.finish()) {
             TransformCounter::ResourceContextDuplicateMiss
         } else {
             TransformCounter::ResourceContextDuplicateHit
-        };
-        observe_counter(observer, signal, counter, 1);
+        }
     }
 
-    pub(super) fn observe_scope_view<S: InstrumentationScopeView>(
-        &mut self,
-        scope: &S,
-        signal: TransformSignal,
-        observer: &mut Option<&mut dyn TransformObserver>,
-    ) {
+    /// Whether `scope`'s context was seen before, as the counter to bump.
+    pub(super) fn scope<S: InstrumentationScopeView>(&mut self, scope: &S) -> TransformCounter {
         let mut hasher = DefaultHasher::new();
         scope.name().hash(&mut hasher);
         scope.version().hash(&mut hasher);
         hash_view_attrs(scope.attributes(), &mut hasher);
-        let counter = if self.scope_contexts.insert(hasher.finish()) {
+        if self.scope_contexts.insert(hasher.finish()) {
             TransformCounter::ScopeContextDuplicateMiss
         } else {
             TransformCounter::ScopeContextDuplicateHit
-        };
-        observe_counter(observer, signal, counter, 1);
+        }
     }
 }
 
@@ -71,22 +59,17 @@ impl ResourceContext {
     /// `None` when `keep` rejects the resource's service name: its rows are
     /// dropped, so nothing else about it is worth computing. The attribute
     /// JSON is serialized only when `attributes` asks for it.
-    pub(super) fn from_view_observed<R: ResourceView>(
+    pub(super) fn from_view<R: ResourceView>(
         resource: Option<&R>,
-        signal: TransformSignal,
-        observer: &mut Option<&mut dyn TransformObserver>,
-        duplicates: Option<&mut ContextDuplicateTracker>,
+        obs: &mut Observation<'_>,
         keep: impl FnOnce(Option<&str>) -> bool,
         attributes: bool,
     ) -> Option<Self> {
-        if let (Some(duplicates), Some(resource)) = (duplicates, resource) {
-            duplicates.observe_resource_view(resource, signal, observer);
+        if let Some(resource) = resource {
+            obs.track_resource(resource);
         }
-        let (service_name, service_namespace, service_instance_id) = measure_phase(
-            observer,
-            signal,
-            TransformPhase::ResourceContextBuild,
-            || {
+        let (service_name, service_namespace, service_instance_id) =
+            obs.phase(TransformPhase::ResourceContextBuild, || {
                 let field = |key| {
                     resource
                         .and_then(|resource| view_json::attribute_field(resource.attributes(), key))
@@ -96,18 +79,14 @@ impl ResourceContext {
                     field(b"service.namespace"),
                     field(b"service.instance.id"),
                 )
-            },
-        );
+            });
         if !keep(service_name.as_deref()) {
             return None;
         }
         let attributes_json = if attributes {
-            measure_phase(
-                observer,
-                signal,
-                TransformPhase::ResourceAttributesJson,
-                || resource.and_then(|resource| view_json::attributes_json(resource.attributes())),
-            )
+            obs.phase(TransformPhase::ResourceAttributesJson, || {
+                resource.and_then(|resource| view_json::attributes_json(resource.attributes()))
+            })
         } else {
             None
         };
@@ -128,34 +107,28 @@ pub(super) struct ScopeContext {
 }
 
 impl ScopeContext {
-    pub(super) fn from_view_observed<S: InstrumentationScopeView>(
+    pub(super) fn from_view<S: InstrumentationScopeView>(
         scope: Option<&S>,
-        signal: TransformSignal,
-        observer: &mut Option<&mut dyn TransformObserver>,
-        duplicates: Option<&mut ContextDuplicateTracker>,
+        obs: &mut Observation<'_>,
         attributes: bool,
     ) -> Self {
-        if let (Some(duplicates), Some(scope)) = (duplicates, scope) {
-            duplicates.observe_scope_view(scope, signal, observer);
+        if let Some(scope) = scope {
+            obs.track_scope(scope);
         }
-        let (name, version) =
-            measure_phase(observer, signal, TransformPhase::ScopeContextBuild, || {
-                (
-                    scope
-                        .and_then(InstrumentationScopeView::name)
-                        .map(|value| String::from_utf8_lossy(value).into_owned()),
-                    scope
-                        .and_then(InstrumentationScopeView::version)
-                        .map(|value| String::from_utf8_lossy(value).into_owned()),
-                )
-            });
-        let attributes_json = if attributes {
-            measure_phase(
-                observer,
-                signal,
-                TransformPhase::ScopeAttributesJson,
-                || scope.and_then(|scope| view_json::attributes_json(scope.attributes())),
+        let (name, version) = obs.phase(TransformPhase::ScopeContextBuild, || {
+            (
+                scope
+                    .and_then(InstrumentationScopeView::name)
+                    .map(|value| String::from_utf8_lossy(value).into_owned()),
+                scope
+                    .and_then(InstrumentationScopeView::version)
+                    .map(|value| String::from_utf8_lossy(value).into_owned()),
             )
+        });
+        let attributes_json = if attributes {
+            obs.phase(TransformPhase::ScopeAttributesJson, || {
+                scope.and_then(|scope| view_json::attributes_json(scope.attributes()))
+            })
         } else {
             None
         };

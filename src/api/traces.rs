@@ -7,7 +7,7 @@ use crate::{
         auto::{auto_dispatch, decode_json_observed},
         batch_to_json_values,
     },
-    batch::{self, TransformObserver, TransformSignal},
+    batch::{self, Observation, TransformSignal},
     decode::{decode_traces_json_request, decode_traces_jsonl_request, InputFormat},
     options::Plan,
     schema::traces_schema_arc,
@@ -20,26 +20,27 @@ use crate::{
 /// It handles decoding, transformation, and Arrow conversion in one step.
 /// [`crate::Transformer`] adds options and an observer.
 pub fn transform_traces(bytes: &[u8], format: InputFormat) -> Result<RecordBatch> {
-    transform_traces_observed(bytes, format, &mut None, &Plan::all(&traces_schema_arc()))
+    let mut obs = Observation::none(TransformSignal::Traces);
+    transform_traces_observed(bytes, format, &mut obs, &Plan::all(&traces_schema_arc()))
 }
 
 pub(super) fn transform_traces_observed(
     bytes: &[u8],
     format: InputFormat,
-    observer: &mut Option<&mut dyn TransformObserver>,
+    obs: &mut Observation<'_>,
     plan: &Plan,
 ) -> Result<RecordBatch> {
     match format {
-        InputFormat::Protobuf => batch::transform_traces_protobuf_observed(bytes, observer, plan),
+        InputFormat::Protobuf => batch::transform_traces_protobuf_observed(bytes, obs, plan),
         InputFormat::Auto => auto_dispatch(
             bytes,
-            observer,
+            obs,
             |b, obs| transform_traces_json_arrow_observed(b, InputFormat::Json, obs, plan),
             |b, obs| transform_traces_json_arrow_observed(b, InputFormat::Jsonl, obs, plan),
             |b, obs| batch::transform_traces_protobuf_observed(b, obs, plan),
         ),
         InputFormat::Json | InputFormat::Jsonl => {
-            transform_traces_json_arrow_observed(bytes, format, observer, plan)
+            transform_traces_json_arrow_observed(bytes, format, obs, plan)
         }
     }
 }
@@ -47,19 +48,18 @@ pub(super) fn transform_traces_observed(
 fn transform_traces_json_arrow_observed(
     bytes: &[u8],
     format: InputFormat,
-    observer: &mut Option<&mut dyn TransformObserver>,
+    obs: &mut Observation<'_>,
     plan: &Plan,
 ) -> Result<RecordBatch> {
     let request = decode_json_observed(
         bytes,
         format,
-        TransformSignal::Traces,
-        observer,
+        obs,
         decode_traces_json_request,
         decode_traces_jsonl_request,
         "traces",
     )?;
-    batch::transform_traces_request_observed(request, bytes.len(), observer, plan)
+    batch::transform_traces_request_observed(request, bytes.len(), obs, plan)
 }
 
 /// Transform OTLP traces to JSON values.

@@ -4,7 +4,7 @@
 use arrow_array::RecordBatch;
 
 use crate::{
-    batch::{MetricsSelection, TransformObserver},
+    batch::{MetricsSelection, Observation, TransformObserver, TransformSignal},
     schema::{logs_schema_arc, traces_schema_arc},
     Error, InputFormat, MetricBatches, MetricShape, MetricShapeBatch, Result, TransformOptions,
 };
@@ -60,17 +60,30 @@ impl<'o> Transformer<'o> {
         self
     }
 
+    /// What one transform of `signal` reports to `observer`.
+    fn observation<'a>(
+        observer: &'a mut Option<&'o mut dyn TransformObserver>,
+        signal: TransformSignal,
+    ) -> Observation<'a> {
+        let observer = observer
+            .as_mut()
+            .map(|o| &mut **o as &mut dyn TransformObserver);
+        Observation::new(signal, observer)
+    }
+
     /// Transforms OTLP logs.
     pub fn logs(&mut self, bytes: &[u8]) -> Result<RecordBatch> {
         // Planned first, so an options error is never retried as another format.
         let plan = self.options.plan(&logs_schema_arc())?;
-        super::logs::transform_logs_observed(bytes, self.format, &mut self.observer, &plan)
+        let mut obs = Self::observation(&mut self.observer, TransformSignal::Logs);
+        super::logs::transform_logs_observed(bytes, self.format, &mut obs, &plan)
     }
 
     /// Transforms OTLP traces.
     pub fn traces(&mut self, bytes: &[u8]) -> Result<RecordBatch> {
         let plan = self.options.plan(&traces_schema_arc())?;
-        super::traces::transform_traces_observed(bytes, self.format, &mut self.observer, &plan)
+        let mut obs = Self::observation(&mut self.observer, TransformSignal::Traces);
+        super::traces::transform_traces_observed(bytes, self.format, &mut obs, &plan)
     }
 
     /// Transforms OTLP metrics into every shape. A column index means
@@ -83,10 +96,11 @@ impl<'o> Transformer<'o> {
                 "options narrow a single metric shape; use metric_shape".into(),
             ));
         }
+        let mut obs = Self::observation(&mut self.observer, TransformSignal::Metrics);
         super::metrics::transform_metrics_observed(
             bytes,
             self.format,
-            &mut self.observer,
+            &mut obs,
             MetricsSelection::All,
         )
     }
@@ -96,10 +110,11 @@ impl<'o> Transformer<'o> {
     /// of is an empty batch.
     pub fn metric_shape(&mut self, shape: MetricShape, bytes: &[u8]) -> Result<MetricShapeBatch> {
         let plan = self.options.plan(&shape.schema_ref())?;
+        let mut obs = Self::observation(&mut self.observer, TransformSignal::Metrics);
         super::metrics::transform_metrics_observed(
             bytes,
             self.format,
-            &mut self.observer,
+            &mut obs,
             MetricsSelection::Shape(shape, &plan),
         )
         .map(|batches| batches.into_shape(shape))

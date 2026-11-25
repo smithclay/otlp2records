@@ -15,7 +15,7 @@ pub(crate) use logs::{transform_logs_protobuf_observed, transform_logs_request_o
 pub(crate) use metrics::{
     transform_metrics_protobuf_observed, transform_metrics_request_observed, MetricsSelection,
 };
-pub(crate) use profile::observe_phase;
+pub(crate) use profile::Observation;
 pub use profile::{
     TransformCounter, TransformCounterValue, TransformObserver, TransformPhase,
     TransformPhaseTiming, TransformSignal,

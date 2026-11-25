@@ -25,11 +25,8 @@ use crate::{
 };
 
 use super::{
-    context::{ContextDuplicateTracker, MetricMeta, ResourceContext, ScopeContext},
-    profile::{
-        measure_phase, measure_result, observe_counter, TransformCounter, TransformObserver,
-        TransformPhase, TransformSignal,
-    },
+    context::{MetricMeta, ResourceContext, ScopeContext},
+    profile::{Observation, TransformCounter, TransformPhase, TransformSignal},
     util::{
         append_f64_list, append_finite, append_finite_opt, append_opt_n, append_opt_ts_ns,
         append_required_service_name_n, append_required_ts_ns, append_u64_list, array, opt_ts,
@@ -109,95 +106,90 @@ impl PointFilter {
 
 pub fn transform_metrics_protobuf_observed(
     bytes: &[u8],
-    observer: &mut Option<&mut dyn TransformObserver>,
+    obs: &mut Observation<'_>,
     selection: MetricsSelection<'_>,
 ) -> Result<MetricBatches> {
-    let request = measure_result(
-        observer,
-        TransformSignal::Metrics,
-        TransformPhase::ProtobufDecode,
-        || ExportMetricsServiceRequest::decode(bytes),
-    )?;
-    transform_metrics_request_observed(request, observer, selection)
+    let request = obs.phase(TransformPhase::ProtobufDecode, || {
+        ExportMetricsServiceRequest::decode(bytes)
+    })?;
+    transform_metrics_request_observed(request, obs, selection)
 }
 
 #[cfg(test)]
 fn transform_metrics_request(request: ExportMetricsServiceRequest) -> Result<MetricBatches> {
-    transform_metrics_request_observed(request, &mut None, MetricsSelection::All)
+    transform_metrics_request_observed(
+        request,
+        &mut Observation::none(TransformSignal::Metrics),
+        MetricsSelection::All,
+    )
 }
 
 pub fn transform_metrics_request_observed(
     request: ExportMetricsServiceRequest,
-    observer: &mut Option<&mut dyn TransformObserver>,
+    obs: &mut Observation<'_>,
     selection: MetricsSelection<'_>,
 ) -> Result<MetricBatches> {
-    transform_metrics_view_observed(&Obj::new(&request), observer, selection)
+    transform_metrics_view_observed(&Obj::new(&request), obs, selection)
 }
 
 pub(crate) fn transform_metrics_view<V: MetricsView>(
     view: &V,
     selection: MetricsSelection<'_>,
 ) -> Result<MetricBatches> {
-    transform_metrics_view_observed(view, &mut None, selection)
+    transform_metrics_view_observed(
+        view,
+        &mut Observation::none(TransformSignal::Metrics),
+        selection,
+    )
 }
 
 pub(crate) fn transform_metrics_view_observed<V: MetricsView>(
     view: &V,
-    observer: &mut Option<&mut dyn TransformObserver>,
+    obs: &mut Observation<'_>,
     selection: MetricsSelection<'_>,
 ) -> Result<MetricBatches> {
     let mut capacities = MetricCapacities::default();
-    measure_phase(
-        observer,
-        TransformSignal::Metrics,
-        TransformPhase::MetricsCapacity,
-        || {
-            for resource_metrics in view.resources() {
-                for scope_metrics in resource_metrics.scopes() {
-                    for metric in scope_metrics.metrics() {
-                        let Some(data) = metric.data() else {
-                            continue;
-                        };
-                        match data.value_type() {
-                            DataType::Gauge if selection.builds(MetricShape::Gauge) => {
-                                capacities.gauge += data.as_gauge().unwrap().data_points().count();
-                            }
-                            DataType::Sum if selection.builds(MetricShape::Sum) => {
-                                capacities.sum += data.as_sum().unwrap().data_points().count();
-                            }
-                            DataType::Histogram if selection.builds(MetricShape::Histogram) => {
-                                capacities.histogram +=
-                                    data.as_histogram().unwrap().data_points().count();
-                            }
-                            DataType::ExponentialHistogram
-                                if selection.builds(MetricShape::ExponentialHistogram) =>
-                            {
-                                capacities.exp_histogram += data
-                                    .as_exponential_histogram()
-                                    .unwrap()
-                                    .data_points()
-                                    .count();
-                            }
-                            _ => {}
+    obs.phase(TransformPhase::MetricsCapacity, || {
+        for resource_metrics in view.resources() {
+            for scope_metrics in resource_metrics.scopes() {
+                for metric in scope_metrics.metrics() {
+                    let Some(data) = metric.data() else {
+                        continue;
+                    };
+                    match data.value_type() {
+                        DataType::Gauge if selection.builds(MetricShape::Gauge) => {
+                            capacities.gauge += data.as_gauge().unwrap().data_points().count();
                         }
+                        DataType::Sum if selection.builds(MetricShape::Sum) => {
+                            capacities.sum += data.as_sum().unwrap().data_points().count();
+                        }
+                        DataType::Histogram if selection.builds(MetricShape::Histogram) => {
+                            capacities.histogram +=
+                                data.as_histogram().unwrap().data_points().count();
+                        }
+                        DataType::ExponentialHistogram
+                            if selection.builds(MetricShape::ExponentialHistogram) =>
+                        {
+                            capacities.exp_histogram += data
+                                .as_exponential_histogram()
+                                .unwrap()
+                                .data_points()
+                                .count();
+                        }
+                        _ => {}
                     }
                 }
             }
-        },
-    );
-    observe_counter(
-        observer,
-        TransformSignal::Metrics,
+        }
+    });
+    obs.count(
         TransformCounter::OutputRows,
         (capacities.gauge + capacities.sum + capacities.histogram + capacities.exp_histogram)
             as u64,
     );
 
-    let (mut gauge, mut sum, mut histogram, mut exp_histogram) = measure_phase(
-        observer,
-        TransformSignal::Metrics,
-        TransformPhase::BuilderInit,
-        || {
+    let (mut gauge, mut sum, mut histogram, mut exp_histogram) =
+        obs.phase(TransformPhase::BuilderInit, || {
             (
                 GaugeBuilders::with_capacity(capacities.gauge, selection.plan(MetricShape::Gauge)),
                 SumBuilders::with_capacity(capacities.sum, selection.plan(MetricShape::Sum)),
@@ -210,10 +202,8 @@ pub(crate) fn transform_metrics_view_observed<V: MetricsView>(
                     selection.plan(MetricShape::ExponentialHistogram),
                 ),
             )
-        },
-    );
+        });
     let mut skipped = SkippedMetrics::default();
-    let mut duplicates = observer.is_some().then(ContextDuplicateTracker::default);
     // Context attributes are serialized if any shape being built keeps them.
     let resource_attributes = gauge.resource_attributes.built()
         || sum.resource_attributes.built()
@@ -226,11 +216,9 @@ pub(crate) fn transform_metrics_view_observed<V: MetricsView>(
 
     for resource_metrics in view.resources() {
         let resource_view = resource_metrics.resource();
-        let Some(resource) = ResourceContext::from_view_observed(
+        let Some(resource) = ResourceContext::from_view(
             resource_view.as_ref(),
-            TransformSignal::Metrics,
-            observer,
-            duplicates.as_mut(),
+            obs,
             |service| {
                 selection
                     .narrowing()
@@ -243,13 +231,7 @@ pub(crate) fn transform_metrics_view_observed<V: MetricsView>(
 
         for scope_metrics in resource_metrics.scopes() {
             let scope_view = scope_metrics.scope();
-            let scope = ScopeContext::from_view_observed(
-                scope_view.as_ref(),
-                TransformSignal::Metrics,
-                observer,
-                duplicates.as_mut(),
-                scope_attributes,
-            );
+            let scope = ScopeContext::from_view(scope_view.as_ref(), obs, scope_attributes);
 
             for metric in scope_metrics.metrics() {
                 let metric_name = String::from_utf8_lossy(metric.name());
@@ -265,143 +247,59 @@ pub(crate) fn transform_metrics_view_observed<V: MetricsView>(
                 };
 
                 match data.value_type() {
-                    DataType::Gauge if selection.builds(MetricShape::Gauge) => {
-                        let data = data.as_gauge().unwrap();
-                        let rows_before = gauge.rows;
-                        let points = gauge.points;
-                        for point in data
-                            .data_points()
-                            .filter(|p| points.keeps(p.time_unix_nano(), p.start_time_unix_nano()))
-                        {
-                            if let Some(value) = metric_point_value(point.value(), &mut skipped) {
-                                measure_result(
-                                    observer,
-                                    TransformSignal::Metrics,
-                                    TransformPhase::ArrowAppend,
-                                    || gauge.append(&point, value, meta),
-                                )?;
-                            }
-                        }
-                        let appended = gauge.rows - rows_before;
-                        if appended > 0 {
-                            measure_phase(
-                                observer,
-                                TransformSignal::Metrics,
-                                TransformPhase::ArrowAppend,
-                                || {
-                                    append_number_metric_context(
-                                        &mut gauge, appended, &resource, &scope,
-                                    );
-                                },
-                            );
-                        }
-                    }
+                    DataType::Gauge if selection.builds(MetricShape::Gauge) => append_points(
+                        &mut gauge,
+                        data.as_gauge().unwrap().data_points(),
+                        |p| (p.time_unix_nano(), p.start_time_unix_nano()),
+                        (&resource, &scope),
+                        obs,
+                        |gauge, point| match metric_point_value(point.value(), &mut skipped) {
+                            Some(value) => gauge.append(point, value, meta),
+                            None => Ok(()),
+                        },
+                    )?,
                     DataType::Sum if selection.builds(MetricShape::Sum) => {
                         let data = data.as_sum().unwrap();
-                        let rows_before = sum.rows;
-                        let points = sum.points;
-                        for point in data
-                            .data_points()
-                            .filter(|p| points.keeps(p.time_unix_nano(), p.start_time_unix_nano()))
-                        {
-                            if let Some(value) = metric_point_value(point.value(), &mut skipped) {
-                                measure_result(
-                                    observer,
-                                    TransformSignal::Metrics,
-                                    TransformPhase::ArrowAppend,
-                                    || {
-                                        sum.append(
-                                            &point,
-                                            value,
-                                            data.aggregation_temporality() as i32,
-                                            data.is_monotonic(),
-                                            meta,
-                                        )
-                                    },
-                                )?;
-                            }
-                        }
-                        let appended = sum.rows - rows_before;
-                        if appended > 0 {
-                            measure_phase(
-                                observer,
-                                TransformSignal::Metrics,
-                                TransformPhase::ArrowAppend,
-                                || {
-                                    append_number_metric_context(
-                                        &mut sum, appended, &resource, &scope,
-                                    );
-                                },
-                            );
-                        }
+                        let temporality = data.aggregation_temporality() as i32;
+                        append_points(
+                            &mut sum,
+                            data.data_points(),
+                            |p| (p.time_unix_nano(), p.start_time_unix_nano()),
+                            (&resource, &scope),
+                            obs,
+                            |sum, point| match metric_point_value(point.value(), &mut skipped) {
+                                Some(value) => {
+                                    sum.append(point, value, temporality, data.is_monotonic(), meta)
+                                }
+                                None => Ok(()),
+                            },
+                        )?;
                     }
                     DataType::Histogram if selection.builds(MetricShape::Histogram) => {
                         let data = data.as_histogram().unwrap();
-                        let rows_before = histogram.rows;
-                        let points = histogram.points;
-                        for point in data
-                            .data_points()
-                            .filter(|p| points.keeps(p.time_unix_nano(), p.start_time_unix_nano()))
-                        {
-                            measure_result(
-                                observer,
-                                TransformSignal::Metrics,
-                                TransformPhase::ArrowAppend,
-                                || {
-                                    histogram.append(
-                                        &point,
-                                        data.aggregation_temporality() as i32,
-                                        meta,
-                                    )
-                                },
-                            )?;
-                        }
-                        let appended = histogram.rows - rows_before;
-                        if appended > 0 {
-                            measure_phase(
-                                observer,
-                                TransformSignal::Metrics,
-                                TransformPhase::ArrowAppend,
-                                || {
-                                    histogram.append_context(appended, &resource, &scope);
-                                },
-                            );
-                        }
+                        let temporality = data.aggregation_temporality() as i32;
+                        append_points(
+                            &mut histogram,
+                            data.data_points(),
+                            |p| (p.time_unix_nano(), p.start_time_unix_nano()),
+                            (&resource, &scope),
+                            obs,
+                            |histogram, point| histogram.append(point, temporality, meta),
+                        )?;
                     }
                     DataType::ExponentialHistogram
                         if selection.builds(MetricShape::ExponentialHistogram) =>
                     {
                         let data = data.as_exponential_histogram().unwrap();
-                        let rows_before = exp_histogram.rows;
-                        let points = exp_histogram.points;
-                        for point in data
-                            .data_points()
-                            .filter(|p| points.keeps(p.time_unix_nano(), p.start_time_unix_nano()))
-                        {
-                            measure_result(
-                                observer,
-                                TransformSignal::Metrics,
-                                TransformPhase::ArrowAppend,
-                                || {
-                                    exp_histogram.append(
-                                        &point,
-                                        data.aggregation_temporality() as i32,
-                                        meta,
-                                    )
-                                },
-                            )?;
-                        }
-                        let appended = exp_histogram.rows - rows_before;
-                        if appended > 0 {
-                            measure_phase(
-                                observer,
-                                TransformSignal::Metrics,
-                                TransformPhase::ArrowAppend,
-                                || {
-                                    exp_histogram.append_context(appended, &resource, &scope);
-                                },
-                            );
-                        }
+                        let temporality = data.aggregation_temporality() as i32;
+                        append_points(
+                            &mut exp_histogram,
+                            data.data_points(),
+                            |p| (p.time_unix_nano(), p.start_time_unix_nano()),
+                            (&resource, &scope),
+                            obs,
+                            |exp_histogram, point| exp_histogram.append(point, temporality, meta),
+                        )?;
                     }
                     DataType::Summary => {
                         skipped.summaries += data.as_summary().unwrap().data_points().count();
@@ -413,21 +311,16 @@ pub(crate) fn transform_metrics_view_observed<V: MetricsView>(
         }
     }
 
-    measure_result(
-        observer,
-        TransformSignal::Metrics,
-        TransformPhase::ArrowFinalize,
-        || {
-            Ok(MetricBatches {
-                gauge: gauge.finish(selection.returns(MetricShape::Gauge))?,
-                sum: sum.finish(selection.returns(MetricShape::Sum))?,
-                histogram: histogram.finish(selection.returns(MetricShape::Histogram))?,
-                exp_histogram: exp_histogram
-                    .finish(selection.returns(MetricShape::ExponentialHistogram))?,
-                skipped,
-            })
-        },
-    )
+    obs.phase(TransformPhase::ArrowFinalize, || {
+        Ok(MetricBatches {
+            gauge: gauge.finish(selection.returns(MetricShape::Gauge))?,
+            sum: sum.finish(selection.returns(MetricShape::Sum))?,
+            histogram: histogram.finish(selection.returns(MetricShape::Histogram))?,
+            exp_histogram: exp_histogram
+                .finish(selection.returns(MetricShape::ExponentialHistogram))?,
+            skipped,
+        })
+    })
 }
 
 #[derive(Default)]
@@ -436,6 +329,44 @@ struct MetricCapacities {
     sum: usize,
     histogram: usize,
     exp_histogram: usize,
+}
+
+/// What a point loop needs from one shape's builders.
+trait ShapeBuilders {
+    /// Rows appended so far.
+    fn rows(&self) -> usize;
+    /// The time ranges this shape's points must fall in.
+    fn points(&self) -> PointFilter;
+    /// Appends the resource and scope context for the last `rows` points.
+    fn append_context(&mut self, rows: usize, resource: &ResourceContext, scope: &ScopeContext);
+}
+
+/// Appends a metric's points that pass the shape's time ranges, then their
+/// shared resource and scope context. `times` reads a point's time and start
+/// time; `append` builds one point (and may skip it, appending nothing).
+fn append_points<B: ShapeBuilders, P>(
+    builders: &mut B,
+    points: impl Iterator<Item = P>,
+    times: impl Fn(&P) -> (u64, u64),
+    (resource, scope): (&ResourceContext, &ScopeContext),
+    obs: &mut Observation<'_>,
+    mut append: impl FnMut(&mut B, &P) -> Result<()>,
+) -> Result<()> {
+    let filter = builders.points();
+    let rows_before = builders.rows();
+    for point in points {
+        let (time, start_time) = times(&point);
+        if filter.keeps(time, start_time) {
+            obs.phase(TransformPhase::ArrowAppend, || append(builders, &point))?;
+        }
+    }
+    let appended = builders.rows() - rows_before;
+    if appended > 0 {
+        obs.phase(TransformPhase::ArrowAppend, || {
+            builders.append_context(appended, resource, scope);
+        });
+    }
+    Ok(())
 }
 
 enum NumberPointValue {
@@ -949,21 +880,6 @@ impl HistogramBuilders {
         Ok(())
     }
 
-    fn append_context(&mut self, rows: usize, resource: &ResourceContext, scope: &ScopeContext) {
-        append_metric_resource_scope_n(
-            &mut self.service_name,
-            &mut self.service_namespace,
-            &mut self.service_instance_id,
-            &mut self.resource_attributes,
-            &mut self.scope_name,
-            &mut self.scope_version,
-            &mut self.scope_attributes,
-            rows,
-            resource,
-            scope,
-        );
-    }
-
     /// `None` when no row was built, unless `keep_empty`.
     fn finish(mut self, keep_empty: bool) -> Result<Option<RecordBatch>> {
         if self.rows == 0 && !keep_empty {
@@ -1130,21 +1046,6 @@ impl ExpHistogramBuilders {
         Ok(())
     }
 
-    fn append_context(&mut self, rows: usize, resource: &ResourceContext, scope: &ScopeContext) {
-        append_metric_resource_scope_n(
-            &mut self.service_name,
-            &mut self.service_namespace,
-            &mut self.service_instance_id,
-            &mut self.resource_attributes,
-            &mut self.scope_name,
-            &mut self.scope_version,
-            &mut self.scope_attributes,
-            rows,
-            resource,
-            scope,
-        );
-    }
-
     /// `None` when no row was built, unless `keep_empty`.
     fn finish(mut self, keep_empty: bool) -> Result<Option<RecordBatch>> {
         if self.rows == 0 && !keep_empty {
@@ -1185,6 +1086,76 @@ impl ExpHistogramBuilders {
                 self.rows,
             )
             .map(Some)
+    }
+}
+
+impl ShapeBuilders for GaugeBuilders {
+    fn rows(&self) -> usize {
+        self.rows
+    }
+    fn points(&self) -> PointFilter {
+        self.points
+    }
+    fn append_context(&mut self, rows: usize, resource: &ResourceContext, scope: &ScopeContext) {
+        append_number_metric_context(self, rows, resource, scope);
+    }
+}
+
+impl ShapeBuilders for SumBuilders {
+    fn rows(&self) -> usize {
+        self.rows
+    }
+    fn points(&self) -> PointFilter {
+        self.points
+    }
+    fn append_context(&mut self, rows: usize, resource: &ResourceContext, scope: &ScopeContext) {
+        append_number_metric_context(self, rows, resource, scope);
+    }
+}
+
+impl ShapeBuilders for HistogramBuilders {
+    fn rows(&self) -> usize {
+        self.rows
+    }
+    fn points(&self) -> PointFilter {
+        self.points
+    }
+    fn append_context(&mut self, rows: usize, resource: &ResourceContext, scope: &ScopeContext) {
+        append_metric_resource_scope_n(
+            &mut self.service_name,
+            &mut self.service_namespace,
+            &mut self.service_instance_id,
+            &mut self.resource_attributes,
+            &mut self.scope_name,
+            &mut self.scope_version,
+            &mut self.scope_attributes,
+            rows,
+            resource,
+            scope,
+        );
+    }
+}
+
+impl ShapeBuilders for ExpHistogramBuilders {
+    fn rows(&self) -> usize {
+        self.rows
+    }
+    fn points(&self) -> PointFilter {
+        self.points
+    }
+    fn append_context(&mut self, rows: usize, resource: &ResourceContext, scope: &ScopeContext) {
+        append_metric_resource_scope_n(
+            &mut self.service_name,
+            &mut self.service_namespace,
+            &mut self.service_instance_id,
+            &mut self.resource_attributes,
+            &mut self.scope_name,
+            &mut self.scope_version,
+            &mut self.scope_attributes,
+            rows,
+            resource,
+            scope,
+        );
     }
 }
 
