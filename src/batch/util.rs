@@ -7,10 +7,10 @@ use arrow_array::{
         FixedSizeBinaryBuilder, Float64Builder, ListBuilder, StringBuilder,
         TimestampNanosecondBuilder, UInt64Builder,
     },
-    Array, ArrayRef, RecordBatch,
+    new_null_array, Array, ArrayRef, RecordBatch, RecordBatchOptions,
 };
 
-use crate::{DecodeError, Error, Result};
+use crate::{options::Plan, DecodeError, Error, Result};
 
 #[inline]
 pub(super) fn append_opt_n(builder: &mut StringBuilder, value: Option<&str>, n: usize) {
@@ -30,7 +30,7 @@ pub(super) fn append_required_service_name_n(
     value: Option<&str>,
     n: usize,
 ) {
-    let value = value.unwrap_or("unknown");
+    let value = value.unwrap_or(super::UNKNOWN_SERVICE_NAME);
     for _ in 0..n {
         builder.append_value(value);
     }
@@ -164,6 +164,46 @@ pub(super) fn record_batch(
     arrays: Vec<ArrayRef>,
 ) -> Result<RecordBatch> {
     Ok(RecordBatch::try_new(schema, arrays)?)
+}
+
+/// Assembles a batch of `rows` rows from builder output, replacing every
+/// column `plan` does not build with an all-null array (its field marked
+/// nullable). Builders skip the appends for those columns, so their arrays
+/// are discarded here unread.
+pub(super) fn finish_batch(
+    schema: Arc<arrow_schema::Schema>,
+    plan: &Plan,
+    arrays: Vec<ArrayRef>,
+    rows: usize,
+) -> Result<RecordBatch> {
+    if plan.builds_everything() {
+        return record_batch(schema, arrays);
+    }
+    let mut fields = Vec::with_capacity(arrays.len());
+    let mut columns = Vec::with_capacity(arrays.len());
+    for (index, (field, array)) in schema.fields().iter().zip(arrays).enumerate() {
+        if plan.builds(index) {
+            fields.push(Arc::clone(field));
+            columns.push(array);
+        } else {
+            fields.push(Arc::new(field.as_ref().clone().with_nullable(true)));
+            columns.push(new_null_array(field.data_type(), rows));
+        }
+    }
+    let schema = arrow_schema::Schema::new_with_metadata(fields, schema.metadata().clone());
+    let options = RecordBatchOptions::new().with_row_count(Some(rows));
+    Ok(RecordBatch::try_new_with_options(
+        Arc::new(schema),
+        columns,
+        &options,
+    )?)
+}
+
+/// The value a nullable timestamp column emits for a raw OTLP field, where
+/// zero means unset.
+#[inline]
+pub(super) fn opt_ts(value: u64) -> Option<u64> {
+    (value != 0).then_some(value)
 }
 
 #[inline]

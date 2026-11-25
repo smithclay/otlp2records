@@ -4,7 +4,12 @@ use arrow_array::RecordBatch;
 use arrow_ipc::reader::StreamReader;
 use prost::Message;
 
-use crate::{api::MetricBatches, Error, Result};
+use crate::{
+    api::MetricBatches,
+    batch::MetricsSelection,
+    options::{self, MetricShape, TransformOptions},
+    Error, Result,
+};
 
 use super::wire::{ArrowPayload, ArrowPayloadType, BatchArrowRecords};
 
@@ -122,9 +127,21 @@ impl OtapDecoder {
 
     /// Decodes one canonical `BatchArrowRecords` message into normalized logs.
     pub fn decode_logs(&mut self, bytes: &[u8]) -> Result<RecordBatch> {
+        self.decode_logs_with_options(bytes, &options::ALL)
+    }
+
+    /// Like [`Self::decode_logs`], building only the columns and rows
+    /// `options` asks for. The whole message is still decoded, so the stream
+    /// state stays complete for later messages.
+    pub fn decode_logs_with_options(
+        &mut self,
+        bytes: &[u8],
+        options: &TransformOptions,
+    ) -> Result<RecordBatch> {
+        options.plan(&crate::logs_schema())?;
         self.guarded(|decoder| {
             let envelope = BatchArrowRecords::decode(bytes)?;
-            decoder.logs(envelope, bytes.len())
+            decoder.logs(envelope, bytes.len(), options)
         })
     }
 
@@ -135,14 +152,25 @@ impl OtapDecoder {
         envelope: BatchArrowRecords,
         input_bytes: usize,
     ) -> Result<RecordBatch> {
-        self.guarded(|decoder| decoder.logs(envelope, input_bytes))
+        self.guarded(|decoder| decoder.logs(envelope, input_bytes, &options::ALL))
     }
 
     /// Decodes one canonical `BatchArrowRecords` message into normalized traces.
     pub fn decode_traces(&mut self, bytes: &[u8]) -> Result<RecordBatch> {
+        self.decode_traces_with_options(bytes, &options::ALL)
+    }
+
+    /// Like [`Self::decode_traces`], building only the columns and rows
+    /// `options` asks for.
+    pub fn decode_traces_with_options(
+        &mut self,
+        bytes: &[u8],
+        options: &TransformOptions,
+    ) -> Result<RecordBatch> {
+        options.plan(&crate::traces_schema())?;
         self.guarded(|decoder| {
             let envelope = BatchArrowRecords::decode(bytes)?;
-            decoder.traces(envelope, bytes.len())
+            decoder.traces(envelope, bytes.len(), options)
         })
     }
 
@@ -153,18 +181,37 @@ impl OtapDecoder {
         envelope: BatchArrowRecords,
         input_bytes: usize,
     ) -> Result<RecordBatch> {
-        self.guarded(|decoder| decoder.traces(envelope, input_bytes))
+        self.guarded(|decoder| decoder.traces(envelope, input_bytes, &options::ALL))
     }
 
     /// Decodes one canonical `BatchArrowRecords` message into normalized metrics.
     pub fn decode_metrics(&mut self, bytes: &[u8]) -> Result<MetricBatches> {
-        self.guarded(|decoder| decoder.metrics(BatchArrowRecords::decode(bytes)?))
+        self.guarded(|decoder| {
+            decoder.metrics(BatchArrowRecords::decode(bytes)?, MetricsSelection::All)
+        })
+    }
+
+    /// Like [`Self::decode_metrics`], building only `shape`, narrowed by
+    /// `options` (column indexes are the shape's).
+    pub fn decode_metrics_with_options(
+        &mut self,
+        bytes: &[u8],
+        shape: MetricShape,
+        options: &TransformOptions,
+    ) -> Result<MetricBatches> {
+        options.plan(&shape.schema())?;
+        self.guarded(|decoder| {
+            decoder.metrics(
+                BatchArrowRecords::decode(bytes)?,
+                MetricsSelection::Shape(shape, options),
+            )
+        })
     }
 
     /// Decodes one already-deserialized `BatchArrowRecords` into normalized
     /// metric shapes (the streaming counterpart of [`Self::decode_metrics`]).
     pub fn decode_metrics_message(&mut self, envelope: BatchArrowRecords) -> Result<MetricBatches> {
-        self.guarded(|decoder| decoder.metrics(envelope))
+        self.guarded(|decoder| decoder.metrics(envelope, MetricsSelection::All))
     }
 
     fn guarded<T>(&mut self, decode: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
@@ -176,7 +223,12 @@ impl OtapDecoder {
         decode(self).inspect_err(|error| self.poisoned = Some(error.to_string()))
     }
 
-    fn logs(&mut self, envelope: BatchArrowRecords, input_bytes: usize) -> Result<RecordBatch> {
+    fn logs(
+        &mut self,
+        envelope: BatchArrowRecords,
+        input_bytes: usize,
+        options: &TransformOptions,
+    ) -> Result<RecordBatch> {
         let (root, mut p) = self.payloads(&LOGS, envelope)?;
         super::logs::normalize(
             root,
@@ -184,10 +236,16 @@ impl OtapDecoder {
             p.take(ArrowPayloadType::ScopeAttrs),
             p.take(ArrowPayloadType::LogAttrs),
             input_bytes,
+            options,
         )
     }
 
-    fn traces(&mut self, envelope: BatchArrowRecords, input_bytes: usize) -> Result<RecordBatch> {
+    fn traces(
+        &mut self,
+        envelope: BatchArrowRecords,
+        input_bytes: usize,
+        options: &TransformOptions,
+    ) -> Result<RecordBatch> {
         let (root, mut p) = self.payloads(&TRACES, envelope)?;
         super::traces::normalize(
             root,
@@ -199,10 +257,15 @@ impl OtapDecoder {
             p.take(ArrowPayloadType::SpanLinks),
             p.take(ArrowPayloadType::SpanLinkAttrs),
             input_bytes,
+            options,
         )
     }
 
-    fn metrics(&mut self, envelope: BatchArrowRecords) -> Result<MetricBatches> {
+    fn metrics(
+        &mut self,
+        envelope: BatchArrowRecords,
+        selection: MetricsSelection<'_>,
+    ) -> Result<MetricBatches> {
         let (root, mut p) = self.payloads(&METRICS, envelope)?;
         use ArrowPayloadType as T;
         super::metrics::normalize(
@@ -224,6 +287,7 @@ impl OtapDecoder {
             p.take(T::NumberDpExemplarAttrs),
             p.take(T::HistogramDpExemplarAttrs),
             p.take(T::ExpHistogramDpExemplarAttrs),
+            selection,
         )
     }
 

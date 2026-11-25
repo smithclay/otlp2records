@@ -165,6 +165,45 @@ The flattened JSON convenience columns remain for now: `resource_attributes`,
 `scope_attributes`, signal attribute JSON columns, `events_json`, `links_json`,
 and `exemplars_json`.
 
+### Narrowing a Transform
+
+A reader that needs some columns of some rows can say so, and the transform skips the
+work for the rest. Attribute, body, event, link and exemplar JSON is most of a
+transform's cost.
+
+| Function | Description |
+|----------|-------------|
+| `transform_logs_with_options(bytes, format, &options)` | Logs, narrowed by `TransformOptions` |
+| `transform_traces_with_options(bytes, format, &options)` | Traces, narrowed by `TransformOptions` |
+| `transform_metrics_with_options(bytes, format, shape, &options)` | One `MetricShape` only; the other shapes are not built |
+| `OtapDecoder::decode_{logs,traces}_with_options`, `decode_metrics_with_options` | The same for OTAP |
+
+```rust
+use otlp2records::{transform_traces_with_options, InputFormat, TransformOptions};
+
+let schema = otlp2records::traces_schema();
+let options = TransformOptions::new()
+    .with_columns([schema.index_of("name")?, schema.index_of("service_name")?])
+    .with_service_names(["checkout"])
+    .with_time_range(schema.index_of("start_time_unix_nano")?, start_ns, end_ns);
+let batch = transform_traces_with_options(bytes, InputFormat::Auto, &options)?;
+```
+
+Columns that were not requested are still in the batch, as all-null arrays (their fields
+are marked nullable), so column order and names never change. The row predicates are
+pruning, not query evaluation:
+
+- A row is kept if its emitted `service_name` is in the set and it falls inside every time
+  range.
+- A resource without `service.name` matches `"unknown"`.
+- A range is inclusive, in nanoseconds, and only allowed on a `Timestamp(Nanosecond)`
+  column.
+- A NULL timestamp falls outside every range.
+
+Options that do not fit the schema are rejected with `Error::InvalidInput` before
+decoding. The C ABI exposes the same options as `OtlpReadOptions` through
+`otlp_transform_with_options()` and `otlp_otap_decode_with_options()`.
+
 ### Transform Observation
 
 Production callers can opt into phase timings and counters without changing output semantics:

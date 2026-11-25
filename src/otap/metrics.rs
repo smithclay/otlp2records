@@ -6,7 +6,7 @@ use arrow_array::{
 
 use crate::{
     api::MetricBatches,
-    batch::transform_metrics_view,
+    batch::{transform_metrics_view, MetricsSelection},
     views::pdata::{
         AggregationTemporality, BucketsView, DataPointFlags, DataType, DataView, ExemplarView,
         ExponentialHistogramDataPointView, ExponentialHistogramView, GaugeView,
@@ -49,6 +49,7 @@ pub(super) fn normalize(
     number_exemplar_attrs: Option<RecordBatch>,
     histogram_exemplar_attrs: Option<RecordBatch>,
     exp_histogram_exemplar_attrs: Option<RecordBatch>,
+    selection: MetricsSelection<'_>,
 ) -> Result<MetricBatches> {
     validate(PayloadSchema::Metrics, "metrics", &metrics)?;
     validate_metric_types(&metrics)?;
@@ -203,7 +204,7 @@ pub(super) fn normalize(
         histogram_exemplar_attrs,
         exp_histogram_exemplar_attrs,
     )?;
-    transform_metrics_view(&view)
+    transform_metrics_view(&view, selection)
 }
 
 struct ChildTable {

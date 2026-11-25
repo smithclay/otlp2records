@@ -191,6 +191,113 @@ static void test_otap(const char* root) {
     free(metrics.data);
 }
 
+static int column_index(const struct ArrowSchema* schema, const char* name) {
+    for (int64_t i = 0; i < schema->n_children; i++) {
+        if (strcmp(schema->children[i]->name, name) == 0) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+static void test_options(const char* root) {
+    Bytes logs = read_file(root, "testdata/logs_large.pb");
+    struct ArrowArray full, array;
+    struct ArrowSchema full_schema, schema;
+    CHECK(otlp_transform_with_options(OTLP_SIGNAL_LOGS, OTLP_FORMAT_PROTOBUF, OTLP_ARROW_PROFILE_DUCKDB, NULL,
+                                      logs.data, logs.len, &full, &full_schema) == OTLP_OK);
+    int body = column_index(&full_schema, "body");
+    int service = column_index(&full_schema, "service_name");
+    CHECK(body >= 0 && service >= 0);
+
+    /* Only service_name: every other column is all-null, the row count is unchanged. */
+    OtlpReadOptions options;
+    memset(&options, 0, sizeof options);
+    options.columns = UINT64_C(1) << service;
+    CHECK(otlp_transform_with_options(OTLP_SIGNAL_LOGS, OTLP_FORMAT_PROTOBUF, OTLP_ARROW_PROFILE_DUCKDB, &options,
+                                      logs.data, logs.len, &array, &schema) == OTLP_OK);
+    CHECK(array.length == full.length);
+    CHECK(array.n_children == full.n_children);
+    CHECK(array.children[body]->null_count == array.length);
+    CHECK(array.children[service]->null_count == 0);
+    array.release(&array);
+    schema.release(&schema);
+
+    /* A service no resource has keeps no rows. */
+    OtlpStr nobody = {(const uint8_t*)"no-such-service", strlen("no-such-service")};
+    options.columns = OTLP_COLUMNS_ALL;
+    options.service_names = &nobody;
+    options.service_names_len = 1;
+    CHECK(otlp_transform_with_options(OTLP_SIGNAL_LOGS, OTLP_FORMAT_AUTO, OTLP_ARROW_PROFILE_DUCKDB, &options,
+                                      logs.data, logs.len, &array, &schema) == OTLP_OK);
+    CHECK(array.length == 0);
+    array.release(&array);
+    schema.release(&schema);
+
+    /* A range covering everything keeps every row with a timestamp. */
+    OtlpTimeRange everything = {0, INT64_MIN, INT64_MAX};
+    memset(&options, 0, sizeof options);
+    options.columns = OTLP_COLUMNS_ALL;
+    options.time_ranges = &everything;
+    options.time_ranges_len = 1;
+    CHECK(otlp_transform_with_options(OTLP_SIGNAL_LOGS, OTLP_FORMAT_PROTOBUF, OTLP_ARROW_PROFILE_CANONICAL,
+                                      &options, logs.data, logs.len, &array, &schema) == OTLP_OK);
+    CHECK(array.length == full.length - full.children[0]->null_count);
+    array.release(&array);
+    schema.release(&schema);
+
+    /* Options that do not fit the schema are an invalid argument, not a parse failure. */
+    OtlpTimeRange on_body = {(uint32_t)body, 0, 1};
+    options.time_ranges = &on_body;
+    CHECK(otlp_transform_with_options(OTLP_SIGNAL_LOGS, OTLP_FORMAT_PROTOBUF, OTLP_ARROW_PROFILE_DUCKDB, &options,
+                                      logs.data, logs.len, &array, &schema) == OTLP_ERROR_INVALID_ARGUMENT);
+    memset(&options, 0, sizeof options);
+    options.columns = UINT64_C(1) << full_schema.n_children;
+    CHECK(otlp_transform_with_options(OTLP_SIGNAL_LOGS, OTLP_FORMAT_PROTOBUF, OTLP_ARROW_PROFILE_DUCKDB, &options,
+                                      logs.data, logs.len, &array, &schema) == OTLP_ERROR_INVALID_ARGUMENT);
+    OtlpStr not_utf8 = {(const uint8_t*)"\xff", 1};
+    options.columns = OTLP_COLUMNS_ALL;
+    options.service_names = &not_utf8;
+    options.service_names_len = 1;
+    CHECK(otlp_transform_with_options(OTLP_SIGNAL_LOGS, OTLP_FORMAT_PROTOBUF, OTLP_ARROW_PROFILE_DUCKDB, &options,
+                                      logs.data, logs.len, &array, &schema) == OTLP_ERROR_INVALID_ARGUMENT);
+    full.release(&full);
+    full_schema.release(&full_schema);
+
+    /* A metric signal type builds one shape, and an absent shape is an empty batch. */
+    Bytes gauge = read_file(root, "testdata/metrics_gauge.pb");
+    CHECK(otlp_transform_with_options(OTLP_SIGNAL_METRICS_GAUGE, OTLP_FORMAT_PROTOBUF, OTLP_ARROW_PROFILE_DUCKDB,
+                                      NULL, gauge.data, gauge.len, &array, &schema) == OTLP_OK);
+    CHECK(array.length > 0);
+    array.release(&array);
+    schema.release(&schema);
+    CHECK(otlp_transform_with_options(OTLP_SIGNAL_METRICS_HISTOGRAM, OTLP_FORMAT_PROTOBUF, OTLP_ARROW_PROFILE_DUCKDB,
+                                      NULL, gauge.data, gauge.len, &array, &schema) == OTLP_OK);
+    CHECK(array.length == 0);
+    CHECK(column_index(&schema, "explicit_bounds") >= 0);
+    array.release(&array);
+    schema.release(&schema);
+
+    /* OTAP: the same options through the stateful decoder. */
+    Bytes bar = read_file(root, "tests/fixtures/otap/logs-initial.bar");
+    OtlpOtapDecoder* decoder = otlp_otap_decoder_new_with_profile(OTLP_ARROW_PROFILE_DUCKDB);
+    memset(&options, 0, sizeof options);
+    options.columns = UINT64_C(1) << service;
+    CHECK(otlp_otap_decode_with_options(decoder, OTLP_SIGNAL_LOGS, &options, bar.data, bar.len, &array, &schema) ==
+          OTLP_OK);
+    CHECK(array.length > 0);
+    CHECK(array.children[body]->null_count == array.length);
+    array.release(&array);
+    schema.release(&schema);
+    CHECK(otlp_otap_decode_with_options(NULL, OTLP_SIGNAL_LOGS, &options, bar.data, bar.len, &array, &schema) ==
+          OTLP_ERROR_INVALID_ARGUMENT);
+    otlp_otap_decoder_free(decoder);
+
+    free(logs.data);
+    free(gauge.data);
+    free(bar.data);
+}
+
 static OtlpIngestStatus never_called(void* user_data, OtlpSignalType signal, uint64_t stream_id, int64_t batch_id,
                                      uint64_t input_bytes, struct ArrowArray* array, struct ArrowSchema* schema) {
     (void)user_data, (void)signal, (void)stream_id, (void)batch_id, (void)input_bytes, (void)array, (void)schema;
@@ -240,6 +347,7 @@ int main(int argc, char** argv) {
     test_one_shot(argv[1]);
     test_metrics_all(argv[1]);
     test_otap(argv[1]);
+    test_options(argv[1]);
     test_grpc_lifecycle();
     if (failures) {
         fprintf(stderr, "%d C ABI check(s) failed\n", failures);

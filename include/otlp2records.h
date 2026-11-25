@@ -152,6 +152,54 @@ typedef struct OtlpMetricsArrowBatches {
     uint64_t skipped_missing_values;
 } OtlpMetricsArrowBatches;
 
+/**
+ * @brief A borrowed UTF-8 string: len bytes at data, not NUL-terminated.
+ */
+typedef struct OtlpStr {
+    const uint8_t* data;
+    size_t len;
+} OtlpStr;
+
+/**
+ * @brief Rows whose timestamp column is within [min, max] (inclusive, ns).
+ *
+ * column indexes the signal's schema (for metrics, the shape's) and must be a
+ * Timestamp(ns) column. A NULL timestamp is outside every range.
+ */
+typedef struct OtlpTimeRange {
+    uint32_t column;
+    int64_t min;
+    int64_t max;
+} OtlpTimeRange;
+
+/** @brief OtlpReadOptions.columns value that builds every column. */
+#define OTLP_COLUMNS_ALL UINT64_MAX
+
+/**
+ * @brief What a *_with_options call builds: some columns of some rows.
+ *
+ * A reader that needs a few columns of a few rows says so, and the transform
+ * skips the work for the rest. Columns not built are still in the output, as
+ * all-null arrays, so the schema keeps its column order and names.
+ *
+ * The row predicates prune; they are not query evaluation. A row is kept only
+ * if its service_name is in service_names (when given) and it is inside every
+ * time range. service_name is compared as emitted, so a resource without
+ * service.name matches "unknown".
+ *
+ * A zero-initialized struct builds no columns of every row: set columns.
+ */
+typedef struct OtlpReadOptions {
+    /** Bit i builds column i of the signal's schema; OTLP_COLUMNS_ALL builds every column. */
+    uint64_t columns;
+    /** Keep only rows whose service_name is one of these. NULL: no filter. */
+    const OtlpStr* service_names;
+    size_t service_names_len;
+    /** Keep only rows inside every range. NULL or 0: no ranges. */
+    const OtlpTimeRange* time_ranges;
+    size_t time_ranges_len;
+} OtlpReadOptions;
+
 /* ============================================================================
  * Schema Access
  * ============================================================================ */
@@ -220,6 +268,32 @@ OtlpStatus otlp_transform_with_profile(
     OtlpSignalType signal_type,
     OtlpInputFormat format,
     OtlpArrowProfile profile,
+    const uint8_t* data,
+    size_t len,
+    struct ArrowArray* out_array,
+    struct ArrowSchema* out_schema
+);
+
+/**
+ * @brief otlp_transform_with_profile() narrowed to the columns and rows a
+ *        reader needs.
+ *
+ * Unlike otlp_transform(), every signal type is accepted: a metric signal type
+ * builds only that metric shape (the others are not built at all), and returns
+ * an empty batch (length 0) when the input holds none of it.
+ *
+ * @param options NULL for every column of every row
+ * @return OTLP_ERROR_INVALID_ARGUMENT if options does not fit the signal's
+ *         schema (a column past it, a range on a non-timestamp column) or a
+ *         service name is not UTF-8; otherwise as otlp_transform_with_profile()
+ *
+ * @note Caller must call out_array->release() and out_schema->release().
+ */
+OtlpStatus otlp_transform_with_options(
+    OtlpSignalType signal_type,
+    OtlpInputFormat format,
+    OtlpArrowProfile profile,
+    const OtlpReadOptions* options,
     const uint8_t* data,
     size_t len,
     struct ArrowArray* out_array,
@@ -376,6 +450,26 @@ OtlpStatus otlp_otap_decode_metrics(
     const uint8_t* data,
     size_t len,
     OtlpMetricsArrowBatches* out_batches
+);
+
+/**
+ * @brief Decode one OTAP message of one signal (for metrics, one shape),
+ *        narrowed to the columns and rows a reader needs.
+ *
+ * The whole message is decoded either way, so the decoder's stream state
+ * stays complete for later messages. Options, empty metric shapes and
+ * statuses are as for otlp_transform_with_options().
+ *
+ * @note Caller must call out_array->release() and out_schema->release().
+ */
+OtlpStatus otlp_otap_decode_with_options(
+    OtlpOtapDecoder* decoder,
+    OtlpSignalType signal_type,
+    const OtlpReadOptions* options,
+    const uint8_t* data,
+    size_t len,
+    struct ArrowArray* out_array,
+    struct ArrowSchema* out_schema
 );
 
 /* ============================================================================

@@ -68,12 +68,17 @@ pub(super) struct ResourceContext {
 }
 
 impl ResourceContext {
+    /// `None` when `keep` rejects the resource's service name: its rows are
+    /// dropped, so nothing else about it is worth computing. The attribute
+    /// JSON is serialized only when `attributes` asks for it.
     pub(super) fn from_view_observed<R: ResourceView>(
         resource: Option<&R>,
         signal: TransformSignal,
         observer: &mut Option<&mut dyn TransformObserver>,
         duplicates: Option<&mut ContextDuplicateTracker>,
-    ) -> Self {
+        keep: impl FnOnce(Option<&str>) -> bool,
+        attributes: bool,
+    ) -> Option<Self> {
         if let (Some(duplicates), Some(resource)) = (duplicates, resource) {
             duplicates.observe_resource_view(resource, signal, observer);
         }
@@ -93,19 +98,26 @@ impl ResourceContext {
                 )
             },
         );
-        let attributes_json = measure_phase(
-            observer,
-            signal,
-            TransformPhase::ResourceAttributesJson,
-            || resource.and_then(|resource| view_json::attributes_json(resource.attributes())),
-        );
+        if !keep(service_name.as_deref()) {
+            return None;
+        }
+        let attributes_json = if attributes {
+            measure_phase(
+                observer,
+                signal,
+                TransformPhase::ResourceAttributesJson,
+                || resource.and_then(|resource| view_json::attributes_json(resource.attributes())),
+            )
+        } else {
+            None
+        };
 
-        Self {
+        Some(Self {
             service_name,
             service_namespace,
             service_instance_id,
             attributes_json,
-        }
+        })
     }
 }
 
@@ -121,6 +133,7 @@ impl ScopeContext {
         signal: TransformSignal,
         observer: &mut Option<&mut dyn TransformObserver>,
         duplicates: Option<&mut ContextDuplicateTracker>,
+        attributes: bool,
     ) -> Self {
         if let (Some(duplicates), Some(scope)) = (duplicates, scope) {
             duplicates.observe_scope_view(scope, signal, observer);
@@ -136,12 +149,16 @@ impl ScopeContext {
                         .map(|value| String::from_utf8_lossy(value).into_owned()),
                 )
             });
-        let attributes_json = measure_phase(
-            observer,
-            signal,
-            TransformPhase::ScopeAttributesJson,
-            || scope.and_then(|scope| view_json::attributes_json(scope.attributes())),
-        );
+        let attributes_json = if attributes {
+            measure_phase(
+                observer,
+                signal,
+                TransformPhase::ScopeAttributesJson,
+                || scope.and_then(|scope| view_json::attributes_json(scope.attributes())),
+            )
+        } else {
+            None
+        };
 
         Self {
             name,

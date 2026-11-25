@@ -11,6 +11,7 @@ use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use prost::Message;
 
 use crate::{
+    options::{in_range, Plan, TransformOptions},
     schema::logs_schema_arc,
     views::otlp::Obj,
     views::pdata::{LogRecordView, LogsDataView, ResourceLogsView, ScopeLogsView},
@@ -24,20 +25,16 @@ use super::{
         TransformCounter, TransformObserver, TransformPhase, TransformSignal,
     },
     util::{
-        append_fixed_or_null, append_opt_n, append_required_service_name_n, array, record_batch,
+        append_fixed_or_null, append_opt_n, append_required_service_name_n, array, finish_batch,
         string_builder_bytes, u64_to_i64,
     },
     view_json,
 };
 
-pub fn transform_logs_protobuf(bytes: &[u8]) -> Result<RecordBatch> {
-    let request = ExportLogsServiceRequest::decode(bytes)?;
-    transform_logs_request(request, bytes.len())
-}
-
 pub fn transform_logs_protobuf_observed(
     bytes: &[u8],
     observer: &mut Option<&mut dyn TransformObserver>,
+    options: &TransformOptions,
 ) -> Result<RecordBatch> {
     let request = measure_result(
         observer,
@@ -45,24 +42,26 @@ pub fn transform_logs_protobuf_observed(
         TransformPhase::ProtobufDecode,
         || ExportLogsServiceRequest::decode(bytes),
     )?;
-    transform_logs_request_observed(request, bytes.len(), observer)
+    transform_logs_request_observed(request, bytes.len(), observer, options)
 }
 
-pub fn transform_logs_request(
+#[cfg(test)]
+fn transform_logs_request(
     request: ExportLogsServiceRequest,
     input_bytes: usize,
 ) -> Result<RecordBatch> {
     let mut observer = None;
-    transform_logs_request_observed(request, input_bytes, &mut observer)
+    transform_logs_request_observed(request, input_bytes, &mut observer, &crate::options::ALL)
 }
 
 pub fn transform_logs_request_observed(
     request: ExportLogsServiceRequest,
     input_bytes: usize,
     observer: &mut Option<&mut dyn TransformObserver>,
+    options: &TransformOptions,
 ) -> Result<RecordBatch> {
     validate_log_ids(&request)?;
-    transform_logs_view_observed(&Obj::new(&request), input_bytes, observer)
+    transform_logs_view_observed(&Obj::new(&request), input_bytes, observer, options)
 }
 
 /// Rejects log identifiers whose byte width is non-canonical. OTLP `trace_id`
@@ -98,7 +97,9 @@ fn transform_logs_view_observed<V: LogsDataView>(
     view: &V,
     input_bytes: usize,
     observer: &mut Option<&mut dyn TransformObserver>,
+    options: &TransformOptions,
 ) -> Result<RecordBatch> {
+    let plan = options.plan(&logs_schema_arc())?;
     let rows = measure_phase(
         observer,
         TransformSignal::Logs,
@@ -124,7 +125,7 @@ fn transform_logs_view_observed<V: LogsDataView>(
         observer,
         TransformSignal::Logs,
         TransformPhase::BuilderInit,
-        || LogBuilders::with_capacity(rows, input_bytes),
+        || LogBuilders::with_capacity(rows, input_bytes, plan),
     );
     let mut duplicates = observer.is_some().then(ContextDuplicateTracker::default);
 
@@ -143,9 +144,10 @@ fn transform_logs_view_observed<V: LogsDataView>(
 pub(crate) fn transform_logs_view<V: LogsDataView>(
     view: &V,
     input_bytes: usize,
+    options: &TransformOptions,
 ) -> Result<RecordBatch> {
     let mut observer = None;
-    transform_logs_view_observed(view, input_bytes, &mut observer)
+    transform_logs_view_observed(view, input_bytes, &mut observer, options)
 }
 
 fn append_resource_logs_observed<R: ResourceLogsView>(
@@ -156,12 +158,16 @@ fn append_resource_logs_observed<R: ResourceLogsView>(
 ) -> Result<()> {
     let resource_phase_start = phase_start(observer);
     let resource_view = resource_logs.resource();
-    let resource = ResourceContext::from_view_observed(
+    let Some(resource) = ResourceContext::from_view_observed(
         resource_view.as_ref(),
         TransformSignal::Logs,
         observer,
         duplicates.as_deref_mut(),
-    );
+        |service| builders.plan.keeps_service(service),
+        builders.resource_attributes_wanted,
+    ) else {
+        return Ok(());
+    };
 
     for scope_logs in resource_logs.scopes() {
         append_scope_logs_observed(
@@ -196,8 +202,16 @@ fn append_scope_logs_observed<S: ScopeLogsView>(
         TransformSignal::Logs,
         observer,
         duplicates,
+        builders.scope_attributes_wanted,
     );
-    let record_count = scope_logs.log_records().count();
+    let record_count = if builders.filters_records() {
+        scope_logs
+            .log_records()
+            .filter(|record| builders.keeps(record))
+            .count()
+    } else {
+        scope_logs.log_records().count()
+    };
     if record_count > 0 {
         let context_phase_start = phase_start(observer);
         builders.append_context_observed(record_count, resource, &scope, observer);
@@ -210,7 +224,9 @@ fn append_scope_logs_observed<S: ScopeLogsView>(
     }
 
     for record in scope_logs.log_records() {
-        append_log_record_observed(record, builders, observer)?;
+        if builders.keeps(&record) {
+            append_log_record_observed(record, builders, observer)?;
+        }
     }
 
     finish_phase(
@@ -239,6 +255,14 @@ fn append_log_record_observed<R: LogRecordView>(
 }
 
 struct LogBuilders {
+    plan: Plan,
+    rows: usize,
+    time_range: Option<(i64, i64)>,
+    observed_time_range: Option<(i64, i64)>,
+    body_wanted: bool,
+    log_attributes_wanted: bool,
+    resource_attributes_wanted: bool,
+    scope_attributes_wanted: bool,
     time_unix_nano: TimestampNanosecondBuilder,
     observed_time_unix_nano: TimestampNanosecondBuilder,
     trace_id: FixedSizeBinaryBuilder,
@@ -261,8 +285,17 @@ struct LogBuilders {
 }
 
 impl LogBuilders {
-    fn with_capacity(rows: usize, input_bytes: usize) -> Self {
+    fn with_capacity(rows: usize, input_bytes: usize, plan: Plan) -> Self {
+        let schema = logs_schema_arc();
         Self {
+            rows: 0,
+            time_range: plan.time_range(&schema, "time_unix_nano"),
+            observed_time_range: plan.time_range(&schema, "observed_time_unix_nano"),
+            body_wanted: plan.builds_named(&schema, "body"),
+            log_attributes_wanted: plan.builds_named(&schema, "log_attributes"),
+            resource_attributes_wanted: plan.builds_named(&schema, "resource_attributes"),
+            scope_attributes_wanted: plan.builds_named(&schema, "scope_attributes"),
+            plan,
             time_unix_nano: TimestampNanosecondBuilder::with_capacity(rows),
             observed_time_unix_nano: TimestampNanosecondBuilder::with_capacity(rows),
             trace_id: FixedSizeBinaryBuilder::new(16),
@@ -285,11 +318,23 @@ impl LogBuilders {
         }
     }
 
+    fn filters_records(&self) -> bool {
+        self.time_range.is_some() || self.observed_time_range.is_some()
+    }
+
+    /// Whether the record passes the time ranges (the service name was
+    /// checked for its whole resource).
+    fn keeps(&self, record: &impl LogRecordView) -> bool {
+        in_range(self.time_range, record.time_unix_nano())
+            && in_range(self.observed_time_range, record.observed_time_unix_nano())
+    }
+
     fn append_observed(
         &mut self,
         record: &impl LogRecordView,
         observer: &mut Option<&mut dyn TransformObserver>,
     ) -> Result<()> {
+        self.rows += 1;
         measure_result(
             observer,
             TransformSignal::Logs,
@@ -330,25 +375,29 @@ impl LogBuilders {
             },
         )?;
 
-        measure_result(
-            observer,
-            TransformSignal::Logs,
-            TransformPhase::BodyAppend,
-            || view_json::append_body(&mut self.body, record.body()),
-        )?;
+        if self.body_wanted {
+            measure_result(
+                observer,
+                TransformSignal::Logs,
+                TransformPhase::BodyAppend,
+                || view_json::append_body(&mut self.body, record.body()),
+            )?;
+        }
 
-        measure_result(
-            observer,
-            TransformSignal::Logs,
-            TransformPhase::LogAttributesJson,
-            || {
-                view_json::append_attributes(
-                    &mut self.log_attributes,
-                    record.attributes(),
-                    &mut self.json_scratch,
-                )
-            },
-        )?;
+        if self.log_attributes_wanted {
+            measure_result(
+                observer,
+                TransformSignal::Logs,
+                TransformPhase::LogAttributesJson,
+                || {
+                    view_json::append_attributes(
+                        &mut self.log_attributes,
+                        record.attributes(),
+                        &mut self.json_scratch,
+                    )
+                },
+            )?;
+        }
         Ok(())
     }
 
@@ -452,8 +501,9 @@ impl LogBuilders {
     }
 
     fn finish(mut self) -> Result<RecordBatch> {
-        record_batch(
+        finish_batch(
             logs_schema_arc(),
+            &self.plan,
             vec![
                 array(self.time_unix_nano.finish()),
                 array(self.observed_time_unix_nano.finish()),
@@ -474,6 +524,7 @@ impl LogBuilders {
                 array(self.dropped_attributes_count.finish()),
                 array(self.flags.finish()),
             ],
+            self.rows,
         )
     }
 }

@@ -11,6 +11,7 @@ use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use prost::Message;
 
 use crate::{
+    options::{in_range, Plan, TransformOptions},
     schema::traces_schema_arc,
     views::otlp::Obj,
     views::pdata::{ResourceSpansView, ScopeSpansView, SpanView, StatusView, TracesView},
@@ -25,20 +26,16 @@ use super::{
     },
     util::{
         append_empty_as_null, append_fixed_or_null, append_fixed_required, append_opt_n,
-        append_required_service_name_n, append_required_ts_ns, array, record_batch,
+        append_required_service_name_n, append_required_ts_ns, array, finish_batch,
         string_builder_bytes, u64_to_i64,
     },
     view_json,
 };
 
-pub fn transform_traces_protobuf(bytes: &[u8]) -> Result<RecordBatch> {
-    let request = ExportTraceServiceRequest::decode(bytes)?;
-    transform_traces_request(request, bytes.len())
-}
-
 pub fn transform_traces_protobuf_observed(
     bytes: &[u8],
     observer: &mut Option<&mut dyn TransformObserver>,
+    options: &TransformOptions,
 ) -> Result<RecordBatch> {
     let request = measure_result(
         observer,
@@ -46,37 +43,33 @@ pub fn transform_traces_protobuf_observed(
         TransformPhase::ProtobufDecode,
         || ExportTraceServiceRequest::decode(bytes),
     )?;
-    transform_traces_request_observed(request, bytes.len(), observer)
-}
-
-pub fn transform_traces_request(
-    request: ExportTraceServiceRequest,
-    input_bytes: usize,
-) -> Result<RecordBatch> {
-    let mut observer = None;
-    transform_traces_request_observed(request, input_bytes, &mut observer)
+    transform_traces_request_observed(request, bytes.len(), observer, options)
 }
 
 pub fn transform_traces_request_observed(
     request: ExportTraceServiceRequest,
     input_bytes: usize,
     observer: &mut Option<&mut dyn TransformObserver>,
+    options: &TransformOptions,
 ) -> Result<RecordBatch> {
-    transform_traces_view_observed(&Obj::new(&request), input_bytes, observer)
+    transform_traces_view_observed(&Obj::new(&request), input_bytes, observer, options)
 }
 
 pub(crate) fn transform_traces_view<V: TracesView>(
     view: &V,
     input_bytes: usize,
+    options: &TransformOptions,
 ) -> Result<RecordBatch> {
-    transform_traces_view_observed(view, input_bytes, &mut None)
+    transform_traces_view_observed(view, input_bytes, &mut None, options)
 }
 
 pub(crate) fn transform_traces_view_observed<V: TracesView>(
     view: &V,
     input_bytes: usize,
     observer: &mut Option<&mut dyn TransformObserver>,
+    options: &TransformOptions,
 ) -> Result<RecordBatch> {
+    let plan = options.plan(&traces_schema_arc())?;
     let rows = measure_phase(
         observer,
         TransformSignal::Traces,
@@ -102,7 +95,7 @@ pub(crate) fn transform_traces_view_observed<V: TracesView>(
         observer,
         TransformSignal::Traces,
         TransformPhase::BuilderInit,
-        || TraceBuilders::with_capacity(rows, input_bytes),
+        || TraceBuilders::with_capacity(rows, input_bytes, plan),
     );
     let mut duplicates = observer.is_some().then(ContextDuplicateTracker::default);
 
@@ -131,12 +124,16 @@ fn append_resource_spans_observed<R: ResourceSpansView>(
 ) -> Result<()> {
     let resource_phase_start = phase_start(observer);
     let resource_view = resource_spans.resource();
-    let resource = ResourceContext::from_view_observed(
+    let Some(resource) = ResourceContext::from_view_observed(
         resource_view.as_ref(),
         TransformSignal::Traces,
         observer,
         duplicates.as_deref_mut(),
-    );
+        |service| builders.plan.keeps_service(service),
+        builders.resource_attributes_wanted,
+    ) else {
+        return Ok(());
+    };
 
     for scope_spans in resource_spans.scopes() {
         append_scope_spans_observed(
@@ -171,8 +168,16 @@ fn append_scope_spans_observed<S: ScopeSpansView>(
         TransformSignal::Traces,
         observer,
         duplicates,
+        builders.scope_attributes_wanted,
     );
-    let span_count = scope_spans.spans().count();
+    let span_count = if builders.start_time_range.is_some() {
+        scope_spans
+            .spans()
+            .filter(|span| builders.keeps(span))
+            .count()
+    } else {
+        scope_spans.spans().count()
+    };
     if span_count > 0 {
         let context_phase_start = phase_start(observer);
         builders.append_context_observed(span_count, resource, &scope, observer);
@@ -185,7 +190,9 @@ fn append_scope_spans_observed<S: ScopeSpansView>(
     }
 
     for span in scope_spans.spans() {
-        append_span_observed(&span, builders, observer)?;
+        if builders.keeps(&span) {
+            append_span_observed(&span, builders, observer)?;
+        }
     }
 
     finish_phase(
@@ -214,6 +221,14 @@ fn append_span_observed<S: SpanView>(
 }
 
 struct TraceBuilders {
+    plan: Plan,
+    rows: usize,
+    start_time_range: Option<(i64, i64)>,
+    span_attributes_wanted: bool,
+    events_json_wanted: bool,
+    links_json_wanted: bool,
+    resource_attributes_wanted: bool,
+    scope_attributes_wanted: bool,
     start_time_unix_nano: TimestampNanosecondBuilder,
     duration_time_unix_nano: DurationNanosecondBuilder,
     trace_id: FixedSizeBinaryBuilder,
@@ -242,8 +257,17 @@ struct TraceBuilders {
 }
 
 impl TraceBuilders {
-    fn with_capacity(rows: usize, input_bytes: usize) -> Self {
+    fn with_capacity(rows: usize, input_bytes: usize, plan: Plan) -> Self {
+        let schema = traces_schema_arc();
         Self {
+            rows: 0,
+            start_time_range: plan.time_range(&schema, "start_time_unix_nano"),
+            span_attributes_wanted: plan.builds_named(&schema, "span_attributes"),
+            events_json_wanted: plan.builds_named(&schema, "events_json"),
+            links_json_wanted: plan.builds_named(&schema, "links_json"),
+            resource_attributes_wanted: plan.builds_named(&schema, "resource_attributes"),
+            scope_attributes_wanted: plan.builds_named(&schema, "scope_attributes"),
+            plan,
             start_time_unix_nano: TimestampNanosecondBuilder::with_capacity(rows),
             duration_time_unix_nano: DurationNanosecondBuilder::with_capacity(rows),
             trace_id: FixedSizeBinaryBuilder::new(16),
@@ -272,11 +296,21 @@ impl TraceBuilders {
         }
     }
 
+    /// Whether the span passes the start time range (the service name was
+    /// checked for its whole resource). A missing start time is emitted as 0.
+    fn keeps<S: SpanView>(&self, span: &S) -> bool {
+        in_range(
+            self.start_time_range,
+            Some(span.start_time_unix_nano().unwrap_or_default()),
+        )
+    }
+
     fn append_observed<S: SpanView>(
         &mut self,
         span: &S,
         observer: &mut Option<&mut dyn TransformObserver>,
     ) -> Result<()> {
+        self.rows += 1;
         measure_result(
             observer,
             TransformSignal::Traces,
@@ -333,36 +367,48 @@ impl TraceBuilders {
             },
         )?;
 
-        measure_result(
-            observer,
-            TransformSignal::Traces,
-            TransformPhase::SpanAttributesJson,
-            || {
-                view_json::append_attributes(
-                    &mut self.span_attributes,
-                    span.attributes(),
-                    &mut self.json_scratch,
-                )
-            },
-        )?;
-        measure_result(
-            observer,
-            TransformSignal::Traces,
-            TransformPhase::EventsJson,
-            || {
-                view_json::append_events(
-                    &mut self.events_json,
-                    span.events(),
-                    &mut self.json_scratch,
-                )
-            },
-        )?;
-        measure_result(
-            observer,
-            TransformSignal::Traces,
-            TransformPhase::LinksJson,
-            || view_json::append_links(&mut self.links_json, span.links(), &mut self.json_scratch),
-        )?;
+        if self.span_attributes_wanted {
+            measure_result(
+                observer,
+                TransformSignal::Traces,
+                TransformPhase::SpanAttributesJson,
+                || {
+                    view_json::append_attributes(
+                        &mut self.span_attributes,
+                        span.attributes(),
+                        &mut self.json_scratch,
+                    )
+                },
+            )?;
+        }
+        if self.events_json_wanted {
+            measure_result(
+                observer,
+                TransformSignal::Traces,
+                TransformPhase::EventsJson,
+                || {
+                    view_json::append_events(
+                        &mut self.events_json,
+                        span.events(),
+                        &mut self.json_scratch,
+                    )
+                },
+            )?;
+        }
+        if self.links_json_wanted {
+            measure_result(
+                observer,
+                TransformSignal::Traces,
+                TransformPhase::LinksJson,
+                || {
+                    view_json::append_links(
+                        &mut self.links_json,
+                        span.links(),
+                        &mut self.json_scratch,
+                    )
+                },
+            )?;
+        }
         measure_phase(
             observer,
             TransformSignal::Traces,
@@ -480,8 +526,9 @@ impl TraceBuilders {
     }
 
     fn finish(mut self) -> Result<RecordBatch> {
-        record_batch(
+        finish_batch(
             traces_schema_arc(),
+            &self.plan,
             vec![
                 array(self.start_time_unix_nano.finish()),
                 array(self.duration_time_unix_nano.finish()),
@@ -508,6 +555,7 @@ impl TraceBuilders {
                 array(self.dropped_links_count.finish()),
                 array(self.flags.finish()),
             ],
+            self.rows,
         )
     }
 }
