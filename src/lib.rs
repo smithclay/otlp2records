@@ -60,12 +60,10 @@ mod grpc_lifecycle_model;
 pub mod wasm;
 
 pub use api::{
-    transform_logs, transform_logs_json, transform_logs_partitioned, transform_logs_with_observer,
-    transform_logs_with_options, transform_metrics, transform_metrics_json,
-    transform_metrics_partitioned, transform_metrics_with_observer, transform_metrics_with_options,
-    transform_traces, transform_traces_json, transform_traces_partitioned,
-    transform_traces_with_observer, transform_traces_with_options, JsonMetricBatches,
-    MetricBatches, SkippedMetrics,
+    transform_logs, transform_logs_json, transform_logs_partitioned, transform_metrics,
+    transform_metrics_json, transform_metrics_partitioned, transform_traces, transform_traces_json,
+    transform_traces_partitioned, JsonMetricBatches, MetricBatches, MetricShapeBatch,
+    SkippedMetrics, Transformer,
 };
 pub use arrow::{
     extract_min_timestamp_micros, extract_service_name, group_batch_by_service, ArrowProfile,

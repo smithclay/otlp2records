@@ -7,7 +7,7 @@ use crate::{
     },
     batch::{self, MetricsSelection, TransformObserver, TransformSignal},
     decode::{decode_metrics_json_request, decode_metrics_jsonl_request, InputFormat},
-    MetricShape, Result, TransformOptions,
+    Result,
 };
 
 /// Transform OTLP metrics to Arrow RecordBatches.
@@ -15,42 +15,12 @@ use crate::{
 /// Returns separate batches for gauge and sum metrics because they have
 /// different schemas. Each field in the result is `None` if there were
 /// no metrics of that type in the input.
+/// [`crate::Transformer`] adds options and an observer.
 pub fn transform_metrics(bytes: &[u8], format: InputFormat) -> Result<MetricBatches> {
     transform_metrics_observed(bytes, format, &mut None, MetricsSelection::All)
 }
 
-/// Transform one metric shape of OTLP metrics, building only the columns and
-/// rows `options` asks for (column indexes are the shape's). That shape's
-/// field is always `Some`, an empty batch when the input has none of it; the
-/// other shapes are not built, so theirs are `None`. `skipped` still counts
-/// summary points. See [`TransformOptions`].
-pub fn transform_metrics_with_options(
-    bytes: &[u8],
-    format: InputFormat,
-    shape: MetricShape,
-    options: &TransformOptions,
-) -> Result<MetricBatches> {
-    // Planned first, so an options error is never retried as another format.
-    let plan = options.plan(&shape.schema_ref())?;
-    transform_metrics_observed(
-        bytes,
-        format,
-        &mut None,
-        MetricsSelection::Shape(shape, &plan),
-    )
-}
-
-/// Transform OTLP metrics while reporting phase timings to an observer.
-pub fn transform_metrics_with_observer(
-    bytes: &[u8],
-    format: InputFormat,
-    observer: &mut dyn TransformObserver,
-) -> Result<MetricBatches> {
-    let mut observer = Some(observer);
-    transform_metrics_observed(bytes, format, &mut observer, MetricsSelection::All)
-}
-
-fn transform_metrics_observed(
+pub(super) fn transform_metrics_observed(
     bytes: &[u8],
     format: InputFormat,
     observer: &mut Option<&mut dyn TransformObserver>,

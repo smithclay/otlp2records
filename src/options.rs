@@ -117,6 +117,11 @@ impl TransformOptions {
         self
     }
 
+    /// Whether these options narrow anything.
+    pub(crate) fn narrows(&self) -> bool {
+        self.columns.is_some() || self.service_filter.is_some() || !self.time_ranges.is_empty()
+    }
+
     /// Checks the options against the schema they will be applied to. Every
     /// public entry point plans once, before format detection, so a bad option
     /// is reported as such rather than retried as a decode failure.

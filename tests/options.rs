@@ -6,9 +6,8 @@ use std::collections::BTreeSet;
 use arrow_array::{Array, BooleanArray, RecordBatch, StringArray, TimestampNanosecondArray};
 use arrow_select::filter::filter_record_batch;
 use otlp2records::{
-    otap::OtapDecoder, transform_logs, transform_logs_with_options, transform_metrics,
-    transform_metrics_with_options, transform_traces, transform_traces_with_options, Error,
-    InputFormat, MetricBatches, MetricShape, TransformOptions,
+    otap::OtapDecoder, transform_logs, transform_metrics, transform_traces, Error, InputFormat,
+    MetricBatches, MetricShape, MetricShapeBatch, TransformOptions, Transformer,
 };
 
 const LOGS: &[u8] = include_bytes!("../testdata/logs_large.pb");
@@ -79,6 +78,11 @@ impl Predicates {
         assert_eq!(actual.num_rows(), expected.num_rows(), "row count");
         assert_eq!(actual, &expected);
     }
+}
+
+/// A narrowed transform of `format` input.
+fn narrowed(format: InputFormat, options: TransformOptions) -> Transformer<'static> {
+    Transformer::new(format).options(options)
 }
 
 fn string_column<'a>(batch: &'a RecordBatch, name: &str) -> &'a StringArray {
@@ -178,8 +182,9 @@ fn cases(full: &RecordBatch, time_columns: &[&str]) -> Vec<Predicates> {
 fn logs_options_match_the_filtered_full_transform() {
     let full = transform_logs(LOGS, InputFormat::Protobuf).unwrap();
     for case in cases(&full, &["time_unix_nano"]) {
-        let actual =
-            transform_logs_with_options(LOGS, InputFormat::Protobuf, &case.options()).unwrap();
+        let actual = narrowed(InputFormat::Protobuf, case.options())
+            .logs(LOGS)
+            .unwrap();
         case.check(&full, &actual);
     }
 }
@@ -188,8 +193,9 @@ fn logs_options_match_the_filtered_full_transform() {
 fn logs_options_apply_to_json_input() {
     let full = transform_logs(LOGS_JSON, InputFormat::Auto).unwrap();
     for case in cases(&full, &[]) {
-        let actual =
-            transform_logs_with_options(LOGS_JSON, InputFormat::Auto, &case.options()).unwrap();
+        let actual = narrowed(InputFormat::Auto, case.options())
+            .logs(LOGS_JSON)
+            .unwrap();
         case.check(&full, &actual);
     }
 }
@@ -198,8 +204,9 @@ fn logs_options_apply_to_json_input() {
 fn traces_options_match_the_filtered_full_transform() {
     let full = transform_traces(TRACES, InputFormat::Protobuf).unwrap();
     for case in cases(&full, &["start_time_unix_nano"]) {
-        let actual =
-            transform_traces_with_options(TRACES, InputFormat::Protobuf, &case.options()).unwrap();
+        let actual = narrowed(InputFormat::Protobuf, case.options())
+            .traces(TRACES)
+            .unwrap();
         case.check(&full, &actual);
     }
 }
@@ -213,22 +220,11 @@ fn metric_options_build_only_their_shape() {
             continue;
         };
         for case in cases(full, &["time_unix_nano"]) {
-            let batches = transform_metrics_with_options(
-                METRICS,
-                InputFormat::Protobuf,
-                shape,
-                &case.options(),
-            )
-            .unwrap();
-            for other in SHAPES.into_iter().filter(|other| *other != shape) {
-                assert!(
-                    shape_batch(&batches, other).is_none(),
-                    "{other:?} was built"
-                );
-            }
-            assert_eq!(batches.skipped.summaries, all.skipped.summaries);
-            // The selected shape is always returned, empty if nothing is kept.
-            case.check(full, shape_batch(&batches, shape).expect("selected shape"));
+            let result = narrowed(InputFormat::Protobuf, case.options())
+                .metric_shape(shape, METRICS)
+                .unwrap();
+            assert_eq!(result.skipped.summaries, all.skipped.summaries);
+            case.check(full, &result.batch);
         }
         checked += 1;
     }
@@ -265,11 +261,10 @@ fn otap_options_match_the_equivalent_otlp() {
             continue;
         };
         for case in cases(full, &["time_unix_nano"]) {
-            let batches = OtapDecoder::new()
-                .decode_metrics_with_options(metrics_bar, shape, &case.options())
+            let result = OtapDecoder::new()
+                .decode_metric_shape(metrics_bar, shape, &case.options())
                 .unwrap();
-            // The selected shape is always returned, empty if nothing is kept.
-            case.check(full, shape_batch(&batches, shape).expect("selected shape"));
+            case.check(full, &result.batch);
         }
     }
 }
@@ -278,7 +273,9 @@ fn otap_options_match_the_equivalent_otlp() {
 fn default_options_are_the_plain_transform() {
     let options = TransformOptions::new();
     assert_eq!(
-        transform_logs_with_options(LOGS, InputFormat::Protobuf, &options).unwrap(),
+        narrowed(InputFormat::Protobuf, options.clone())
+            .logs(LOGS)
+            .unwrap(),
         transform_logs(LOGS, InputFormat::Protobuf).unwrap()
     );
 }
@@ -294,8 +291,9 @@ fn invalid_options_are_rejected_before_decoding() {
         TransformOptions::new().with_time_range(width, 0, 1),
     ] {
         // Garbage input: the options error must win over the decode error.
-        let error =
-            transform_logs_with_options(b"\xff\xff", InputFormat::Auto, &options).unwrap_err();
+        let error = narrowed(InputFormat::Auto, options)
+            .logs(b"\xff\xff")
+            .unwrap_err();
         assert!(matches!(&error, Error::InvalidOptions(_)), "{error}");
     }
 }
@@ -321,8 +319,9 @@ fn a_range_rejects_null_timestamps() {
         ranges: vec![(column, i64::MIN, i64::MAX)],
         ..Default::default()
     };
-    let actual =
-        transform_logs_with_options(NULLS_AND_UNKNOWN, InputFormat::Json, &case.options()).unwrap();
+    let actual = narrowed(InputFormat::Json, case.options())
+        .logs(NULLS_AND_UNKNOWN)
+        .unwrap();
     assert_eq!(actual.num_rows(), 2);
     case.check(&full, &actual);
 }
@@ -335,9 +334,9 @@ fn a_resource_without_service_name_matches_unknown() {
             services: Some(vec![service.into()]),
             ..Default::default()
         };
-        let actual =
-            transform_logs_with_options(NULLS_AND_UNKNOWN, InputFormat::Json, &case.options())
-                .unwrap();
+        let actual = narrowed(InputFormat::Json, case.options())
+            .logs(NULLS_AND_UNKNOWN)
+            .unwrap();
         assert_eq!(actual.num_rows(), rows, "{service}");
         case.check(&full, &actual);
     }
@@ -348,16 +347,43 @@ fn a_shape_the_input_lacks_is_an_empty_projected_batch() {
     let gauges = include_bytes!("../testdata/metrics_gauge.pb");
     let schema = MetricShape::Histogram.schema();
     let bounds = schema.index_of("explicit_bounds").unwrap();
-    let batches = transform_metrics_with_options(
-        gauges,
+    let MetricShapeBatch { batch, .. } = narrowed(
         InputFormat::Protobuf,
-        MetricShape::Histogram,
-        &TransformOptions::new().with_columns([bounds]),
+        TransformOptions::new().with_columns([bounds]),
     )
+    .metric_shape(MetricShape::Histogram, gauges)
     .unwrap();
-    let histogram = batches.histogram.expect("the selected shape is returned");
-    assert_eq!(histogram.num_rows(), 0);
-    assert_eq!(histogram.schema().fields().len(), 1);
-    assert_eq!(histogram.schema().field(0).name(), "explicit_bounds");
-    assert!(batches.gauge.is_none());
+    assert_eq!(batch.num_rows(), 0);
+    assert_eq!(batch.schema().fields().len(), 1);
+    assert_eq!(batch.schema().field(0).name(), "explicit_bounds");
+}
+
+#[test]
+fn every_shape_at_once_cannot_be_narrowed() {
+    let options = TransformOptions::new().with_time_range(0, 0, 1);
+    let error = narrowed(InputFormat::Protobuf, options)
+        .metrics(METRICS)
+        .unwrap_err();
+    assert!(matches!(error, Error::InvalidOptions(_)), "{error}");
+}
+
+#[test]
+fn options_and_an_observer_combine() {
+    #[derive(Default)]
+    struct Phases(usize);
+    impl otlp2records::TransformObserver for Phases {
+        fn on_phase(&mut self, _: otlp2records::TransformPhaseTiming) {
+            self.0 += 1;
+        }
+    }
+    let schema = otlp2records::logs_schema();
+    let options = TransformOptions::new().with_columns([schema.index_of("body").unwrap()]);
+    let mut phases = Phases::default();
+    let batch = Transformer::new(InputFormat::Protobuf)
+        .options(options)
+        .observer(&mut phases)
+        .logs(LOGS)
+        .unwrap();
+    assert_eq!(batch.num_columns(), 1);
+    assert!(phases.0 > 0);
 }

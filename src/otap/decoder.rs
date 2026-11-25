@@ -5,7 +5,7 @@ use arrow_ipc::reader::StreamReader;
 use prost::Message;
 
 use crate::{
-    api::MetricBatches,
+    api::{MetricBatches, MetricShapeBatch},
     batch::MetricsSelection,
     options::{MetricShape, Plan, TransformOptions},
     schema::{logs_schema_arc, traces_schema_arc},
@@ -196,20 +196,21 @@ impl OtapDecoder {
         })
     }
 
-    /// Like [`Self::decode_metrics`], building only `shape`, narrowed by
-    /// `options` (column indexes are the shape's). That shape's field is always
-    /// `Some`, an empty batch when the message has none of it.
-    pub fn decode_metrics_with_options(
+    /// Decodes one message into one metric shape, narrowed by `options`
+    /// (column indexes are the shape's). The other shapes are not built, and a
+    /// shape the message has none of is an empty batch.
+    pub fn decode_metric_shape(
         &mut self,
         bytes: &[u8],
         shape: MetricShape,
         options: &TransformOptions,
-    ) -> Result<MetricBatches> {
+    ) -> Result<MetricShapeBatch> {
         let plan = options.plan(&shape.schema_ref())?;
         self.guarded(|decoder| {
             let envelope = BatchArrowRecords::decode(bytes)?;
             decoder.metrics(envelope, MetricsSelection::Shape(shape, &plan))
         })
+        .map(|batches| batches.into_shape(shape))
     }
 
     /// Decodes one already-deserialized `BatchArrowRecords` into normalized

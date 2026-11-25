@@ -96,7 +96,7 @@ pub struct TransformCounterValue {
 /// Optional sink for transform timing observations.
 ///
 /// Default transform entrypoints do not require an observer. Production callers that need phase
-/// timings can use the `*_with_observer` functions and provide a lightweight sink.
+/// timings pass a lightweight sink to [`crate::Transformer::observer`].
 pub trait TransformObserver {
     fn on_phase(&mut self, timing: TransformPhaseTiming);
 

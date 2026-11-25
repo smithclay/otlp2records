@@ -11,9 +11,8 @@ use crate::ffi_export::{ffi_boundary, ExportError, ExportedBatch, ExportedMetric
 pub use crate::ffi_export::{OtlpArrowBatch, OtlpMetricsArrowBatches};
 use crate::{
     schema::{logs_schema_arc, traces_schema_arc},
-    transform_logs, transform_logs_with_options, transform_metrics, transform_metrics_with_options,
-    transform_traces, transform_traces_with_options, ArrowProfile, Error, MetricBatches,
-    MetricShape, TransformOptions,
+    transform_logs, transform_metrics, transform_traces, ArrowProfile, Error, MetricShape,
+    TransformOptions, Transformer,
 };
 
 /// OTLP signal types supported by the transformer.
@@ -138,17 +137,6 @@ fn options_status(error: &Error) -> OtlpStatus {
         Error::InvalidOptions(_) => OtlpStatus::InvalidArgument,
         _ => OtlpStatus::ParseFailed,
     }
-}
-
-/// The selected shape's batch, which a narrowed metrics transform always returns.
-fn selected_shape(batches: MetricBatches, shape: MetricShape) -> RecordBatch {
-    match shape {
-        MetricShape::Gauge => batches.gauge,
-        MetricShape::Sum => batches.sum,
-        MetricShape::Histogram => batches.histogram,
-        MetricShape::ExponentialHistogram => batches.exp_histogram,
-    }
-    .expect("a narrowed metrics transform returns its shape")
 }
 
 /// The metric shape a signal type names, if it names one.
@@ -388,16 +376,15 @@ pub unsafe extern "C" fn otlp_transform_with_options(
         if data.is_null() || out_array.is_null() || out_schema.is_null() {
             return OtlpStatus::InvalidArgument;
         }
-        let options = read_options(options);
         let input = std::slice::from_raw_parts(data, len);
-        let format = InputFormat::from(format);
+        let mut transformer =
+            Transformer::new(InputFormat::from(format)).options(read_options(options));
         let transformed = match metric_shape(signal_type) {
-            Some(shape) => transform_metrics_with_options(input, format, shape, &options)
-                .map(|batches| selected_shape(batches, shape)),
-            None if signal_type == OtlpSignalType::Logs => {
-                transform_logs_with_options(input, format, &options)
-            }
-            None => transform_traces_with_options(input, format, &options),
+            Some(shape) => transformer
+                .metric_shape(shape, input)
+                .map(|shape| shape.batch),
+            None if signal_type == OtlpSignalType::Logs => transformer.logs(input),
+            None => transformer.traces(input),
         };
         match transformed {
             Ok(batch) => export_batch(profile.into(), batch, out_array, out_schema),
@@ -675,8 +662,8 @@ pub unsafe extern "C" fn otlp_otap_decode_with_options(
         let decoded = match metric_shape(signal_type) {
             Some(shape) => decoder
                 .inner
-                .decode_metrics_with_options(input, shape, &options)
-                .map(|batches| selected_shape(batches, shape)),
+                .decode_metric_shape(input, shape, &options)
+                .map(|shape| shape.batch),
             None if signal_type == OtlpSignalType::Logs => {
                 decoder.inner.decode_logs_with_options(input, &options)
             }

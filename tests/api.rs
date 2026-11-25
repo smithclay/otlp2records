@@ -429,8 +429,10 @@ fn test_transform_logs_with_observer_matches_default() {
 
     let default_batch = transform_logs(&bytes, InputFormat::Protobuf).unwrap();
     let mut observer = TestObserver::default();
-    let observed_batch =
-        transform_logs_with_observer(&bytes, InputFormat::Protobuf, &mut observer).unwrap();
+    let observed_batch = Transformer::new(InputFormat::Protobuf)
+        .observer(&mut observer)
+        .logs(&bytes)
+        .unwrap();
 
     assert_eq!(observed_batch.num_rows(), default_batch.num_rows());
     assert!(observer.phases.contains(&TransformPhase::ProtobufDecode));
@@ -462,7 +464,10 @@ fn test_transform_observer_reports_duplicate_context_hits() {
     let bytes = request.encode_to_vec();
 
     let mut observer = TestObserver::default();
-    let batch = transform_logs_with_observer(&bytes, InputFormat::Protobuf, &mut observer).unwrap();
+    let batch = Transformer::new(InputFormat::Protobuf)
+        .observer(&mut observer)
+        .logs(&bytes)
+        .unwrap();
 
     assert_eq!(batch.num_rows(), 2);
     assert!(observer
@@ -636,8 +641,10 @@ fn test_transform_traces_with_observer_matches_default() {
 
     let default_batch = transform_traces(&bytes, InputFormat::Protobuf).unwrap();
     let mut observer = TestObserver::default();
-    let observed_batch =
-        transform_traces_with_observer(&bytes, InputFormat::Protobuf, &mut observer).unwrap();
+    let observed_batch = Transformer::new(InputFormat::Protobuf)
+        .observer(&mut observer)
+        .traces(&bytes)
+        .unwrap();
 
     assert_eq!(observed_batch.num_rows(), default_batch.num_rows());
     assert!(observer.phases.contains(&TransformPhase::ProtobufDecode));
@@ -851,8 +858,10 @@ fn test_transform_metrics_with_observer_matches_default() {
 
     let default_batches = transform_metrics(&bytes, InputFormat::Protobuf).unwrap();
     let mut observer = TestObserver::default();
-    let observed_batches =
-        transform_metrics_with_observer(&bytes, InputFormat::Protobuf, &mut observer).unwrap();
+    let observed_batches = Transformer::new(InputFormat::Protobuf)
+        .observer(&mut observer)
+        .metrics(&bytes)
+        .unwrap();
 
     assert_eq!(
         observed_batches

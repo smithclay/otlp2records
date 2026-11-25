@@ -53,6 +53,15 @@ pub struct MetricBatches {
     pub skipped: SkippedMetrics,
 }
 
+/// One metric shape, from a transform that built only that shape.
+#[derive(Debug)]
+pub struct MetricShapeBatch {
+    /// The shape's rows; empty when the input had none of it.
+    pub batch: RecordBatch,
+    /// Metrics that were skipped during processing.
+    pub skipped: SkippedMetrics,
+}
+
 /// Result of transforming OTLP metrics to JSON values.
 #[derive(Debug)]
 pub struct JsonMetricBatches {
