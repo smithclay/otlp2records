@@ -293,7 +293,6 @@ fn otap_options_match_the_equivalent_otlp() {
 #[test]
 fn default_options_are_the_plain_transform() {
     let options = TransformOptions::new();
-    assert!(options.is_everything());
     assert_eq!(
         transform_logs_with_options(LOGS, InputFormat::Protobuf, &options).unwrap(),
         transform_logs(LOGS, InputFormat::Protobuf).unwrap()

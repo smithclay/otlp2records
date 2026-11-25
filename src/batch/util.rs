@@ -68,10 +68,9 @@ pub(super) fn append_opt_ts_ns(
     value: u64,
     field: &str,
 ) -> Result<()> {
-    if value == 0 {
-        builder.append_null();
-    } else {
-        builder.append_value(u64_to_i64(value, field)?);
+    match opt_ts(value) {
+        Some(value) => builder.append_value(u64_to_i64(value, field)?),
+        None => builder.append_null(),
     }
     Ok(())
 }

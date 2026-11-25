@@ -19,7 +19,7 @@ use super::wire::{
 };
 use crate::{
     batch::transform_logs_view,
-    options::TransformOptions,
+    options::Plan,
     views::pdata::{
         AnyValueView, AttributeView, InstrumentationScopeView, LogRecordView, LogsDataView,
         ResourceLogsView, ResourceView, ScopeLogsView, SpanId, Str, TraceId, ValueType,
@@ -36,7 +36,7 @@ pub(super) fn normalize(
     scope_attrs: Option<RecordBatch>,
     log_attrs: Option<RecordBatch>,
     input_bytes: usize,
-    options: &TransformOptions,
+    plan: &Plan,
 ) -> Result<RecordBatch> {
     validate_logs(&logs)?;
     for (name, batch) in [
@@ -62,7 +62,7 @@ pub(super) fn normalize(
     let scope_attrs = scope_attrs.map(decode_attr_parent_ids).transpose()?;
     let log_attrs = log_attrs.map(decode_attr_parent_ids).transpose()?;
     let view = OtapLogsView::new(logs, resource_attrs, scope_attrs, log_attrs)?;
-    transform_logs_view(&view, input_bytes, options)
+    transform_logs_view(&view, input_bytes, plan)
 }
 
 struct OtapLogsView {
@@ -1545,7 +1545,7 @@ mod tests {
             None,
             Some(empty_value_attrs()),
             0,
-            &crate::options::ALL,
+            &crate::options::Plan::all(&crate::schema::logs_schema_arc()),
         )
         .unwrap_err();
         assert!(

@@ -12,9 +12,12 @@
 //! SQL comparison semantics: a NULL timestamp fails a range. A caller that has
 //! richer filters applies them itself after the transform.
 
-use arrow_schema::{DataType, Schema, TimeUnit};
+use arrow_schema::{DataType, Schema, SchemaRef, TimeUnit};
 
-use crate::{Error, Result};
+use crate::{
+    schema::{exp_histogram_schema_arc, gauge_schema_arc, histogram_schema_arc, sum_schema_arc},
+    Error, Result,
+};
 
 /// Which metric shape a metrics transform builds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -29,24 +32,26 @@ impl MetricShape {
     /// The schema of this shape's batches.
     #[must_use]
     pub fn schema(self) -> Schema {
+        self.schema_ref().as_ref().clone()
+    }
+
+    pub(crate) fn schema_ref(self) -> SchemaRef {
         match self {
-            MetricShape::Gauge => crate::gauge_schema(),
-            MetricShape::Sum => crate::sum_schema(),
-            MetricShape::Histogram => crate::histogram_schema(),
-            MetricShape::ExponentialHistogram => crate::exp_histogram_schema(),
+            MetricShape::Gauge => gauge_schema_arc(),
+            MetricShape::Sum => sum_schema_arc(),
+            MetricShape::Histogram => histogram_schema_arc(),
+            MetricShape::ExponentialHistogram => exp_histogram_schema_arc(),
         }
     }
 }
 
 /// An inclusive range of nanosecond timestamps on one timestamp column.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TimeRange {
+struct TimeRange {
     /// Index of a `Timestamp(Nanosecond)` column in the signal's schema.
-    pub column: usize,
-    /// Smallest value kept, inclusive.
-    pub min: i64,
-    /// Largest value kept, inclusive.
-    pub max: i64,
+    column: usize,
+    min: i64,
+    max: i64,
 }
 
 /// What a transform builds. The default builds every column of every row.
@@ -57,20 +62,10 @@ pub struct TimeRange {
 /// output schema keeps its column order and names.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TransformOptions {
-    columns: Option<u64>,
-    /// A column index passed to `with_columns` that no mask can hold.
-    column_overflow: Option<usize>,
+    columns: Option<Vec<usize>>,
     service_names: Option<Vec<String>>,
     time_ranges: Vec<TimeRange>,
 }
-
-/// The options every profile-less transform uses: everything, unfiltered.
-pub(crate) static ALL: TransformOptions = TransformOptions {
-    columns: None,
-    column_overflow: None,
-    service_names: None,
-    time_ranges: Vec::new(),
-};
 
 impl TransformOptions {
     /// Every column of every row.
@@ -79,25 +74,11 @@ impl TransformOptions {
         Self::default()
     }
 
-    /// Build only these columns. Schemas have at most 64 columns, so an index
-    /// of 64 or more is rejected when the transform validates the options.
+    /// Build only these columns. An index past the schema is rejected when the
+    /// transform validates the options.
     #[must_use]
     pub fn with_columns(mut self, columns: impl IntoIterator<Item = usize>) -> Self {
-        let mut mask = 0u64;
-        for column in columns {
-            match u32::try_from(column).ok().and_then(|c| 1u64.checked_shl(c)) {
-                Some(bit) => mask |= bit,
-                None => self.column_overflow = Some(column),
-            }
-        }
-        self.columns = Some(mask);
-        self
-    }
-
-    /// Build only the columns whose bit is set (bit `i` is column `i`).
-    #[must_use]
-    pub fn with_column_mask(mut self, mask: u64) -> Self {
-        self.columns = Some(mask);
+        self.columns = Some(columns.into_iter().collect());
         self
     }
 
@@ -121,36 +102,25 @@ impl TransformOptions {
         self
     }
 
-    /// Whether these options build every column of every row.
-    #[must_use]
-    pub fn is_everything(&self) -> bool {
-        self.columns.is_none()
-            && self.column_overflow.is_none()
-            && self.service_names.is_none()
-            && self.time_ranges.is_empty()
-    }
-
-    /// Checks the options against the schema they will be applied to.
+    /// Checks the options against the schema they will be applied to. Every
+    /// public entry point plans once, before format detection, so a bad option
+    /// is reported as such rather than retried as a decode failure.
     pub(crate) fn plan(&self, schema: &Schema) -> Result<Plan> {
         let width = schema.fields().len();
-        if let Some(column) = self.column_overflow {
-            return Err(invalid(format!(
-                "column {column} is past the schema's {width}"
-            )));
-        }
-        let all = if width >= 64 {
-            u64::MAX
-        } else {
-            (1u64 << width) - 1
-        };
-        let columns = match self.columns {
-            Some(mask) if mask & !all != 0 => {
-                return Err(invalid(format!(
-                    "column mask {mask:#x} names a column past the schema's {width}"
-                )))
+        let columns = match &self.columns {
+            None => vec![true; width],
+            Some(requested) => {
+                let mut columns = vec![false; width];
+                for &column in requested {
+                    let Some(slot) = columns.get_mut(column) else {
+                        return Err(invalid(format!(
+                            "column {column} is past the schema's {width}"
+                        )));
+                    };
+                    *slot = true;
+                }
+                columns
             }
-            Some(mask) => mask,
-            None => all,
         };
         let mut time_ranges: Vec<TimeRange> = Vec::new();
         for range in &self.time_ranges {
@@ -178,11 +148,9 @@ impl TransformOptions {
                 None => time_ranges.push(*range),
             }
         }
-        let service_names = self.service_names.clone();
         Ok(Plan {
             columns,
-            all,
-            service_names,
+            service_names: self.service_names.clone(),
             time_ranges,
         })
     }
@@ -195,17 +163,26 @@ fn invalid(message: String) -> Error {
 /// [`TransformOptions`] resolved against one schema.
 #[derive(Debug, Clone)]
 pub(crate) struct Plan {
-    columns: u64,
-    all: u64,
+    /// Whether each column of the schema is built.
+    columns: Vec<bool>,
     service_names: Option<Vec<String>>,
     time_ranges: Vec<TimeRange>,
 }
 
 impl Plan {
+    /// Every column of every row of `schema`.
+    pub(crate) fn all(schema: &Schema) -> Self {
+        Self {
+            columns: vec![true; schema.fields().len()],
+            service_names: None,
+            time_ranges: Vec::new(),
+        }
+    }
+
     /// Whether the column at `index` is built.
     #[inline]
     pub(crate) fn builds(&self, index: usize) -> bool {
-        self.columns & (1u64 << index) != 0
+        self.columns[index]
     }
 
     /// Whether the named column is built. Panics on a name the schema lacks,
@@ -220,7 +197,7 @@ impl Plan {
 
     /// Whether every column is built.
     pub(crate) fn builds_everything(&self) -> bool {
-        self.columns == self.all
+        self.columns.iter().all(|built| *built)
     }
 
     /// Whether a resource whose emitted `service_name` is `service_name`
@@ -280,7 +257,7 @@ mod tests {
             .plan(&schema)
             .is_err());
         assert!(TransformOptions::new()
-            .with_columns([70])
+            .with_columns([usize::MAX])
             .plan(&schema)
             .is_err());
     }

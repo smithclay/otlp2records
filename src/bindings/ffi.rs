@@ -4,15 +4,17 @@ use std::ffi::c_char;
 
 use arrow_array::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
 use arrow_array::RecordBatch;
-use arrow_schema::Schema;
+use arrow_schema::{Schema, SchemaRef};
 
 use crate::decode::InputFormat;
 use crate::ffi_export::{ffi_boundary, ExportError, ExportedBatch, ExportedMetrics};
 pub use crate::ffi_export::{OtlpArrowBatch, OtlpMetricsArrowBatches};
 use crate::{
-    exp_histogram_schema, gauge_schema, histogram_schema, logs_schema, sum_schema, traces_schema,
-    transform_logs, transform_logs_with_options, transform_metrics, transform_metrics_with_options,
-    transform_traces, transform_traces_with_options, ArrowProfile, MetricBatches, MetricShape,
+    api::{transform_logs_planned, transform_metrics_planned, transform_traces_planned},
+    batch::MetricsSelection,
+    options::Plan,
+    schema::{logs_schema_arc, traces_schema_arc},
+    transform_logs, transform_metrics, transform_traces, ArrowProfile, MetricBatches, MetricShape,
     TransformOptions,
 };
 
@@ -38,23 +40,17 @@ pub enum OtlpSignalType {
 
 impl OtlpSignalType {
     fn schema(self) -> Schema {
-        match self {
-            OtlpSignalType::Logs => logs_schema(),
-            OtlpSignalType::Traces => traces_schema(),
-            OtlpSignalType::MetricsGauge => gauge_schema(),
-            OtlpSignalType::MetricsSum => sum_schema(),
-            OtlpSignalType::MetricsHistogram => histogram_schema(),
-            OtlpSignalType::MetricsExpHistogram => exp_histogram_schema(),
-        }
+        self.schema_ref().as_ref().clone()
     }
 
-    fn metric_shape(self) -> Option<MetricShape> {
+    fn schema_ref(self) -> SchemaRef {
         match self {
-            OtlpSignalType::Logs | OtlpSignalType::Traces => None,
-            OtlpSignalType::MetricsGauge => Some(MetricShape::Gauge),
-            OtlpSignalType::MetricsSum => Some(MetricShape::Sum),
-            OtlpSignalType::MetricsHistogram => Some(MetricShape::Histogram),
-            OtlpSignalType::MetricsExpHistogram => Some(MetricShape::ExponentialHistogram),
+            OtlpSignalType::Logs => logs_schema_arc(),
+            OtlpSignalType::Traces => traces_schema_arc(),
+            OtlpSignalType::MetricsGauge => MetricShape::Gauge.schema_ref(),
+            OtlpSignalType::MetricsSum => MetricShape::Sum.schema_ref(),
+            OtlpSignalType::MetricsHistogram => MetricShape::Histogram.schema_ref(),
+            OtlpSignalType::MetricsExpHistogram => MetricShape::ExponentialHistogram.schema_ref(),
         }
     }
 }
@@ -68,7 +64,7 @@ pub struct OtlpStr {
 }
 
 /// An inclusive nanosecond range on one timestamp column; see
-/// [`crate::TimeRange`].
+/// [`TransformOptions::with_time_range`].
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct OtlpTimeRange {
@@ -97,19 +93,17 @@ pub struct OtlpReadOptions {
     pub time_ranges_len: usize,
 }
 
-/// Reads `options` (NULL means every column of every row) and checks it
+/// Reads `options` (NULL means every column of every row) and plans it
 /// against `signal`'s schema. `None` for options that cannot be read or do
 /// not fit the schema.
-unsafe fn read_options(
-    signal: OtlpSignalType,
-    options: *const OtlpReadOptions,
-) -> Option<TransformOptions> {
+unsafe fn read_options(signal: OtlpSignalType, options: *const OtlpReadOptions) -> Option<Plan> {
+    let schema = signal.schema_ref();
     let Some(options) = options.as_ref() else {
-        return Some(TransformOptions::new());
+        return Some(Plan::all(&schema));
     };
     let mut result = TransformOptions::new();
     if options.columns != OTLP_COLUMNS_ALL {
-        result = result.with_column_mask(options.columns);
+        result = result.with_columns((0..64).filter(|bit| options.columns >> bit & 1 == 1));
     }
     if !options.service_names.is_null() {
         let names = std::slice::from_raw_parts(options.service_names, options.service_names_len);
@@ -133,20 +127,32 @@ unsafe fn read_options(
             result = result.with_time_range(range.column as usize, range.min, range.max);
         }
     }
-    result.plan(&signal.schema()).ok()?;
-    Some(result)
+    result.plan(&schema).ok()
 }
 
 /// The requested shape's batch, or an empty batch of its schema when the input
 /// had none of it.
-fn metric_shape_batch(batches: MetricBatches, shape: MetricShape) -> crate::Result<RecordBatch> {
+fn metric_shape_batch(batches: MetricBatches, shape: MetricShape) -> RecordBatch {
     let batch = match shape {
         MetricShape::Gauge => batches.gauge,
         MetricShape::Sum => batches.sum,
         MetricShape::Histogram => batches.histogram,
         MetricShape::ExponentialHistogram => batches.exp_histogram,
     };
-    Ok(batch.unwrap_or_else(|| RecordBatch::new_empty(std::sync::Arc::new(shape.schema()))))
+    batch.unwrap_or_else(|| RecordBatch::new_empty(shape.schema_ref()))
+}
+
+/// The metric shape a metric signal type names.
+fn metric_shape(signal: OtlpSignalType) -> MetricShape {
+    match signal {
+        OtlpSignalType::MetricsGauge => MetricShape::Gauge,
+        OtlpSignalType::MetricsSum => MetricShape::Sum,
+        OtlpSignalType::MetricsHistogram => MetricShape::Histogram,
+        OtlpSignalType::MetricsExpHistogram => MetricShape::ExponentialHistogram,
+        OtlpSignalType::Logs | OtlpSignalType::Traces => {
+            unreachable!("{signal:?} is not a metric shape")
+        }
+    }
 }
 
 /// Input format for OTLP data.
@@ -374,18 +380,19 @@ pub unsafe extern "C" fn otlp_transform_with_options(
         if data.is_null() || out_array.is_null() || out_schema.is_null() {
             return OtlpStatus::InvalidArgument;
         }
-        let Some(options) = read_options(signal_type, options) else {
+        let Some(plan) = read_options(signal_type, options) else {
             return OtlpStatus::InvalidArgument;
         };
         let input = std::slice::from_raw_parts(data, len);
         let format = InputFormat::from(format);
-        let transformed = match signal_type.metric_shape() {
-            None if signal_type == OtlpSignalType::Logs => {
-                transform_logs_with_options(input, format, &options)
+        let transformed = match signal_type {
+            OtlpSignalType::Logs => transform_logs_planned(input, format, &plan),
+            OtlpSignalType::Traces => transform_traces_planned(input, format, &plan),
+            metric => {
+                let shape = metric_shape(metric);
+                transform_metrics_planned(input, format, MetricsSelection::Shape(shape, &plan))
+                    .map(|batches| metric_shape_batch(batches, shape))
             }
-            None => transform_traces_with_options(input, format, &options),
-            Some(shape) => transform_metrics_with_options(input, format, shape, &options)
-                .and_then(|batches| metric_shape_batch(batches, shape)),
         };
         let Ok(batch) = transformed else {
             return OtlpStatus::ParseFailed;
@@ -657,20 +664,21 @@ pub unsafe extern "C" fn otlp_otap_decode_with_options(
         if decoder.is_null() || data.is_null() || out_array.is_null() || out_schema.is_null() {
             return OtlpStatus::InvalidArgument;
         }
-        let Some(options) = read_options(signal_type, options) else {
+        let Some(plan) = read_options(signal_type, options) else {
             return OtlpStatus::InvalidArgument;
         };
         let decoder = &mut *decoder;
         let input = std::slice::from_raw_parts(data, len);
-        let decoded = match signal_type.metric_shape() {
-            None if signal_type == OtlpSignalType::Logs => {
-                decoder.inner.decode_logs_with_options(input, &options)
+        let decoded = match signal_type {
+            OtlpSignalType::Logs => decoder.inner.decode_logs_planned(input, &plan),
+            OtlpSignalType::Traces => decoder.inner.decode_traces_planned(input, &plan),
+            metric => {
+                let shape = metric_shape(metric);
+                decoder
+                    .inner
+                    .decode_metrics_planned(input, MetricsSelection::Shape(shape, &plan))
+                    .map(|batches| metric_shape_batch(batches, shape))
             }
-            None => decoder.inner.decode_traces_with_options(input, &options),
-            Some(shape) => decoder
-                .inner
-                .decode_metrics_with_options(input, shape, &options)
-                .and_then(|batches| metric_shape_batch(batches, shape)),
         };
         let Ok(batch) = decoded else {
             return OtlpStatus::ParseFailed;

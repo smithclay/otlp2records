@@ -257,7 +257,7 @@ impl LogsService for OtlpIngest {
             request,
             input_bytes,
             &mut None,
-            &crate::options::ALL,
+            &crate::options::Plan::all(&crate::schema::logs_schema_arc()),
         )
         .map_err(|e| invalid("logs", e))?;
         self.host
@@ -280,7 +280,7 @@ impl TraceService for OtlpIngest {
             request,
             input_bytes,
             &mut None,
-            &crate::options::ALL,
+            &crate::options::Plan::all(&crate::schema::traces_schema_arc()),
         )
         .map_err(|e| invalid("traces", e))?;
         self.host

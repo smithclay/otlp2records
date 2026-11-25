@@ -2,8 +2,8 @@
 
 use arrow_array::{
     builder::{
-        DurationNanosecondBuilder, FixedSizeBinaryBuilder, Int32Builder, StringBuilder,
-        TimestampNanosecondBuilder, UInt32Builder,
+        ArrayBuilder, DurationNanosecondBuilder, FixedSizeBinaryBuilder, Int32Builder,
+        StringBuilder, TimestampNanosecondBuilder, UInt32Builder,
     },
     RecordBatch,
 };
@@ -11,7 +11,7 @@ use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use prost::Message;
 
 use crate::{
-    options::{in_range, Plan, TransformOptions},
+    options::{in_range, Plan},
     schema::traces_schema_arc,
     views::otlp::Obj,
     views::pdata::{ResourceSpansView, ScopeSpansView, SpanView, StatusView, TracesView},
@@ -35,7 +35,7 @@ use super::{
 pub fn transform_traces_protobuf_observed(
     bytes: &[u8],
     observer: &mut Option<&mut dyn TransformObserver>,
-    options: &TransformOptions,
+    plan: &Plan,
 ) -> Result<RecordBatch> {
     let request = measure_result(
         observer,
@@ -43,33 +43,32 @@ pub fn transform_traces_protobuf_observed(
         TransformPhase::ProtobufDecode,
         || ExportTraceServiceRequest::decode(bytes),
     )?;
-    transform_traces_request_observed(request, bytes.len(), observer, options)
+    transform_traces_request_observed(request, bytes.len(), observer, plan)
 }
 
 pub fn transform_traces_request_observed(
     request: ExportTraceServiceRequest,
     input_bytes: usize,
     observer: &mut Option<&mut dyn TransformObserver>,
-    options: &TransformOptions,
+    plan: &Plan,
 ) -> Result<RecordBatch> {
-    transform_traces_view_observed(&Obj::new(&request), input_bytes, observer, options)
+    transform_traces_view_observed(&Obj::new(&request), input_bytes, observer, plan)
 }
 
 pub(crate) fn transform_traces_view<V: TracesView>(
     view: &V,
     input_bytes: usize,
-    options: &TransformOptions,
+    plan: &Plan,
 ) -> Result<RecordBatch> {
-    transform_traces_view_observed(view, input_bytes, &mut None, options)
+    transform_traces_view_observed(view, input_bytes, &mut None, plan)
 }
 
 pub(crate) fn transform_traces_view_observed<V: TracesView>(
     view: &V,
     input_bytes: usize,
     observer: &mut Option<&mut dyn TransformObserver>,
-    options: &TransformOptions,
+    plan: &Plan,
 ) -> Result<RecordBatch> {
-    let plan = options.plan(&traces_schema_arc())?;
     let rows = measure_phase(
         observer,
         TransformSignal::Traces,
@@ -95,7 +94,7 @@ pub(crate) fn transform_traces_view_observed<V: TracesView>(
         observer,
         TransformSignal::Traces,
         TransformPhase::BuilderInit,
-        || TraceBuilders::with_capacity(rows, input_bytes, plan),
+        || TraceBuilders::with_capacity(rows, input_bytes, plan.clone()),
     );
     let mut duplicates = observer.is_some().then(ContextDuplicateTracker::default);
 
@@ -170,14 +169,15 @@ fn append_scope_spans_observed<S: ScopeSpansView>(
         duplicates,
         builders.scope_attributes_wanted,
     );
-    let span_count = if builders.start_time_range.is_some() {
-        scope_spans
-            .spans()
-            .filter(|span| builders.keeps(span))
-            .count()
-    } else {
-        scope_spans.spans().count()
-    };
+    // The context columns are separate builders, so they can be appended once
+    // the scope's kept spans are counted.
+    let mut span_count = 0;
+    for span in scope_spans.spans() {
+        if builders.keeps(&span) {
+            append_span_observed(&span, builders, observer)?;
+            span_count += 1;
+        }
+    }
     if span_count > 0 {
         let context_phase_start = phase_start(observer);
         builders.append_context_observed(span_count, resource, &scope, observer);
@@ -187,12 +187,6 @@ fn append_scope_spans_observed<S: ScopeSpansView>(
             TransformPhase::SpanBuild,
             context_phase_start,
         );
-    }
-
-    for span in scope_spans.spans() {
-        if builders.keeps(&span) {
-            append_span_observed(&span, builders, observer)?;
-        }
     }
 
     finish_phase(
@@ -222,7 +216,6 @@ fn append_span_observed<S: SpanView>(
 
 struct TraceBuilders {
     plan: Plan,
-    rows: usize,
     start_time_range: Option<(i64, i64)>,
     span_attributes_wanted: bool,
     events_json_wanted: bool,
@@ -259,14 +252,20 @@ struct TraceBuilders {
 impl TraceBuilders {
     fn with_capacity(rows: usize, input_bytes: usize, plan: Plan) -> Self {
         let schema = traces_schema_arc();
+        let span_attributes_wanted = plan.builds_named(&schema, "span_attributes");
+        let events_json_wanted = plan.builds_named(&schema, "events_json");
+        let links_json_wanted = plan.builds_named(&schema, "links_json");
+        let resource_attributes_wanted = plan.builds_named(&schema, "resource_attributes");
+        let scope_attributes_wanted = plan.builds_named(&schema, "scope_attributes");
+        // A column that is not built reserves nothing.
+        let json_bytes = |wanted: bool, bytes: usize| if wanted { bytes } else { 0 };
         Self {
-            rows: 0,
             start_time_range: plan.time_range(&schema, "start_time_unix_nano"),
-            span_attributes_wanted: plan.builds_named(&schema, "span_attributes"),
-            events_json_wanted: plan.builds_named(&schema, "events_json"),
-            links_json_wanted: plan.builds_named(&schema, "links_json"),
-            resource_attributes_wanted: plan.builds_named(&schema, "resource_attributes"),
-            scope_attributes_wanted: plan.builds_named(&schema, "scope_attributes"),
+            span_attributes_wanted,
+            events_json_wanted,
+            links_json_wanted,
+            resource_attributes_wanted,
+            scope_attributes_wanted,
             plan,
             start_time_unix_nano: TimestampNanosecondBuilder::with_capacity(rows),
             duration_time_unix_nano: DurationNanosecondBuilder::with_capacity(rows),
@@ -281,13 +280,22 @@ impl TraceBuilders {
             kind: Int32Builder::with_capacity(rows),
             status_code: Int32Builder::with_capacity(rows),
             status_status_message: string_builder_bytes(rows, rows.saturating_mul(16)),
-            resource_attributes: string_builder_bytes(rows, input_bytes),
+            resource_attributes: string_builder_bytes(
+                rows,
+                json_bytes(resource_attributes_wanted, input_bytes),
+            ),
             scope_name: string_builder_bytes(rows, rows.saturating_mul(16)),
             scope_version: string_builder_bytes(rows, rows.saturating_mul(8)),
-            scope_attributes: string_builder_bytes(rows, input_bytes / 4),
-            span_attributes: string_builder_bytes(rows, input_bytes),
-            events_json: string_builder_bytes(rows, input_bytes),
-            links_json: string_builder_bytes(rows, input_bytes / 2),
+            scope_attributes: string_builder_bytes(
+                rows,
+                json_bytes(scope_attributes_wanted, input_bytes / 4),
+            ),
+            span_attributes: string_builder_bytes(
+                rows,
+                json_bytes(span_attributes_wanted, input_bytes),
+            ),
+            events_json: string_builder_bytes(rows, json_bytes(events_json_wanted, input_bytes)),
+            links_json: string_builder_bytes(rows, json_bytes(links_json_wanted, input_bytes / 2)),
             dropped_attributes_count: UInt32Builder::with_capacity(rows),
             dropped_events_count: UInt32Builder::with_capacity(rows),
             dropped_links_count: UInt32Builder::with_capacity(rows),
@@ -310,7 +318,6 @@ impl TraceBuilders {
         span: &S,
         observer: &mut Option<&mut dyn TransformObserver>,
     ) -> Result<()> {
-        self.rows += 1;
         measure_result(
             observer,
             TransformSignal::Traces,
@@ -526,6 +533,8 @@ impl TraceBuilders {
     }
 
     fn finish(mut self) -> Result<RecordBatch> {
+        // Every kept span appends its start time, whatever the plan builds.
+        let rows = self.start_time_unix_nano.len();
         finish_batch(
             traces_schema_arc(),
             &self.plan,
@@ -555,7 +564,7 @@ impl TraceBuilders {
                 array(self.dropped_links_count.finish()),
                 array(self.flags.finish()),
             ],
-            self.rows,
+            rows,
         )
     }
 }

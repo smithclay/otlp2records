@@ -29,15 +29,19 @@ pub fn transform_metrics_with_options(
     shape: MetricShape,
     options: &TransformOptions,
 ) -> Result<MetricBatches> {
-    // Reject bad options before format detection can mistake the error for a
-    // decode failure and retry another format.
-    options.plan(&shape.schema())?;
-    transform_metrics_observed(
-        bytes,
-        format,
-        &mut None,
-        MetricsSelection::Shape(shape, options),
-    )
+    let plan = options.plan(&shape.schema_ref())?;
+    transform_metrics_planned(bytes, format, MetricsSelection::Shape(shape, &plan))
+}
+
+/// The transform behind the public entry points, for a selection whose plan
+/// is already made. Planning first keeps an options error from being
+/// mistaken for a decode failure and retried as another format.
+pub(crate) fn transform_metrics_planned(
+    bytes: &[u8],
+    format: InputFormat,
+    selection: MetricsSelection<'_>,
+) -> Result<MetricBatches> {
+    transform_metrics_observed(bytes, format, &mut None, selection)
 }
 
 /// Transform OTLP metrics while reporting phase timings to an observer.

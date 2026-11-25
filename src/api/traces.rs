@@ -9,7 +9,8 @@ use crate::{
     },
     batch::{self, TransformObserver, TransformSignal},
     decode::{decode_traces_json_request, decode_traces_jsonl_request, InputFormat},
-    options::{self, TransformOptions},
+    options::{Plan, TransformOptions},
+    schema::traces_schema_arc,
     Result,
 };
 
@@ -18,7 +19,7 @@ use crate::{
 /// This is the simplest way to convert OTLP trace data to Arrow format.
 /// It handles decoding, transformation, and Arrow conversion in one step.
 pub fn transform_traces(bytes: &[u8], format: InputFormat) -> Result<RecordBatch> {
-    transform_traces_observed(bytes, format, &mut None, &options::ALL)
+    transform_traces_planned(bytes, format, &Plan::all(&traces_schema_arc()))
 }
 
 /// Transform OTLP traces, building only the columns and rows `options` asks
@@ -28,10 +29,18 @@ pub fn transform_traces_with_options(
     format: InputFormat,
     options: &TransformOptions,
 ) -> Result<RecordBatch> {
-    // Reject bad options before format detection can mistake the error for a
-    // decode failure and retry another format.
-    options.plan(&crate::traces_schema())?;
-    transform_traces_observed(bytes, format, &mut None, options)
+    transform_traces_planned(bytes, format, &options.plan(&traces_schema_arc())?)
+}
+
+/// The transform behind the public entry points, for options already planned
+/// against the traces schema. Planning first keeps an options error from
+/// being mistaken for a decode failure and retried as another format.
+pub(crate) fn transform_traces_planned(
+    bytes: &[u8],
+    format: InputFormat,
+    plan: &Plan,
+) -> Result<RecordBatch> {
+    transform_traces_observed(bytes, format, &mut None, plan)
 }
 
 /// Transform OTLP traces while reporting phase timings to an observer.
@@ -41,28 +50,31 @@ pub fn transform_traces_with_observer(
     observer: &mut dyn TransformObserver,
 ) -> Result<RecordBatch> {
     let mut observer = Some(observer);
-    transform_traces_observed(bytes, format, &mut observer, &options::ALL)
+    transform_traces_observed(
+        bytes,
+        format,
+        &mut observer,
+        &Plan::all(&traces_schema_arc()),
+    )
 }
 
 fn transform_traces_observed(
     bytes: &[u8],
     format: InputFormat,
     observer: &mut Option<&mut dyn TransformObserver>,
-    options: &TransformOptions,
+    plan: &Plan,
 ) -> Result<RecordBatch> {
     match format {
-        InputFormat::Protobuf => {
-            batch::transform_traces_protobuf_observed(bytes, observer, options)
-        }
+        InputFormat::Protobuf => batch::transform_traces_protobuf_observed(bytes, observer, plan),
         InputFormat::Auto => auto_dispatch(
             bytes,
             observer,
-            |b, obs| transform_traces_json_arrow_observed(b, InputFormat::Json, obs, options),
-            |b, obs| transform_traces_json_arrow_observed(b, InputFormat::Jsonl, obs, options),
-            |b, obs| batch::transform_traces_protobuf_observed(b, obs, options),
+            |b, obs| transform_traces_json_arrow_observed(b, InputFormat::Json, obs, plan),
+            |b, obs| transform_traces_json_arrow_observed(b, InputFormat::Jsonl, obs, plan),
+            |b, obs| batch::transform_traces_protobuf_observed(b, obs, plan),
         ),
         InputFormat::Json | InputFormat::Jsonl => {
-            transform_traces_json_arrow_observed(bytes, format, observer, options)
+            transform_traces_json_arrow_observed(bytes, format, observer, plan)
         }
     }
 }
@@ -71,7 +83,7 @@ fn transform_traces_json_arrow_observed(
     bytes: &[u8],
     format: InputFormat,
     observer: &mut Option<&mut dyn TransformObserver>,
-    options: &TransformOptions,
+    plan: &Plan,
 ) -> Result<RecordBatch> {
     let request = decode_json_observed(
         bytes,
@@ -82,7 +94,7 @@ fn transform_traces_json_arrow_observed(
         decode_traces_jsonl_request,
         "traces",
     )?;
-    batch::transform_traces_request_observed(request, bytes.len(), observer, options)
+    batch::transform_traces_request_observed(request, bytes.len(), observer, plan)
 }
 
 /// Transform OTLP traces to JSON values.

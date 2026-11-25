@@ -9,7 +9,8 @@ use crate::{
     },
     batch::{self, TransformObserver, TransformSignal},
     decode::{decode_logs_json_request, decode_logs_jsonl_request, InputFormat},
-    options::{self, TransformOptions},
+    options::{Plan, TransformOptions},
+    schema::logs_schema_arc,
     Result,
 };
 
@@ -18,7 +19,7 @@ use crate::{
 /// This is the simplest way to convert OTLP log data to Arrow format.
 /// It handles decoding, transformation, and Arrow conversion in one step.
 pub fn transform_logs(bytes: &[u8], format: InputFormat) -> Result<RecordBatch> {
-    transform_logs_observed(bytes, format, &mut None, &options::ALL)
+    transform_logs_planned(bytes, format, &Plan::all(&logs_schema_arc()))
 }
 
 /// Transform OTLP logs, building only the columns and rows `options` asks
@@ -28,10 +29,18 @@ pub fn transform_logs_with_options(
     format: InputFormat,
     options: &TransformOptions,
 ) -> Result<RecordBatch> {
-    // Reject bad options before format detection can mistake the error for a
-    // decode failure and retry another format.
-    options.plan(&crate::logs_schema())?;
-    transform_logs_observed(bytes, format, &mut None, options)
+    transform_logs_planned(bytes, format, &options.plan(&logs_schema_arc())?)
+}
+
+/// The transform behind the public entry points, for options already planned
+/// against the logs schema. Planning first keeps an options error from
+/// being mistaken for a decode failure and retried as another format.
+pub(crate) fn transform_logs_planned(
+    bytes: &[u8],
+    format: InputFormat,
+    plan: &Plan,
+) -> Result<RecordBatch> {
+    transform_logs_observed(bytes, format, &mut None, plan)
 }
 
 /// Transform OTLP logs while reporting phase timings to an observer.
@@ -41,26 +50,26 @@ pub fn transform_logs_with_observer(
     observer: &mut dyn TransformObserver,
 ) -> Result<RecordBatch> {
     let mut observer = Some(observer);
-    transform_logs_observed(bytes, format, &mut observer, &options::ALL)
+    transform_logs_observed(bytes, format, &mut observer, &Plan::all(&logs_schema_arc()))
 }
 
 fn transform_logs_observed(
     bytes: &[u8],
     format: InputFormat,
     observer: &mut Option<&mut dyn TransformObserver>,
-    options: &TransformOptions,
+    plan: &Plan,
 ) -> Result<RecordBatch> {
     match format {
-        InputFormat::Protobuf => batch::transform_logs_protobuf_observed(bytes, observer, options),
+        InputFormat::Protobuf => batch::transform_logs_protobuf_observed(bytes, observer, plan),
         InputFormat::Auto => auto_dispatch(
             bytes,
             observer,
-            |b, obs| transform_logs_json_arrow_observed(b, InputFormat::Json, obs, options),
-            |b, obs| transform_logs_json_arrow_observed(b, InputFormat::Jsonl, obs, options),
-            |b, obs| batch::transform_logs_protobuf_observed(b, obs, options),
+            |b, obs| transform_logs_json_arrow_observed(b, InputFormat::Json, obs, plan),
+            |b, obs| transform_logs_json_arrow_observed(b, InputFormat::Jsonl, obs, plan),
+            |b, obs| batch::transform_logs_protobuf_observed(b, obs, plan),
         ),
         InputFormat::Json | InputFormat::Jsonl => {
-            transform_logs_json_arrow_observed(bytes, format, observer, options)
+            transform_logs_json_arrow_observed(bytes, format, observer, plan)
         }
     }
 }
@@ -69,7 +78,7 @@ fn transform_logs_json_arrow_observed(
     bytes: &[u8],
     format: InputFormat,
     observer: &mut Option<&mut dyn TransformObserver>,
-    options: &TransformOptions,
+    plan: &Plan,
 ) -> Result<RecordBatch> {
     let request = decode_json_observed(
         bytes,
@@ -80,7 +89,7 @@ fn transform_logs_json_arrow_observed(
         decode_logs_jsonl_request,
         "logs",
     )?;
-    batch::transform_logs_request_observed(request, bytes.len(), observer, options)
+    batch::transform_logs_request_observed(request, bytes.len(), observer, plan)
 }
 
 /// Transform OTLP logs to JSON values.

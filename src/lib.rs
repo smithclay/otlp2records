@@ -77,7 +77,7 @@ pub use batch::{
 };
 pub use decode::{DecodeError, InputFormat};
 pub use error::{Error, Result};
-pub use options::{MetricShape, TimeRange, TransformOptions};
+pub use options::{MetricShape, TransformOptions};
 #[cfg(feature = "parquet")]
 pub use output::to_parquet;
 pub use output::{to_ipc, to_json};

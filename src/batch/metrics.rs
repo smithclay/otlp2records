@@ -12,7 +12,7 @@ use prost::Message;
 
 use crate::{
     api::{MetricBatches, SkippedMetrics},
-    options::{self, in_range, MetricShape, Plan, TransformOptions},
+    options::{in_range, MetricShape, Plan},
     schema::{exp_histogram_schema_arc, gauge_schema_arc, histogram_schema_arc, sum_schema_arc},
     views::otlp::Obj,
     views::pdata::{
@@ -43,14 +43,14 @@ use super::{
 pub(crate) enum MetricsSelection<'a> {
     /// Every shape, every column, every row.
     All,
-    /// Only this shape, narrowed by the options.
-    Shape(MetricShape, &'a TransformOptions),
+    /// Only this shape, narrowed by a plan made against its schema.
+    Shape(MetricShape, &'a Plan),
 }
 
 impl MetricsSelection<'_> {
     /// The plan of each shape, in gauge/sum/histogram/exp-histogram order;
     /// `None` for a shape that is not built.
-    fn plans(self) -> Result<[Option<ShapePlan>; 4]> {
+    fn plans(self) -> [Option<ShapePlan>; 4] {
         let shapes = [
             MetricShape::Gauge,
             MetricShape::Sum,
@@ -59,15 +59,15 @@ impl MetricsSelection<'_> {
         ];
         let mut plans: [Option<ShapePlan>; 4] = [None, None, None, None];
         for (slot, shape) in plans.iter_mut().zip(shapes) {
-            let options = match self {
-                MetricsSelection::All => &options::ALL,
-                MetricsSelection::Shape(wanted, options) if wanted == shape => options,
-                MetricsSelection::Shape(..) => continue,
+            *slot = match self {
+                MetricsSelection::All => Some(ShapePlan::everything(shape)),
+                MetricsSelection::Shape(wanted, plan) if wanted == shape => {
+                    Some(ShapePlan::new(plan.clone(), &shape.schema_ref()))
+                }
+                MetricsSelection::Shape(..) => None,
             };
-            let schema = shape.schema();
-            *slot = Some(ShapePlan::new(options.plan(&schema)?, &schema));
         }
-        Ok(plans)
+        plans
     }
 }
 
@@ -96,13 +96,10 @@ impl ShapePlan {
         }
     }
 
-    /// The plan of a shape that is not built: its builders stay empty.
+    /// Every column of every point of `shape`.
     fn everything(shape: MetricShape) -> Self {
-        let schema = shape.schema();
-        let plan = options::ALL
-            .plan(&schema)
-            .expect("the default options fit every schema");
-        Self::new(plan, &schema)
+        let schema = shape.schema_ref();
+        Self::new(Plan::all(&schema), &schema)
     }
 
     /// Whether a point passes the time ranges. A zero start time is emitted
@@ -152,13 +149,15 @@ pub(crate) fn transform_metrics_view_observed<V: MetricsView>(
     observer: &mut Option<&mut dyn TransformObserver>,
     selection: MetricsSelection<'_>,
 ) -> Result<MetricBatches> {
-    let [gauge_plan, sum_plan, histogram_plan, exp_histogram_plan] = selection.plans()?;
-    let builds = [
-        gauge_plan.is_some(),
-        sum_plan.is_some(),
-        histogram_plan.is_some(),
-        exp_histogram_plan.is_some(),
-    ];
+    let plans = selection.plans();
+    let builds = plans.each_ref().map(Option::is_some);
+    let resource_attributes = plans
+        .iter()
+        .flatten()
+        .any(|shape| shape.resource_attributes);
+    let scope_attributes = plans.iter().flatten().any(|shape| shape.scope_attributes);
+    // A shape that is not built keeps empty builders.
+    let [gauge_plan, sum_plan, histogram_plan, exp_histogram_plan] = plans;
     let mut capacities = MetricCapacities::default();
     measure_phase(
         observer,
@@ -234,24 +233,6 @@ pub(crate) fn transform_metrics_view_observed<V: MetricsView>(
     let mut skipped = SkippedMetrics::default();
     let mut duplicates = observer.is_some().then(ContextDuplicateTracker::default);
 
-    // The plans of the shapes being built, apart from their builders so the
-    // service filter can consult them while the builders are appended to.
-    let shape_plans: [Option<ShapePlan>; 4] = [
-        builds[0].then(|| gauge.shape.clone()),
-        builds[1].then(|| sum.shape.clone()),
-        builds[2].then(|| histogram.shape.clone()),
-        builds[3].then(|| exp_histogram.shape.clone()),
-    ];
-    let resource_attributes = shape_plans
-        .iter()
-        .flatten()
-        .any(|shape| shape.resource_attributes);
-    let scope_attributes = shape_plans
-        .iter()
-        .flatten()
-        .any(|shape| shape.scope_attributes);
-    let mut keeps_service = builds;
-
     for resource_metrics in view.resources() {
         let resource_view = resource_metrics.resource();
         let Some(resource) = ResourceContext::from_view_observed(
@@ -259,13 +240,17 @@ pub(crate) fn transform_metrics_view_observed<V: MetricsView>(
             TransformSignal::Metrics,
             observer,
             duplicates.as_mut(),
+            // Only one shape is built when any has a service filter.
             |service| {
-                for (keep, shape) in keeps_service.iter_mut().zip(&shape_plans) {
-                    *keep = shape
-                        .as_ref()
-                        .is_some_and(|shape| shape.plan.keeps_service(service));
-                }
-                keeps_service.iter().any(|keep| *keep)
+                [
+                    &gauge.shape,
+                    &sum.shape,
+                    &histogram.shape,
+                    &exp_histogram.shape,
+                ]
+                .into_iter()
+                .zip(builds)
+                .any(|(shape, built)| built && shape.plan.keeps_service(service))
             },
             resource_attributes,
         ) else {
@@ -296,7 +281,7 @@ pub(crate) fn transform_metrics_view_observed<V: MetricsView>(
                 };
 
                 match data.value_type() {
-                    DataType::Gauge if keeps_service[0] => {
+                    DataType::Gauge if builds[0] => {
                         let data = data.as_gauge().unwrap();
                         let rows_before = gauge.rows;
                         for point in data.data_points() {
@@ -329,7 +314,7 @@ pub(crate) fn transform_metrics_view_observed<V: MetricsView>(
                             );
                         }
                     }
-                    DataType::Sum if keeps_service[1] => {
+                    DataType::Sum if builds[1] => {
                         let data = data.as_sum().unwrap();
                         let rows_before = sum.rows;
                         for point in data.data_points() {
@@ -370,7 +355,7 @@ pub(crate) fn transform_metrics_view_observed<V: MetricsView>(
                             );
                         }
                     }
-                    DataType::Histogram if keeps_service[2] => {
+                    DataType::Histogram if builds[2] => {
                         let data = data.as_histogram().unwrap();
                         let rows_before = histogram.rows;
                         for point in data.data_points() {
@@ -405,7 +390,7 @@ pub(crate) fn transform_metrics_view_observed<V: MetricsView>(
                             );
                         }
                     }
-                    DataType::ExponentialHistogram if keeps_service[3] => {
+                    DataType::ExponentialHistogram if builds[3] => {
                         let data = data.as_exponential_histogram().unwrap();
                         let rows_before = exp_histogram.rows;
                         for point in data.data_points() {
@@ -443,8 +428,7 @@ pub(crate) fn transform_metrics_view_observed<V: MetricsView>(
                     DataType::Summary => {
                         skipped.summaries += data.as_summary().unwrap().data_points().count();
                     }
-                    // A shape this transform does not build, or whose
-                    // service filter rejected the resource.
+                    // A shape this transform does not build.
                     _ => {}
                 }
             }

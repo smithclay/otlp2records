@@ -142,9 +142,10 @@ fn apply_duckdb(batch: RecordBatch) -> Result<RecordBatch> {
 /// Re-type one column. `column` names the source column in error messages.
 fn duckdb_array(column: &str, array: &ArrayRef) -> Result<ArrayRef> {
     // An all-null column (one a reader did not ask for) has no values to
-    // convert.
-    if array.null_count() == array.len() {
-        return Ok(new_null_array(&duckdb_type(array.data_type()), array.len()));
+    // convert; one whose type is unchanged takes the zero-copy path below.
+    let target = duckdb_type(array.data_type());
+    if array.null_count() == array.len() && &target != array.data_type() {
+        return Ok(new_null_array(&target, array.len()));
     }
     Ok(match array.data_type() {
         DataType::FixedSizeBinary(_) => Arc::new(hex_encode(
