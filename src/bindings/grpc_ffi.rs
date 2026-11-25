@@ -253,8 +253,13 @@ impl LogsService for OtlpIngest {
         self.host.authorize(request.metadata())?;
         let request = request.into_inner();
         let input_bytes = request.encoded_len();
-        let batch = crate::batch::transform_logs_request_observed(request, input_bytes, &mut None)
-            .map_err(|e| invalid("logs", e))?;
+        let batch = crate::batch::transform_logs_request_observed(
+            request,
+            input_bytes,
+            &mut crate::batch::Observation::none(crate::TransformSignal::Logs),
+            &crate::options::Plan::all(&crate::schema::logs_schema_arc()),
+        )
+        .map_err(|e| invalid("logs", e))?;
         self.host
             .deliver_one(OtlpSignalType::Logs, 0, 0, input_bytes as u64, batch)
             .into_grpc()?;
@@ -271,9 +276,13 @@ impl TraceService for OtlpIngest {
         self.host.authorize(request.metadata())?;
         let request = request.into_inner();
         let input_bytes = request.encoded_len();
-        let batch =
-            crate::batch::transform_traces_request_observed(request, input_bytes, &mut None)
-                .map_err(|e| invalid("traces", e))?;
+        let batch = crate::batch::transform_traces_request_observed(
+            request,
+            input_bytes,
+            &mut crate::batch::Observation::none(crate::TransformSignal::Traces),
+            &crate::options::Plan::all(&crate::schema::traces_schema_arc()),
+        )
+        .map_err(|e| invalid("traces", e))?;
         self.host
             .deliver_one(OtlpSignalType::Traces, 0, 0, input_bytes as u64, batch)
             .into_grpc()?;
@@ -290,8 +299,12 @@ impl MetricsService for OtlpIngest {
         self.host.authorize(request.metadata())?;
         let request = request.into_inner();
         let input_bytes = request.encoded_len() as u64;
-        let batches = crate::batch::transform_metrics_request_observed(request, &mut None)
-            .map_err(|e| invalid("metrics", e))?;
+        let batches = crate::batch::transform_metrics_request_observed(
+            request,
+            &mut crate::batch::Observation::none(crate::TransformSignal::Metrics),
+            crate::batch::MetricsSelection::All,
+        )
+        .map_err(|e| invalid("metrics", e))?;
         self.host
             .deliver_metrics(0, 0, input_bytes, batches)
             .into_grpc()?;

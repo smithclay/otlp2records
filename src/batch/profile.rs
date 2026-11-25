@@ -2,6 +2,9 @@
 
 use std::time::{Duration, Instant};
 
+use super::context::ContextDuplicateTracker;
+use crate::views::pdata::{InstrumentationScopeView, ResourceView};
+
 /// Telemetry signal being transformed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TransformSignal {
@@ -96,102 +99,103 @@ pub struct TransformCounterValue {
 /// Optional sink for transform timing observations.
 ///
 /// Default transform entrypoints do not require an observer. Production callers that need phase
-/// timings can use the `*_with_observer` functions and provide a lightweight sink.
+/// timings pass a lightweight sink to [`crate::Transformer::observer`].
 pub trait TransformObserver {
     fn on_phase(&mut self, timing: TransformPhaseTiming);
 
     fn on_counter(&mut self, _counter: TransformCounterValue) {}
 }
 
-pub(crate) fn observe_phase(
-    observer: &mut Option<&mut dyn TransformObserver>,
+/// What one transform reports: phase timings and counters for its signal to
+/// an optional observer, and, only when observed, how often resource and
+/// scope contexts repeat. Every internal step takes one of these instead of
+/// the observer, signal and duplicate tracker separately.
+pub(crate) struct Observation<'o> {
+    observer: Option<&'o mut dyn TransformObserver>,
     signal: TransformSignal,
-    phase: TransformPhase,
-    elapsed: Duration,
-) {
-    if let Some(observer) = observer.as_deref_mut() {
-        observer.on_phase(TransformPhaseTiming {
+    duplicates: Option<ContextDuplicateTracker>,
+}
+
+impl<'o> Observation<'o> {
+    pub(crate) fn new(
+        signal: TransformSignal,
+        observer: Option<&'o mut dyn TransformObserver>,
+    ) -> Self {
+        let duplicates = observer.is_some().then(ContextDuplicateTracker::default);
+        Self {
+            observer,
             signal,
-            phase,
-            elapsed,
-        });
+            duplicates,
+        }
     }
-}
 
-pub(crate) fn observe_counter(
-    observer: &mut Option<&mut dyn TransformObserver>,
-    signal: TransformSignal,
-    counter: TransformCounter,
-    value: u64,
-) {
-    if value == 0 {
-        return;
+    /// A transform nobody observes.
+    pub(crate) fn none(signal: TransformSignal) -> Self {
+        Self::new(signal, None)
     }
-    if let Some(observer) = observer.as_deref_mut() {
-        observer.on_counter(TransformCounterValue {
-            signal,
-            counter,
-            value,
-        });
-    }
-}
 
-/// Begin timing a phase by inverting the closure-based `measure_*` helpers:
-/// returns `Some(Instant::now())` when an observer is attached, `None`
-/// otherwise. Pair with [`finish_phase`] at the end of the work block. Useful
-/// when the work spans multiple borrows of `observer` (e.g. nested broad
-/// phases around inner loops that themselves emit observations).
-pub(crate) fn phase_start(observer: &Option<&mut dyn TransformObserver>) -> Option<Instant> {
-    observer.is_some().then(Instant::now)
-}
-
-/// Emit a phase timing previously started by [`phase_start`]. No-op when
-/// `start` is `None` (observer was disabled).
-pub(crate) fn finish_phase(
-    observer: &mut Option<&mut dyn TransformObserver>,
-    signal: TransformSignal,
-    phase: TransformPhase,
-    start: Option<Instant>,
-) {
-    if let Some(start) = start {
-        observe_phase(observer, signal, phase, start.elapsed());
-    }
-}
-
-pub(crate) fn measure_phase<T, F>(
-    observer: &mut Option<&mut dyn TransformObserver>,
-    signal: TransformSignal,
-    phase: TransformPhase,
-    f: F,
-) -> T
-where
-    F: FnOnce() -> T,
-{
-    if observer.is_some() {
+    /// Runs `f`, timing it as `phase` when observed.
+    pub(crate) fn phase<T>(&mut self, phase: TransformPhase, f: impl FnOnce() -> T) -> T {
+        if self.observer.is_none() {
+            return f();
+        }
         let start = Instant::now();
         let value = f();
-        observe_phase(observer, signal, phase, start.elapsed());
+        self.record(phase, start.elapsed());
         value
-    } else {
-        f()
     }
-}
 
-pub(crate) fn measure_result<T, E, F>(
-    observer: &mut Option<&mut dyn TransformObserver>,
-    signal: TransformSignal,
-    phase: TransformPhase,
-    f: F,
-) -> std::result::Result<T, E>
-where
-    F: FnOnce() -> std::result::Result<T, E>,
-{
-    if observer.is_some() {
-        let start = Instant::now();
-        let value = f();
-        observe_phase(observer, signal, phase, start.elapsed());
-        value
-    } else {
-        f()
+    /// Begins timing a phase whose work also reports observations of its own
+    /// (so it cannot be one closure); [`Self::finish`] ends it.
+    pub(crate) fn start(&self) -> Option<Instant> {
+        self.observer.is_some().then(Instant::now)
+    }
+
+    /// Ends a phase begun by [`Self::start`].
+    pub(crate) fn finish(&mut self, phase: TransformPhase, start: Option<Instant>) {
+        if let Some(start) = start {
+            self.record(phase, start.elapsed());
+        }
+    }
+
+    /// Reports that `phase` took `elapsed`.
+    pub(crate) fn record(&mut self, phase: TransformPhase, elapsed: Duration) {
+        if let Some(observer) = self.observer.as_deref_mut() {
+            observer.on_phase(TransformPhaseTiming {
+                signal: self.signal,
+                phase,
+                elapsed,
+            });
+        }
+    }
+
+    /// Adds `value` to `counter`.
+    pub(crate) fn count(&mut self, counter: TransformCounter, value: u64) {
+        if value == 0 {
+            return;
+        }
+        if let Some(observer) = self.observer.as_deref_mut() {
+            observer.on_counter(TransformCounterValue {
+                signal: self.signal,
+                counter,
+                value,
+            });
+        }
+    }
+
+    /// Counts whether `resource`'s context repeats an earlier one.
+    pub(crate) fn track_resource<R: ResourceView>(&mut self, resource: &R) {
+        if let Some(duplicates) = self.duplicates.as_mut() {
+            let counter = duplicates.resource(resource);
+            self.count(counter, 1);
+        }
+    }
+
+    /// Counts whether `scope`'s context repeats an earlier one.
+    pub(crate) fn track_scope<S: InstrumentationScopeView>(&mut self, scope: &S) {
+        if let Some(duplicates) = self.duplicates.as_mut() {
+            let counter = duplicates.scope(scope);
+            self.count(counter, 1);
+        }
     }
 }

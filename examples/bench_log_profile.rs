@@ -8,8 +8,8 @@ use opentelemetry_proto::tonic::{
     resource::v1::Resource,
 };
 use otlp2records::{
-    transform_logs_with_observer, InputFormat, TransformCounter, TransformCounterValue,
-    TransformObserver, TransformPhase, TransformPhaseTiming,
+    InputFormat, TransformCounter, TransformCounterValue, TransformObserver, TransformPhase,
+    TransformPhaseTiming, Transformer,
 };
 use prost::Message;
 
@@ -153,7 +153,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn measure(bytes: &[u8]) -> Result<Measurement, Box<dyn std::error::Error>> {
     for _ in 0..WARMUP_ITERS {
         let mut phases = PhaseTotals::default();
-        let batch = transform_logs_with_observer(bytes, InputFormat::Protobuf, &mut phases)?;
+        let batch = Transformer::new(InputFormat::Protobuf)
+            .observer(&mut phases)
+            .logs(bytes)?;
         black_box(batch.num_rows());
         black_box(phases);
     }
@@ -162,7 +164,9 @@ fn measure(bytes: &[u8]) -> Result<Measurement, Box<dyn std::error::Error>> {
     let mut phases = PhaseTotals::default();
     let start = Instant::now();
     for _ in 0..MEASURE_ITERS {
-        let batch = transform_logs_with_observer(bytes, InputFormat::Protobuf, &mut phases)?;
+        let batch = Transformer::new(InputFormat::Protobuf)
+            .observer(&mut phases)
+            .logs(bytes)?;
         rows_per_iter = batch.num_rows();
         black_box(batch);
     }

@@ -30,6 +30,10 @@ pub enum Error {
     InvalidInput(String),
 
     /// Schema mismatch error
+    /// [`crate::TransformOptions`] that do not fit the signal's schema.
+    #[error("invalid transform options: {0}")]
+    InvalidOptions(String),
+
     #[error("schema mismatch: {0}")]
     SchemaMismatch(String),
 

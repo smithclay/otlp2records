@@ -4,6 +4,7 @@ use arrow_array::{Array, RecordBatch, StructArray, UInt32Array};
 
 use crate::{
     batch::transform_traces_view,
+    options::Plan,
     views::pdata::{
         EventView, InstrumentationScopeView, LinkView, ResourceSpansView, ResourceView,
         ScopeSpansView, SpanId, SpanView, StatusView, Str, TraceId, TracesView,
@@ -31,6 +32,7 @@ pub(super) fn normalize(
     links: Option<RecordBatch>,
     link_attrs: Option<RecordBatch>,
     input_bytes: usize,
+    plan: &Plan,
 ) -> Result<RecordBatch> {
     validate(PayloadSchema::Spans, "spans", &spans)?;
     for (payload, name, batch) in [
@@ -99,7 +101,7 @@ pub(super) fn normalize(
         links,
         link_attrs,
     )?;
-    transform_traces_view(&view, input_bytes)
+    transform_traces_view(&view, input_bytes, plan)
 }
 
 struct OtapTracesView {

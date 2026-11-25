@@ -136,6 +136,8 @@ const arrowIpc = transform_logs_wasm(otlpBytes, "protobuf");
 | `transform_traces(bytes, format)` | Transform OTLP traces to Arrow RecordBatch |
 | `transform_metrics(bytes, format)` | Transform OTLP metrics to MetricBatches |
 
+For narrowed or observed transforms, see [Transformer](#transformer-options-and-observation).
+
 ### Breaking Changes In 0.8.0
 
 The 0.7 to 0.8 release intentionally changes the default normalized schema. The
@@ -165,15 +167,49 @@ The flattened JSON convenience columns remain for now: `resource_attributes`,
 `scope_attributes`, signal attribute JSON columns, `events_json`, `links_json`,
 and `exemplars_json`.
 
-### Transform Observation
+### Transformer: Options and Observation
 
-Production callers can opt into phase timings and counters without changing output semantics:
+The `transform_*` functions build every column of every row. `Transformer` is the same
+transform, configured: it builds only what `TransformOptions` asks for, and reports phase
+timings to an optional `TransformObserver`. The two combine freely.
 
-| Function | Description |
-|----------|-------------|
-| `transform_logs_with_observer(bytes, format, observer)` | Transform logs and report decode/build/append/finalize phases |
-| `transform_traces_with_observer(bytes, format, observer)` | Transform traces and report decode/build/attribute JSON/append/finalize phases |
-| `transform_metrics_with_observer(bytes, format, observer)` | Transform metrics and report decode/capacity/context/append/finalize phases |
+| Method | Returns |
+|--------|---------|
+| `Transformer::new(format)` | A transform of `format` input that builds everything |
+| `.options(options)` / `.observer(&mut observer)` | The same transform, narrowed / observed |
+| `.logs(bytes)`, `.traces(bytes)` | `RecordBatch` |
+| `.metric_shape(shape, bytes)` | `MetricShapeBatch`: that shape's batch (empty if the input has none) and the skipped counts; the other shapes are not built |
+| `.metrics(bytes)` | `MetricBatches` for every shape; options that narrow are an error here, since a column index means something different in each shape |
+
+```rust
+use otlp2records::{InputFormat, TransformOptions, Transformer};
+
+let schema = otlp2records::traces_schema();
+let options = TransformOptions::new()
+    .with_columns([schema.index_of("name")?, schema.index_of("service_name")?])
+    .with_service_filter(|service| service == "checkout")
+    .with_time_range(schema.index_of("start_time_unix_nano")?, start_ns, end_ns);
+let batch = Transformer::new(InputFormat::Auto)
+    .options(options)
+    .observer(&mut timings) // optional
+    .traces(bytes)?;
+```
+
+Attribute, body, event, link and exemplar JSON is most of a transform's cost, so narrowing
+pays. The batch holds exactly the requested columns, in the requested order. Rows are kept
+only if their resource passes the service filter and they fall inside every time range:
+
+- The service filter is called once per resource with the emitted `service_name`, so a
+  resource without `service.name` is asked about `"unknown"`. A rejected resource costs
+  nothing beyond decoding it.
+- A range is inclusive, in nanoseconds, and only allowed on a `Timestamp(Nanosecond)`
+  column. A NULL timestamp falls outside every range.
+
+Options that do not fit the schema are rejected with `Error::InvalidOptions` before
+decoding. For OTAP, `OtapDecoder::decode_logs_with_options`, `decode_traces_with_options`
+and `decode_metric_shape` take the same options. The C ABI exposes them as
+`OtlpReadOptions` (a column list, an `OtlpServiceFilter` callback, time ranges) through
+`otlp_transform_with_options()` and `otlp_otap_decode_with_options()`.
 
 Implement `TransformObserver` to receive `TransformPhaseTiming` and `TransformCounterValue`
 events. Counters include duplicate resource/scope context hits and misses plus repeated

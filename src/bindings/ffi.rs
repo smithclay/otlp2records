@@ -1,17 +1,18 @@
 //! C ABI for the one-shot transforms and the stateful OTAP decoder.
 
-use std::ffi::c_char;
+use std::ffi::{c_char, c_void};
 
 use arrow_array::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
 use arrow_array::RecordBatch;
-use arrow_schema::Schema;
+use arrow_schema::{Schema, SchemaRef};
 
 use crate::decode::InputFormat;
 use crate::ffi_export::{ffi_boundary, ExportError, ExportedBatch, ExportedMetrics};
 pub use crate::ffi_export::{OtlpArrowBatch, OtlpMetricsArrowBatches};
 use crate::{
-    exp_histogram_schema, gauge_schema, histogram_schema, logs_schema, sum_schema, traces_schema,
-    transform_logs, transform_metrics, transform_traces, ArrowProfile,
+    schema::{logs_schema_arc, traces_schema_arc},
+    transform_logs, transform_metrics, transform_traces, ArrowProfile, Error, MetricShape,
+    TransformOptions, Transformer,
 };
 
 /// OTLP signal types supported by the transformer.
@@ -36,14 +37,116 @@ pub enum OtlpSignalType {
 
 impl OtlpSignalType {
     fn schema(self) -> Schema {
+        self.schema_ref().as_ref().clone()
+    }
+
+    fn schema_ref(self) -> SchemaRef {
         match self {
-            OtlpSignalType::Logs => logs_schema(),
-            OtlpSignalType::Traces => traces_schema(),
-            OtlpSignalType::MetricsGauge => gauge_schema(),
-            OtlpSignalType::MetricsSum => sum_schema(),
-            OtlpSignalType::MetricsHistogram => histogram_schema(),
-            OtlpSignalType::MetricsExpHistogram => exp_histogram_schema(),
+            OtlpSignalType::Logs => logs_schema_arc(),
+            OtlpSignalType::Traces => traces_schema_arc(),
+            OtlpSignalType::MetricsGauge => MetricShape::Gauge.schema_ref(),
+            OtlpSignalType::MetricsSum => MetricShape::Sum.schema_ref(),
+            OtlpSignalType::MetricsHistogram => MetricShape::Histogram.schema_ref(),
+            OtlpSignalType::MetricsExpHistogram => MetricShape::ExponentialHistogram.schema_ref(),
         }
+    }
+}
+
+/// An inclusive nanosecond range on one timestamp column; see
+/// [`TransformOptions::with_time_range`].
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct OtlpTimeRange {
+    pub column: u32,
+    pub min: i64,
+    pub max: i64,
+}
+
+/// Decides whether a resource's rows are kept, from its emitted
+/// `service_name` (`len` UTF-8 bytes, not NUL-terminated). Called once per
+/// resource, on the calling thread, during the transform.
+pub type OtlpServiceFilter =
+    unsafe extern "C" fn(user_data: *mut c_void, service_name: *const u8, len: usize) -> bool;
+
+/// What one `*_with_options` call builds; the C form of
+/// [`TransformOptions`]. Zero-initialized, it builds every column of every row.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct OtlpReadOptions {
+    /// The columns to build and return, in this order, by index in the
+    /// signal's schema. NULL: every column in schema order. A non-NULL pointer
+    /// with length 0 returns no columns, only the row count.
+    pub columns: *const u32,
+    pub columns_len: usize,
+    /// Keep only the rows of resources this accepts. NULL: every resource.
+    pub keep_service: Option<OtlpServiceFilter>,
+    pub keep_service_data: *mut c_void,
+    /// Keep only rows within every range. NULL (or length 0): no ranges.
+    pub time_ranges: *const OtlpTimeRange,
+    pub time_ranges_len: usize,
+}
+
+/// The host's service filter, callable from the transform.
+struct ServiceCallback {
+    filter: OtlpServiceFilter,
+    user_data: *mut c_void,
+}
+
+impl ServiceCallback {
+    fn keeps(&self, name: &str) -> bool {
+        // SAFETY: the host promised a callback that is safe to call during the
+        // `*_with_options` call it was passed to.
+        unsafe { (self.filter)(self.user_data, name.as_ptr(), name.len()) }
+    }
+}
+
+// SAFETY: the callback only runs inside the `*_with_options` call that was
+// given it, on the calling thread; the options never outlive that call.
+unsafe impl Send for ServiceCallback {}
+unsafe impl Sync for ServiceCallback {}
+
+/// Reads `options` (NULL means every column of every row).
+unsafe fn read_options(options: *const OtlpReadOptions) -> TransformOptions {
+    let mut result = TransformOptions::new();
+    let Some(options) = options.as_ref() else {
+        return result;
+    };
+    if !options.columns.is_null() {
+        let columns = std::slice::from_raw_parts(options.columns, options.columns_len);
+        result = result.with_columns(columns.iter().map(|&column| column as usize));
+    }
+    if let Some(filter) = options.keep_service {
+        let callback = ServiceCallback {
+            filter,
+            user_data: options.keep_service_data,
+        };
+        result = result.with_service_filter(move |name| callback.keeps(name));
+    }
+    if !options.time_ranges.is_null() {
+        let ranges = std::slice::from_raw_parts(options.time_ranges, options.time_ranges_len);
+        for range in ranges {
+            result = result.with_time_range(range.column as usize, range.min, range.max);
+        }
+    }
+    result
+}
+
+/// The status of a failed `*_with_options` call.
+fn options_status(error: &Error) -> OtlpStatus {
+    match error {
+        Error::InvalidOptions(_) => OtlpStatus::InvalidArgument,
+        _ => OtlpStatus::ParseFailed,
+    }
+}
+
+/// The metric shape a signal type names, if it names one.
+fn metric_shape(signal: OtlpSignalType) -> Option<MetricShape> {
+    match signal {
+        OtlpSignalType::Logs | OtlpSignalType::Traces => None,
+        OtlpSignalType::MetricsGauge => Some(MetricShape::Gauge),
+        OtlpSignalType::MetricsSum => Some(MetricShape::Sum),
+        OtlpSignalType::MetricsHistogram => Some(MetricShape::Histogram),
+        OtlpSignalType::MetricsExpHistogram => Some(MetricShape::ExponentialHistogram),
     }
 }
 
@@ -244,6 +347,49 @@ pub unsafe extern "C" fn otlp_transform_with_profile(
             return OtlpStatus::ParseFailed;
         };
         export_batch(profile.into(), batch, out_array, out_schema)
+    })
+}
+
+/// Transforms one signal (for metrics, one shape), building and returning
+/// only the columns and rows `options` asks for. A metric shape the input
+/// does not contain yields an empty batch.
+///
+/// # Safety
+///
+/// `data` must point to `len` readable bytes, `options` must be NULL or point
+/// to a valid [`OtlpReadOptions`] whose arrays are readable for their lengths
+/// and whose callback is safe to call during this call, and
+/// `out_array`/`out_schema` must be writable. On `OTLP_OK` the caller owns
+/// both outputs.
+#[no_mangle]
+pub unsafe extern "C" fn otlp_transform_with_options(
+    signal_type: OtlpSignalType,
+    format: OtlpInputFormat,
+    profile: OtlpArrowProfile,
+    options: *const OtlpReadOptions,
+    data: *const u8,
+    len: usize,
+    out_array: *mut FFI_ArrowArray,
+    out_schema: *mut FFI_ArrowSchema,
+) -> OtlpStatus {
+    ffi_boundary(OtlpStatus::Internal, || {
+        if data.is_null() || out_array.is_null() || out_schema.is_null() {
+            return OtlpStatus::InvalidArgument;
+        }
+        let input = std::slice::from_raw_parts(data, len);
+        let mut transformer =
+            Transformer::new(InputFormat::from(format)).options(read_options(options));
+        let transformed = match metric_shape(signal_type) {
+            Some(shape) => transformer
+                .metric_shape(shape, input)
+                .map(|shape| shape.batch),
+            None if signal_type == OtlpSignalType::Logs => transformer.logs(input),
+            None => transformer.traces(input),
+        };
+        match transformed {
+            Ok(batch) => export_batch(profile.into(), batch, out_array, out_schema),
+            Err(error) => options_status(&error),
+        }
     })
 }
 
@@ -485,6 +631,48 @@ pub unsafe extern "C" fn otlp_otap_decode_metrics(
             return OtlpStatus::ParseFailed;
         };
         write_metrics(decoder.profile, batches, out_batches)
+    })
+}
+
+/// Decodes one OTAP message of `signal_type` (for metrics, one shape),
+/// building only the columns and rows `options` asks for. The whole message
+/// is decoded either way, so the decoder's stream state stays complete.
+///
+/// # Safety
+///
+/// As [`otlp_transform_with_options`], and `decoder` must come from
+/// `otlp_otap_decoder_new*`.
+#[no_mangle]
+pub unsafe extern "C" fn otlp_otap_decode_with_options(
+    decoder: *mut OtlpOtapDecoder,
+    signal_type: OtlpSignalType,
+    options: *const OtlpReadOptions,
+    data: *const u8,
+    len: usize,
+    out_array: *mut FFI_ArrowArray,
+    out_schema: *mut FFI_ArrowSchema,
+) -> OtlpStatus {
+    ffi_boundary(OtlpStatus::Internal, || {
+        if decoder.is_null() || data.is_null() || out_array.is_null() || out_schema.is_null() {
+            return OtlpStatus::InvalidArgument;
+        }
+        let options = read_options(options);
+        let decoder = &mut *decoder;
+        let input = std::slice::from_raw_parts(data, len);
+        let decoded = match metric_shape(signal_type) {
+            Some(shape) => decoder
+                .inner
+                .decode_metric_shape(input, shape, &options)
+                .map(|shape| shape.batch),
+            None if signal_type == OtlpSignalType::Logs => {
+                decoder.inner.decode_logs_with_options(input, &options)
+            }
+            None => decoder.inner.decode_traces_with_options(input, &options),
+        };
+        match decoded {
+            Ok(batch) => export_batch(decoder.profile, batch, out_array, out_schema),
+            Err(error) => options_status(&error),
+        }
     })
 }
 

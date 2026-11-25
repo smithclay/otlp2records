@@ -28,6 +28,7 @@ mod batch;
 mod decode;
 mod error;
 pub mod fixtures;
+mod options;
 pub mod otap;
 mod output;
 pub mod proto_output;
@@ -59,11 +60,10 @@ mod grpc_lifecycle_model;
 pub mod wasm;
 
 pub use api::{
-    transform_logs, transform_logs_json, transform_logs_partitioned, transform_logs_with_observer,
-    transform_metrics, transform_metrics_json, transform_metrics_partitioned,
-    transform_metrics_with_observer, transform_traces, transform_traces_json,
-    transform_traces_partitioned, transform_traces_with_observer, JsonMetricBatches, MetricBatches,
-    SkippedMetrics,
+    transform_logs, transform_logs_json, transform_logs_partitioned, transform_metrics,
+    transform_metrics_json, transform_metrics_partitioned, transform_traces, transform_traces_json,
+    transform_traces_partitioned, JsonMetricBatches, MetricBatches, MetricShapeBatch,
+    SkippedMetrics, Transformer,
 };
 pub use arrow::{
     extract_min_timestamp_micros, extract_service_name, group_batch_by_service, ArrowProfile,
@@ -75,6 +75,7 @@ pub use batch::{
 };
 pub use decode::{DecodeError, InputFormat};
 pub use error::{Error, Result};
+pub use options::{MetricShape, TransformOptions};
 #[cfg(feature = "parquet")]
 pub use output::to_parquet;
 pub use output::{to_ipc, to_json};

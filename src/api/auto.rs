@@ -5,31 +5,29 @@
 //!
 //! - [`auto_dispatch`]: all `*_auto*` variants try JSON, then JSONL, then
 //!   protobuf when the payload looks like JSON, otherwise protobuf then JSON.
-//!   The closures take an extra `&mut O` parameter so the observed variants can
-//!   thread `&mut Option<&mut dyn TransformObserver>` without simultaneous
-//!   mutable borrows.
+//!   The closures take the `&mut Observation` as a parameter rather than
+//!   capturing it, so each attempt can borrow it in turn.
 //! - [`decode_json_observed`]: decode a JSON or JSONL request and report the
-//!   decode phase to the observer. Both the normalized and OTAP star JSON paths
+//!   decode phase to the observation. Both the normalized and OTAP star JSON paths
 //!   of every signal share this exact block.
 
 use std::time::Instant;
 
 use crate::{
-    batch::{observe_phase, TransformObserver, TransformPhase, TransformSignal},
+    batch::{Observation, TransformPhase},
     decode::{looks_like_json, DecodeError, InputFormat},
     Error, Result,
 };
 
 /// Decode a JSON (`InputFormat::Json`) or JSONL (`InputFormat::Jsonl`) request
-/// and report the corresponding decode phase to `observer`. Returns the decoded
+/// and report the corresponding decode phase to `obs`. Returns the decoded
 /// request; the caller chooses the normalized or OTAP star transform to apply.
 /// Any other `format` is a caller bug and yields an `Unsupported` error tagged
 /// with `signal_label` (e.g. `"logs"`).
 pub(super) fn decode_json_observed<R>(
     bytes: &[u8],
     format: InputFormat,
-    signal: TransformSignal,
-    observer: &mut Option<&mut dyn TransformObserver>,
+    obs: &mut Observation<'_>,
     decode_json: impl FnOnce(&[u8]) -> std::result::Result<R, DecodeError>,
     decode_jsonl: impl FnOnce(&[u8]) -> std::result::Result<R, DecodeError>,
     signal_label: &str,
@@ -44,23 +42,23 @@ pub(super) fn decode_json_observed<R>(
             ))));
         }
     };
-    observe_phase(observer, signal, phase, start.elapsed());
+    obs.record(phase, start.elapsed());
     Ok(request)
 }
 
 pub(super) fn auto_dispatch<T, O>(
     bytes: &[u8],
-    observer: &mut O,
+    obs: &mut O,
     json: impl FnOnce(&[u8], &mut O) -> Result<T>,
     jsonl: impl FnOnce(&[u8], &mut O) -> Result<T>,
     protobuf: impl FnOnce(&[u8], &mut O) -> Result<T>,
 ) -> Result<T> {
     if looks_like_json(bytes) {
-        match json(bytes, observer) {
+        match json(bytes, obs) {
             Ok(value) => Ok(value),
-            Err(json_err) => match jsonl(bytes, observer) {
+            Err(json_err) => match jsonl(bytes, obs) {
                 Ok(value) => Ok(value),
-                Err(_) => protobuf(bytes, observer).map_err(|proto_err| {
+                Err(_) => protobuf(bytes, obs).map_err(|proto_err| {
                     Error::Decode(DecodeError::Unsupported(format!(
                         "json decode failed: {json_err}; protobuf fallback failed: {proto_err}"
                     )))
@@ -68,9 +66,9 @@ pub(super) fn auto_dispatch<T, O>(
             },
         }
     } else {
-        match protobuf(bytes, observer) {
+        match protobuf(bytes, obs) {
             Ok(value) => Ok(value),
-            Err(proto_err) => json(bytes, observer).map_err(|json_err| {
+            Err(proto_err) => json(bytes, obs).map_err(|json_err| {
                 Error::Decode(DecodeError::Unsupported(format!(
                     "protobuf decode failed: {proto_err}; json fallback failed: {json_err}"
                 )))

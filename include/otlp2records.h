@@ -9,6 +9,7 @@
 #ifndef OTLP2RECORDS_H
 #define OTLP2RECORDS_H
 
+#include <stdbool.h>
 #include <stdint.h>
 #include <stddef.h>
 
@@ -152,6 +153,52 @@ typedef struct OtlpMetricsArrowBatches {
     uint64_t skipped_missing_values;
 } OtlpMetricsArrowBatches;
 
+/**
+ * @brief Rows whose timestamp column is within [min, max] (inclusive, ns).
+ *
+ * column indexes the signal's schema (for metrics, the shape's) and must be a
+ * Timestamp(ns) column. A NULL timestamp is outside every range.
+ */
+typedef struct OtlpTimeRange {
+    uint32_t column;
+    int64_t min;
+    int64_t max;
+} OtlpTimeRange;
+
+/**
+ * @brief Decides whether a resource's rows are kept, from its service_name.
+ *
+ * service_name is the value the transform emits (len UTF-8 bytes, not
+ * NUL-terminated), so a resource without service.name is asked about
+ * "unknown". Called once per resource, on the calling thread, during the
+ * *_with_options call. It must not unwind.
+ */
+typedef bool (*OtlpServiceFilter)(void* user_data, const uint8_t* service_name, size_t len);
+
+/**
+ * @brief What a *_with_options call builds: some columns of some rows.
+ *
+ * A reader that needs a few columns of a few rows says so, and the transform
+ * skips the work for the rest: the batch holds exactly the requested columns,
+ * in the requested order, and only the rows that pass the filters. Rows of a
+ * resource keep_service rejects, or outside a time range, are dropped before
+ * any of their columns are built.
+ *
+ * A zero-initialized struct builds every column of every row.
+ */
+typedef struct OtlpReadOptions {
+    /** Columns to return, in order, by index in the signal's schema. NULL: every column, in schema order.
+     *  A non-NULL pointer with columns_len 0 returns no columns, only the row count. */
+    const uint32_t* columns;
+    size_t columns_len;
+    /** Keep only the rows of resources this accepts. NULL: every resource. */
+    OtlpServiceFilter keep_service;
+    void* keep_service_data;
+    /** Keep only rows inside every range. NULL or 0: no ranges. */
+    const OtlpTimeRange* time_ranges;
+    size_t time_ranges_len;
+} OtlpReadOptions;
+
 /* ============================================================================
  * Schema Access
  * ============================================================================ */
@@ -220,6 +267,32 @@ OtlpStatus otlp_transform_with_profile(
     OtlpSignalType signal_type,
     OtlpInputFormat format,
     OtlpArrowProfile profile,
+    const uint8_t* data,
+    size_t len,
+    struct ArrowArray* out_array,
+    struct ArrowSchema* out_schema
+);
+
+/**
+ * @brief otlp_transform_with_profile() narrowed to the columns and rows a
+ *        reader needs.
+ *
+ * Unlike otlp_transform(), every signal type is accepted: a metric signal type
+ * builds only that metric shape (the others are not built at all), and returns
+ * an empty batch (length 0) when the input holds none of it.
+ *
+ * @param options NULL for every column of every row
+ * @return OTLP_ERROR_INVALID_ARGUMENT if options does not fit the signal's
+ *         schema (a column past it, a range on a non-timestamp column);
+ *         otherwise as otlp_transform_with_profile()
+ *
+ * @note Caller must call out_array->release() and out_schema->release().
+ */
+OtlpStatus otlp_transform_with_options(
+    OtlpSignalType signal_type,
+    OtlpInputFormat format,
+    OtlpArrowProfile profile,
+    const OtlpReadOptions* options,
     const uint8_t* data,
     size_t len,
     struct ArrowArray* out_array,
@@ -376,6 +449,26 @@ OtlpStatus otlp_otap_decode_metrics(
     const uint8_t* data,
     size_t len,
     OtlpMetricsArrowBatches* out_batches
+);
+
+/**
+ * @brief Decode one OTAP message of one signal (for metrics, one shape),
+ *        narrowed to the columns and rows a reader needs.
+ *
+ * The whole message is decoded either way, so the decoder's stream state
+ * stays complete for later messages. Options, empty metric shapes and
+ * statuses are as for otlp_transform_with_options().
+ *
+ * @note Caller must call out_array->release() and out_schema->release().
+ */
+OtlpStatus otlp_otap_decode_with_options(
+    OtlpOtapDecoder* decoder,
+    OtlpSignalType signal_type,
+    const OtlpReadOptions* options,
+    const uint8_t* data,
+    size_t len,
+    struct ArrowArray* out_array,
+    struct ArrowSchema* out_schema
 );
 
 /* ============================================================================
