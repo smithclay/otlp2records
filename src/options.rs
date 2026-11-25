@@ -192,6 +192,16 @@ impl Plan {
         }
     }
 
+    /// No column and no row: the plan of a metric shape that is not built.
+    pub(crate) fn none(schema: &Schema) -> Self {
+        Self {
+            built: vec![false; schema.fields().len()],
+            output: Some(Vec::new()),
+            service_filter: None,
+            time_ranges: Vec::new(),
+        }
+    }
+
     /// Whether the named column is built. Panics on a name the schema lacks,
     /// which is a bug in the builder asking.
     pub(crate) fn builds_named(&self, schema: &Schema, name: &str) -> bool {

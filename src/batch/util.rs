@@ -10,7 +10,9 @@ use arrow_array::{
     Array, ArrayRef,
 };
 
-use crate::{DecodeError, Error, Result};
+use arrow_schema::Schema;
+
+use crate::{options::Plan, DecodeError, Error, Result};
 
 #[inline]
 pub(super) fn append_opt_n(builder: &mut StringBuilder, value: Option<&str>, n: usize) {
@@ -150,6 +152,56 @@ pub(super) fn string_builder(rows: usize) -> StringBuilder {
 #[inline]
 pub(super) fn string_builder_bytes(rows: usize, data_capacity: usize) -> StringBuilder {
     StringBuilder::with_capacity(rows, data_capacity)
+}
+
+/// A JSON string column that a plan may leave out. One that is not built
+/// reserves nothing and ignores appends, and the plan drops its empty array,
+/// so a builder appends to it unconditionally.
+pub(super) struct JsonColumn {
+    builder: StringBuilder,
+    built: bool,
+}
+
+impl JsonColumn {
+    /// The column `name` of `schema`, with room for `bytes` of JSON if `plan`
+    /// builds it.
+    pub(super) fn new(plan: &Plan, schema: &Schema, name: &str, rows: usize, bytes: usize) -> Self {
+        let built = plan.builds_named(schema, name);
+        let builder = if built {
+            string_builder_bytes(rows, bytes)
+        } else {
+            StringBuilder::new()
+        };
+        Self { builder, built }
+    }
+
+    /// Whether the plan builds this column.
+    pub(super) fn built(&self) -> bool {
+        self.built
+    }
+
+    /// Runs `append` against the column's builder, if it is built.
+    pub(super) fn append(
+        &mut self,
+        append: impl FnOnce(&mut StringBuilder) -> Result<()>,
+    ) -> Result<()> {
+        if self.built {
+            append(&mut self.builder)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Appends `value` (NULL when `None`) `n` times, if the column is built.
+    pub(super) fn append_opt_n(&mut self, value: Option<&str>, n: usize) {
+        if self.built {
+            append_opt_n(&mut self.builder, value, n);
+        }
+    }
+
+    pub(super) fn finish(&mut self) -> ArrayRef {
+        array(self.builder.finish())
+    }
 }
 
 #[inline]

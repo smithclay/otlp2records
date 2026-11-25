@@ -27,7 +27,7 @@ use super::{
     util::{
         append_empty_as_null, append_fixed_or_null, append_fixed_required, append_opt_n,
         append_required_service_name_n, append_required_ts_ns, array, string_builder_bytes,
-        u64_to_i64,
+        u64_to_i64, JsonColumn,
     },
     view_json,
 };
@@ -129,7 +129,7 @@ fn append_resource_spans_observed<R: ResourceSpansView>(
         observer,
         duplicates.as_deref_mut(),
         |service| builders.plan.keeps_service(service),
-        builders.resource_attributes_wanted,
+        builders.resource_attributes.built(),
     ) else {
         return Ok(());
     };
@@ -167,7 +167,7 @@ fn append_scope_spans_observed<S: ScopeSpansView>(
         TransformSignal::Traces,
         observer,
         duplicates,
-        builders.scope_attributes_wanted,
+        builders.scope_attributes.built(),
     );
     // The context columns are separate builders, so they can be appended once
     // the scope's kept spans are counted.
@@ -217,11 +217,6 @@ fn append_span_observed<S: SpanView>(
 struct TraceBuilders {
     plan: Plan,
     start_time_range: Option<(i64, i64)>,
-    span_attributes_wanted: bool,
-    events_json_wanted: bool,
-    links_json_wanted: bool,
-    resource_attributes_wanted: bool,
-    scope_attributes_wanted: bool,
     start_time_unix_nano: TimestampNanosecondBuilder,
     duration_time_unix_nano: DurationNanosecondBuilder,
     trace_id: FixedSizeBinaryBuilder,
@@ -235,13 +230,13 @@ struct TraceBuilders {
     kind: Int32Builder,
     status_code: Int32Builder,
     status_status_message: StringBuilder,
-    resource_attributes: StringBuilder,
+    resource_attributes: JsonColumn,
     scope_name: StringBuilder,
     scope_version: StringBuilder,
-    scope_attributes: StringBuilder,
-    span_attributes: StringBuilder,
-    events_json: StringBuilder,
-    links_json: StringBuilder,
+    scope_attributes: JsonColumn,
+    span_attributes: JsonColumn,
+    events_json: JsonColumn,
+    links_json: JsonColumn,
     dropped_attributes_count: UInt32Builder,
     dropped_events_count: UInt32Builder,
     dropped_links_count: UInt32Builder,
@@ -252,21 +247,14 @@ struct TraceBuilders {
 impl TraceBuilders {
     fn with_capacity(rows: usize, input_bytes: usize, plan: Plan) -> Self {
         let schema = traces_schema_arc();
-        let span_attributes_wanted = plan.builds_named(&schema, "span_attributes");
-        let events_json_wanted = plan.builds_named(&schema, "events_json");
-        let links_json_wanted = plan.builds_named(&schema, "links_json");
-        let resource_attributes_wanted = plan.builds_named(&schema, "resource_attributes");
-        let scope_attributes_wanted = plan.builds_named(&schema, "scope_attributes");
-        // A column that is not built reserves nothing.
-        let json_bytes = |wanted: bool, bytes: usize| if wanted { bytes } else { 0 };
+        let json = |name, bytes| JsonColumn::new(&plan, &schema, name, rows, bytes);
         Self {
             start_time_range: plan.time_range(&schema, "start_time_unix_nano"),
-            span_attributes_wanted,
-            events_json_wanted,
-            links_json_wanted,
-            resource_attributes_wanted,
-            scope_attributes_wanted,
-            plan,
+            resource_attributes: json("resource_attributes", input_bytes),
+            scope_attributes: json("scope_attributes", input_bytes / 4),
+            span_attributes: json("span_attributes", input_bytes),
+            events_json: json("events_json", input_bytes),
+            links_json: json("links_json", input_bytes / 2),
             start_time_unix_nano: TimestampNanosecondBuilder::with_capacity(rows),
             duration_time_unix_nano: DurationNanosecondBuilder::with_capacity(rows),
             trace_id: FixedSizeBinaryBuilder::new(16),
@@ -280,27 +268,14 @@ impl TraceBuilders {
             kind: Int32Builder::with_capacity(rows),
             status_code: Int32Builder::with_capacity(rows),
             status_status_message: string_builder_bytes(rows, rows.saturating_mul(16)),
-            resource_attributes: string_builder_bytes(
-                rows,
-                json_bytes(resource_attributes_wanted, input_bytes),
-            ),
             scope_name: string_builder_bytes(rows, rows.saturating_mul(16)),
             scope_version: string_builder_bytes(rows, rows.saturating_mul(8)),
-            scope_attributes: string_builder_bytes(
-                rows,
-                json_bytes(scope_attributes_wanted, input_bytes / 4),
-            ),
-            span_attributes: string_builder_bytes(
-                rows,
-                json_bytes(span_attributes_wanted, input_bytes),
-            ),
-            events_json: string_builder_bytes(rows, json_bytes(events_json_wanted, input_bytes)),
-            links_json: string_builder_bytes(rows, json_bytes(links_json_wanted, input_bytes / 2)),
             dropped_attributes_count: UInt32Builder::with_capacity(rows),
             dropped_events_count: UInt32Builder::with_capacity(rows),
             dropped_links_count: UInt32Builder::with_capacity(rows),
             flags: UInt32Builder::with_capacity(rows),
             json_scratch: String::new(),
+            plan,
         }
     }
 
@@ -374,48 +349,36 @@ impl TraceBuilders {
             },
         )?;
 
-        if self.span_attributes_wanted {
-            measure_result(
-                observer,
-                TransformSignal::Traces,
-                TransformPhase::SpanAttributesJson,
-                || {
-                    view_json::append_attributes(
-                        &mut self.span_attributes,
-                        span.attributes(),
-                        &mut self.json_scratch,
-                    )
-                },
-            )?;
-        }
-        if self.events_json_wanted {
-            measure_result(
-                observer,
-                TransformSignal::Traces,
-                TransformPhase::EventsJson,
-                || {
-                    view_json::append_events(
-                        &mut self.events_json,
-                        span.events(),
-                        &mut self.json_scratch,
-                    )
-                },
-            )?;
-        }
-        if self.links_json_wanted {
-            measure_result(
-                observer,
-                TransformSignal::Traces,
-                TransformPhase::LinksJson,
-                || {
-                    view_json::append_links(
-                        &mut self.links_json,
-                        span.links(),
-                        &mut self.json_scratch,
-                    )
-                },
-            )?;
-        }
+        measure_result(
+            observer,
+            TransformSignal::Traces,
+            TransformPhase::SpanAttributesJson,
+            || {
+                self.span_attributes.append(|column| {
+                    view_json::append_attributes(column, span.attributes(), &mut self.json_scratch)
+                })
+            },
+        )?;
+        measure_result(
+            observer,
+            TransformSignal::Traces,
+            TransformPhase::EventsJson,
+            || {
+                self.events_json.append(|column| {
+                    view_json::append_events(column, span.events(), &mut self.json_scratch)
+                })
+            },
+        )?;
+        measure_result(
+            observer,
+            TransformSignal::Traces,
+            TransformPhase::LinksJson,
+            || {
+                self.links_json.append(|column| {
+                    view_json::append_links(column, span.links(), &mut self.json_scratch)
+                })
+            },
+        )?;
         measure_phase(
             observer,
             TransformSignal::Traces,
@@ -472,11 +435,8 @@ impl TraceBuilders {
             TransformSignal::Traces,
             TransformPhase::ResourceAttributesAppend,
             || {
-                append_opt_n(
-                    &mut self.resource_attributes,
-                    resource.attributes_json.as_deref(),
-                    rows,
-                );
+                self.resource_attributes
+                    .append_opt_n(resource.attributes_json.as_deref(), rows);
             },
         );
         if let Some(json) = resource.attributes_json.as_deref() {
@@ -509,11 +469,8 @@ impl TraceBuilders {
             TransformSignal::Traces,
             TransformPhase::ScopeAttributesAppend,
             || {
-                append_opt_n(
-                    &mut self.scope_attributes,
-                    scope.attributes_json.as_deref(),
-                    rows,
-                )
+                self.scope_attributes
+                    .append_opt_n(scope.attributes_json.as_deref(), rows)
             },
         );
         if let Some(json) = scope.attributes_json.as_deref() {
@@ -551,13 +508,13 @@ impl TraceBuilders {
                 array(self.kind.finish()),
                 array(self.status_code.finish()),
                 array(self.status_status_message.finish()),
-                array(self.resource_attributes.finish()),
+                self.resource_attributes.finish(),
                 array(self.scope_name.finish()),
                 array(self.scope_version.finish()),
-                array(self.scope_attributes.finish()),
-                array(self.span_attributes.finish()),
-                array(self.events_json.finish()),
-                array(self.links_json.finish()),
+                self.scope_attributes.finish(),
+                self.span_attributes.finish(),
+                self.events_json.finish(),
+                self.links_json.finish(),
                 array(self.dropped_attributes_count.finish()),
                 array(self.dropped_events_count.finish()),
                 array(self.dropped_links_count.finish()),

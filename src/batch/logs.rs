@@ -26,7 +26,7 @@ use super::{
     },
     util::{
         append_fixed_or_null, append_opt_n, append_required_service_name_n, array,
-        string_builder_bytes, u64_to_i64,
+        string_builder_bytes, u64_to_i64, JsonColumn,
     },
     view_json,
 };
@@ -164,7 +164,7 @@ fn append_resource_logs_observed<R: ResourceLogsView>(
         observer,
         duplicates.as_deref_mut(),
         |service| builders.plan.keeps_service(service),
-        builders.resource_attributes_wanted,
+        builders.resource_attributes.built(),
     ) else {
         return Ok(());
     };
@@ -202,7 +202,7 @@ fn append_scope_logs_observed<S: ScopeLogsView>(
         TransformSignal::Logs,
         observer,
         duplicates,
-        builders.scope_attributes_wanted,
+        builders.scope_attributes.built(),
     );
     // The context columns are separate builders, so they can be appended once
     // the scope's kept records are counted.
@@ -253,10 +253,6 @@ struct LogBuilders {
     plan: Plan,
     time_range: Option<(i64, i64)>,
     observed_time_range: Option<(i64, i64)>,
-    body_wanted: bool,
-    log_attributes_wanted: bool,
-    resource_attributes_wanted: bool,
-    scope_attributes_wanted: bool,
     time_unix_nano: TimestampNanosecondBuilder,
     observed_time_unix_nano: TimestampNanosecondBuilder,
     trace_id: FixedSizeBinaryBuilder,
@@ -267,12 +263,12 @@ struct LogBuilders {
     severity_number: Int32Builder,
     severity_text: StringBuilder,
     event_name: StringBuilder,
-    body: StringBuilder,
-    resource_attributes: StringBuilder,
+    body: JsonColumn,
+    resource_attributes: JsonColumn,
     scope_name: StringBuilder,
     scope_version: StringBuilder,
-    scope_attributes: StringBuilder,
-    log_attributes: StringBuilder,
+    scope_attributes: JsonColumn,
+    log_attributes: JsonColumn,
     dropped_attributes_count: UInt32Builder,
     flags: UInt32Builder,
     json_scratch: String,
@@ -281,20 +277,14 @@ struct LogBuilders {
 impl LogBuilders {
     fn with_capacity(rows: usize, input_bytes: usize, plan: Plan) -> Self {
         let schema = logs_schema_arc();
-        let body_wanted = plan.builds_named(&schema, "body");
-        let log_attributes_wanted = plan.builds_named(&schema, "log_attributes");
-        let resource_attributes_wanted = plan.builds_named(&schema, "resource_attributes");
-        let scope_attributes_wanted = plan.builds_named(&schema, "scope_attributes");
-        // A column that is not built reserves nothing.
-        let json_bytes = |wanted: bool, bytes: usize| if wanted { bytes } else { 0 };
+        let json = |name, bytes| JsonColumn::new(&plan, &schema, name, rows, bytes);
         Self {
             time_range: plan.time_range(&schema, "time_unix_nano"),
             observed_time_range: plan.time_range(&schema, "observed_time_unix_nano"),
-            body_wanted,
-            log_attributes_wanted,
-            resource_attributes_wanted,
-            scope_attributes_wanted,
-            plan,
+            body: json("body", input_bytes),
+            resource_attributes: json("resource_attributes", input_bytes),
+            scope_attributes: json("scope_attributes", input_bytes / 4),
+            log_attributes: json("log_attributes", input_bytes),
             time_unix_nano: TimestampNanosecondBuilder::with_capacity(rows),
             observed_time_unix_nano: TimestampNanosecondBuilder::with_capacity(rows),
             trace_id: FixedSizeBinaryBuilder::new(16),
@@ -305,24 +295,12 @@ impl LogBuilders {
             severity_number: Int32Builder::with_capacity(rows),
             severity_text: string_builder_bytes(rows, rows.saturating_mul(8)),
             event_name: string_builder_bytes(rows, rows.saturating_mul(16)),
-            body: string_builder_bytes(rows, json_bytes(body_wanted, input_bytes)),
-            resource_attributes: string_builder_bytes(
-                rows,
-                json_bytes(resource_attributes_wanted, input_bytes),
-            ),
             scope_name: string_builder_bytes(rows, rows.saturating_mul(16)),
             scope_version: string_builder_bytes(rows, rows.saturating_mul(8)),
-            scope_attributes: string_builder_bytes(
-                rows,
-                json_bytes(scope_attributes_wanted, input_bytes / 4),
-            ),
-            log_attributes: string_builder_bytes(
-                rows,
-                json_bytes(log_attributes_wanted, input_bytes),
-            ),
             dropped_attributes_count: UInt32Builder::with_capacity(rows),
             flags: UInt32Builder::with_capacity(rows),
             json_scratch: String::new(),
+            plan,
         }
     }
 
@@ -378,29 +356,30 @@ impl LogBuilders {
             },
         )?;
 
-        if self.body_wanted {
-            measure_result(
-                observer,
-                TransformSignal::Logs,
-                TransformPhase::BodyAppend,
-                || view_json::append_body(&mut self.body, record.body()),
-            )?;
-        }
+        measure_result(
+            observer,
+            TransformSignal::Logs,
+            TransformPhase::BodyAppend,
+            || {
+                self.body
+                    .append(|body| view_json::append_body(body, record.body()))
+            },
+        )?;
 
-        if self.log_attributes_wanted {
-            measure_result(
-                observer,
-                TransformSignal::Logs,
-                TransformPhase::LogAttributesJson,
-                || {
+        measure_result(
+            observer,
+            TransformSignal::Logs,
+            TransformPhase::LogAttributesJson,
+            || {
+                self.log_attributes.append(|attributes| {
                     view_json::append_attributes(
-                        &mut self.log_attributes,
+                        attributes,
                         record.attributes(),
                         &mut self.json_scratch,
                     )
-                },
-            )?;
-        }
+                })
+            },
+        )?;
         Ok(())
     }
 
@@ -443,11 +422,8 @@ impl LogBuilders {
             TransformSignal::Logs,
             TransformPhase::ResourceAttributesAppend,
             || {
-                append_opt_n(
-                    &mut self.resource_attributes,
-                    resource.attributes_json.as_deref(),
-                    rows,
-                );
+                self.resource_attributes
+                    .append_opt_n(resource.attributes_json.as_deref(), rows);
             },
         );
         if let Some(json) = resource.attributes_json.as_deref() {
@@ -480,11 +456,8 @@ impl LogBuilders {
             TransformSignal::Logs,
             TransformPhase::ScopeAttributesAppend,
             || {
-                append_opt_n(
-                    &mut self.scope_attributes,
-                    scope.attributes_json.as_deref(),
-                    rows,
-                )
+                self.scope_attributes
+                    .append_opt_n(scope.attributes_json.as_deref(), rows)
             },
         );
         if let Some(json) = scope.attributes_json.as_deref() {
@@ -519,12 +492,12 @@ impl LogBuilders {
                 array(self.severity_number.finish()),
                 array(self.severity_text.finish()),
                 array(self.event_name.finish()),
-                array(self.body.finish()),
-                array(self.resource_attributes.finish()),
+                self.body.finish(),
+                self.resource_attributes.finish(),
                 array(self.scope_name.finish()),
                 array(self.scope_version.finish()),
-                array(self.scope_attributes.finish()),
-                array(self.log_attributes.finish()),
+                self.scope_attributes.finish(),
+                self.log_attributes.finish(),
                 array(self.dropped_attributes_count.finish()),
                 array(self.flags.finish()),
             ],

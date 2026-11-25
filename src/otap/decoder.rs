@@ -128,7 +128,7 @@ impl OtapDecoder {
 
     /// Decodes one canonical `BatchArrowRecords` message into normalized logs.
     pub fn decode_logs(&mut self, bytes: &[u8]) -> Result<RecordBatch> {
-        self.decode_logs_with(bytes, &Plan::all(&logs_schema_arc()))
+        self.decode_logs_with_options(bytes, &TransformOptions::new())
     }
 
     /// Like [`Self::decode_logs`], building only the columns and rows
@@ -142,13 +142,9 @@ impl OtapDecoder {
         // Planned before decoding, so a caller's bad option never poisons the
         // decoder.
         let plan = options.plan(&logs_schema_arc())?;
-        self.decode_logs_with(bytes, &plan)
-    }
-
-    fn decode_logs_with(&mut self, bytes: &[u8], plan: &Plan) -> Result<RecordBatch> {
         self.guarded(|decoder| {
             let envelope = BatchArrowRecords::decode(bytes)?;
-            decoder.logs(envelope, bytes.len(), plan)
+            decoder.logs(envelope, bytes.len(), &plan)
         })
     }
 
@@ -165,7 +161,7 @@ impl OtapDecoder {
 
     /// Decodes one canonical `BatchArrowRecords` message into normalized traces.
     pub fn decode_traces(&mut self, bytes: &[u8]) -> Result<RecordBatch> {
-        self.decode_traces_with(bytes, &Plan::all(&traces_schema_arc()))
+        self.decode_traces_with_options(bytes, &TransformOptions::new())
     }
 
     /// Like [`Self::decode_traces`], building only the columns and rows
@@ -176,13 +172,9 @@ impl OtapDecoder {
         options: &TransformOptions,
     ) -> Result<RecordBatch> {
         let plan = options.plan(&traces_schema_arc())?;
-        self.decode_traces_with(bytes, &plan)
-    }
-
-    fn decode_traces_with(&mut self, bytes: &[u8], plan: &Plan) -> Result<RecordBatch> {
         self.guarded(|decoder| {
             let envelope = BatchArrowRecords::decode(bytes)?;
-            decoder.traces(envelope, bytes.len(), plan)
+            decoder.traces(envelope, bytes.len(), &plan)
         })
     }
 
@@ -199,7 +191,9 @@ impl OtapDecoder {
 
     /// Decodes one canonical `BatchArrowRecords` message into normalized metrics.
     pub fn decode_metrics(&mut self, bytes: &[u8]) -> Result<MetricBatches> {
-        self.decode_metrics_with(bytes, MetricsSelection::All)
+        self.guarded(|decoder| {
+            decoder.metrics(BatchArrowRecords::decode(bytes)?, MetricsSelection::All)
+        })
     }
 
     /// Like [`Self::decode_metrics`], building only `shape`, narrowed by
@@ -212,15 +206,10 @@ impl OtapDecoder {
         options: &TransformOptions,
     ) -> Result<MetricBatches> {
         let plan = options.plan(&shape.schema_ref())?;
-        self.decode_metrics_with(bytes, MetricsSelection::Shape(shape, &plan))
-    }
-
-    fn decode_metrics_with(
-        &mut self,
-        bytes: &[u8],
-        selection: MetricsSelection<'_>,
-    ) -> Result<MetricBatches> {
-        self.guarded(|decoder| decoder.metrics(BatchArrowRecords::decode(bytes)?, selection))
+        self.guarded(|decoder| {
+            let envelope = BatchArrowRecords::decode(bytes)?;
+            decoder.metrics(envelope, MetricsSelection::Shape(shape, &plan))
+        })
     }
 
     /// Decodes one already-deserialized `BatchArrowRecords` into normalized

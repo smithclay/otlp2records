@@ -33,7 +33,7 @@ use super::{
     util::{
         append_f64_list, append_finite, append_finite_opt, append_opt_n, append_opt_ts_ns,
         append_required_service_name_n, append_required_ts_ns, append_u64_list, array, opt_ts,
-        string_builder,
+        string_builder, JsonColumn,
     },
     view_json,
 };
@@ -48,26 +48,23 @@ pub(crate) enum MetricsSelection<'a> {
 }
 
 impl<'a> MetricsSelection<'a> {
-    /// The plan of each shape, in gauge/sum/histogram/exp-histogram order;
-    /// `None` for a shape that is not built.
-    fn plans(self) -> [Option<ShapePlan>; 4] {
-        let shapes = [
-            MetricShape::Gauge,
-            MetricShape::Sum,
-            MetricShape::Histogram,
-            MetricShape::ExponentialHistogram,
-        ];
-        let mut plans: [Option<ShapePlan>; 4] = [None, None, None, None];
-        for (slot, shape) in plans.iter_mut().zip(shapes) {
-            *slot = match self {
-                MetricsSelection::All => Some(ShapePlan::everything(shape)),
-                MetricsSelection::Shape(wanted, plan) if wanted == shape => {
-                    Some(ShapePlan::new(plan.clone(), &shape.schema_ref()))
-                }
-                MetricsSelection::Shape(..) => None,
-            };
+    /// Whether `shape` is built at all.
+    fn builds(self, shape: MetricShape) -> bool {
+        match self {
+            MetricsSelection::All => true,
+            MetricsSelection::Shape(selected, _) => selected == shape,
         }
-        plans
+    }
+
+    /// The plan `shape` is built by: every column, the selected shape's plan,
+    /// or no column for a shape that is not built.
+    fn plan(self, shape: MetricShape) -> Plan {
+        let schema = shape.schema_ref();
+        match self {
+            MetricsSelection::All => Plan::all(&schema),
+            MetricsSelection::Shape(selected, plan) if selected == shape => plan.clone(),
+            MetricsSelection::Shape(..) => Plan::none(&schema),
+        }
     }
 
     /// The plan narrowing the one selected shape; `None` when every shape is
@@ -86,42 +83,27 @@ impl<'a> MetricsSelection<'a> {
     }
 }
 
-/// One metric shape's [`Plan`], with what its builders consult per point.
-#[derive(Clone)]
-struct ShapePlan {
-    plan: Plan,
-    time_range: Option<(i64, i64)>,
-    start_time_range: Option<(i64, i64)>,
-    metric_attributes: bool,
-    exemplars: bool,
-    resource_attributes: bool,
-    scope_attributes: bool,
+/// The time ranges a shape's points must fall in. `Copy`, so a point loop can
+/// filter by it while appending to the builders it came from.
+#[derive(Clone, Copy)]
+struct PointFilter {
+    time: Option<(i64, i64)>,
+    start_time: Option<(i64, i64)>,
 }
 
-impl ShapePlan {
-    fn new(plan: Plan, schema: &arrow_schema::Schema) -> Self {
+impl PointFilter {
+    fn new(plan: &Plan, schema: &arrow_schema::Schema) -> Self {
         Self {
-            time_range: plan.time_range(schema, "time_unix_nano"),
-            start_time_range: plan.time_range(schema, "start_time_unix_nano"),
-            metric_attributes: plan.builds_named(schema, "metric_attributes"),
-            exemplars: plan.builds_named(schema, "exemplars_json"),
-            resource_attributes: plan.builds_named(schema, "resource_attributes"),
-            scope_attributes: plan.builds_named(schema, "scope_attributes"),
-            plan,
+            time: plan.time_range(schema, "time_unix_nano"),
+            start_time: plan.time_range(schema, "start_time_unix_nano"),
         }
-    }
-
-    /// Every column of every point of `shape`.
-    fn everything(shape: MetricShape) -> Self {
-        let schema = shape.schema_ref();
-        Self::new(Plan::all(&schema), &schema)
     }
 
     /// Whether a point passes the time ranges. A zero start time is emitted
     /// as NULL, so it fails a start time range.
-    fn keeps(&self, time_unix_nano: u64, start_time_unix_nano: u64) -> bool {
-        in_range(self.time_range, Some(time_unix_nano))
-            && in_range(self.start_time_range, opt_ts(start_time_unix_nano))
+    fn keeps(self, time_unix_nano: u64, start_time_unix_nano: u64) -> bool {
+        in_range(self.time, Some(time_unix_nano))
+            && in_range(self.start_time, opt_ts(start_time_unix_nano))
     }
 }
 
@@ -164,15 +146,6 @@ pub(crate) fn transform_metrics_view_observed<V: MetricsView>(
     observer: &mut Option<&mut dyn TransformObserver>,
     selection: MetricsSelection<'_>,
 ) -> Result<MetricBatches> {
-    let plans = selection.plans();
-    let builds = plans.each_ref().map(Option::is_some);
-    let resource_attributes = plans
-        .iter()
-        .flatten()
-        .any(|shape| shape.resource_attributes);
-    let scope_attributes = plans.iter().flatten().any(|shape| shape.scope_attributes);
-    // A shape that is not built keeps empty builders.
-    let [gauge_plan, sum_plan, histogram_plan, exp_histogram_plan] = plans;
     let mut capacities = MetricCapacities::default();
     measure_phase(
         observer,
@@ -186,17 +159,19 @@ pub(crate) fn transform_metrics_view_observed<V: MetricsView>(
                             continue;
                         };
                         match data.value_type() {
-                            DataType::Gauge if builds[0] => {
+                            DataType::Gauge if selection.builds(MetricShape::Gauge) => {
                                 capacities.gauge += data.as_gauge().unwrap().data_points().count();
                             }
-                            DataType::Sum if builds[1] => {
+                            DataType::Sum if selection.builds(MetricShape::Sum) => {
                                 capacities.sum += data.as_sum().unwrap().data_points().count();
                             }
-                            DataType::Histogram if builds[2] => {
+                            DataType::Histogram if selection.builds(MetricShape::Histogram) => {
                                 capacities.histogram +=
                                     data.as_histogram().unwrap().data_points().count();
                             }
-                            DataType::ExponentialHistogram if builds[3] => {
+                            DataType::ExponentialHistogram
+                                if selection.builds(MetricShape::ExponentialHistogram) =>
+                            {
                                 capacities.exp_histogram += data
                                     .as_exponential_histogram()
                                     .unwrap()
@@ -224,29 +199,30 @@ pub(crate) fn transform_metrics_view_observed<V: MetricsView>(
         TransformPhase::BuilderInit,
         || {
             (
-                GaugeBuilders::with_capacity(
-                    capacities.gauge,
-                    gauge_plan.unwrap_or_else(|| ShapePlan::everything(MetricShape::Gauge)),
-                ),
-                SumBuilders::with_capacity(
-                    capacities.sum,
-                    sum_plan.unwrap_or_else(|| ShapePlan::everything(MetricShape::Sum)),
-                ),
+                GaugeBuilders::with_capacity(capacities.gauge, selection.plan(MetricShape::Gauge)),
+                SumBuilders::with_capacity(capacities.sum, selection.plan(MetricShape::Sum)),
                 HistogramBuilders::with_capacity(
                     capacities.histogram,
-                    histogram_plan.unwrap_or_else(|| ShapePlan::everything(MetricShape::Histogram)),
+                    selection.plan(MetricShape::Histogram),
                 ),
                 ExpHistogramBuilders::with_capacity(
                     capacities.exp_histogram,
-                    exp_histogram_plan.unwrap_or_else(|| {
-                        ShapePlan::everything(MetricShape::ExponentialHistogram)
-                    }),
+                    selection.plan(MetricShape::ExponentialHistogram),
                 ),
             )
         },
     );
     let mut skipped = SkippedMetrics::default();
     let mut duplicates = observer.is_some().then(ContextDuplicateTracker::default);
+    // Context attributes are serialized if any shape being built keeps them.
+    let resource_attributes = gauge.resource_attributes.built()
+        || sum.resource_attributes.built()
+        || histogram.resource_attributes.built()
+        || exp_histogram.resource_attributes.built();
+    let scope_attributes = gauge.scope_attributes.built()
+        || sum.scope_attributes.built()
+        || histogram.scope_attributes.built()
+        || exp_histogram.scope_attributes.built();
 
     for resource_metrics in view.resources() {
         let resource_view = resource_metrics.resource();
@@ -289,16 +265,14 @@ pub(crate) fn transform_metrics_view_observed<V: MetricsView>(
                 };
 
                 match data.value_type() {
-                    DataType::Gauge if builds[0] => {
+                    DataType::Gauge if selection.builds(MetricShape::Gauge) => {
                         let data = data.as_gauge().unwrap();
                         let rows_before = gauge.rows;
-                        for point in data.data_points() {
-                            if !gauge
-                                .shape
-                                .keeps(point.time_unix_nano(), point.start_time_unix_nano())
-                            {
-                                continue;
-                            }
+                        let points = gauge.points;
+                        for point in data
+                            .data_points()
+                            .filter(|p| points.keeps(p.time_unix_nano(), p.start_time_unix_nano()))
+                        {
                             if let Some(value) = metric_point_value(point.value(), &mut skipped) {
                                 measure_result(
                                     observer,
@@ -322,16 +296,14 @@ pub(crate) fn transform_metrics_view_observed<V: MetricsView>(
                             );
                         }
                     }
-                    DataType::Sum if builds[1] => {
+                    DataType::Sum if selection.builds(MetricShape::Sum) => {
                         let data = data.as_sum().unwrap();
                         let rows_before = sum.rows;
-                        for point in data.data_points() {
-                            if !sum
-                                .shape
-                                .keeps(point.time_unix_nano(), point.start_time_unix_nano())
-                            {
-                                continue;
-                            }
+                        let points = sum.points;
+                        for point in data
+                            .data_points()
+                            .filter(|p| points.keeps(p.time_unix_nano(), p.start_time_unix_nano()))
+                        {
                             if let Some(value) = metric_point_value(point.value(), &mut skipped) {
                                 measure_result(
                                     observer,
@@ -363,16 +335,14 @@ pub(crate) fn transform_metrics_view_observed<V: MetricsView>(
                             );
                         }
                     }
-                    DataType::Histogram if builds[2] => {
+                    DataType::Histogram if selection.builds(MetricShape::Histogram) => {
                         let data = data.as_histogram().unwrap();
                         let rows_before = histogram.rows;
-                        for point in data.data_points() {
-                            if !histogram
-                                .shape
-                                .keeps(point.time_unix_nano(), point.start_time_unix_nano())
-                            {
-                                continue;
-                            }
+                        let points = histogram.points;
+                        for point in data
+                            .data_points()
+                            .filter(|p| points.keeps(p.time_unix_nano(), p.start_time_unix_nano()))
+                        {
                             measure_result(
                                 observer,
                                 TransformSignal::Metrics,
@@ -398,16 +368,16 @@ pub(crate) fn transform_metrics_view_observed<V: MetricsView>(
                             );
                         }
                     }
-                    DataType::ExponentialHistogram if builds[3] => {
+                    DataType::ExponentialHistogram
+                        if selection.builds(MetricShape::ExponentialHistogram) =>
+                    {
                         let data = data.as_exponential_histogram().unwrap();
                         let rows_before = exp_histogram.rows;
-                        for point in data.data_points() {
-                            if !exp_histogram
-                                .shape
-                                .keeps(point.time_unix_nano(), point.start_time_unix_nano())
-                            {
-                                continue;
-                            }
+                        let points = exp_histogram.points;
+                        for point in data
+                            .data_points()
+                            .filter(|p| points.keeps(p.time_unix_nano(), p.start_time_unix_nano()))
+                        {
                             measure_result(
                                 observer,
                                 TransformSignal::Metrics,
@@ -474,7 +444,8 @@ enum NumberPointValue {
 }
 
 struct GaugeBuilders {
-    shape: ShapePlan,
+    plan: Plan,
+    points: PointFilter,
     rows: usize,
     time_unix_nano: TimestampNanosecondBuilder,
     start_time_unix_nano: TimestampNanosecondBuilder,
@@ -486,20 +457,26 @@ struct GaugeBuilders {
     service_name: StringBuilder,
     service_namespace: StringBuilder,
     service_instance_id: StringBuilder,
-    resource_attributes: StringBuilder,
+    resource_attributes: JsonColumn,
     scope_name: StringBuilder,
     scope_version: StringBuilder,
-    scope_attributes: StringBuilder,
-    metric_attributes: StringBuilder,
+    scope_attributes: JsonColumn,
+    metric_attributes: JsonColumn,
     flags: UInt32Builder,
-    exemplars_json: StringBuilder,
+    exemplars_json: JsonColumn,
     json_scratch: String,
 }
 
 impl GaugeBuilders {
-    fn with_capacity(rows: usize, shape: ShapePlan) -> Self {
+    fn with_capacity(rows: usize, plan: Plan) -> Self {
+        let schema = gauge_schema_arc();
+        let json = |name| JsonColumn::new(&plan, &schema, name, rows, rows.saturating_mul(32));
         Self {
-            shape,
+            points: PointFilter::new(&plan, &schema),
+            resource_attributes: json("resource_attributes"),
+            scope_attributes: json("scope_attributes"),
+            metric_attributes: json("metric_attributes"),
+            exemplars_json: json("exemplars_json"),
             rows: 0,
             time_unix_nano: TimestampNanosecondBuilder::with_capacity(rows),
             start_time_unix_nano: TimestampNanosecondBuilder::with_capacity(rows),
@@ -511,14 +488,11 @@ impl GaugeBuilders {
             service_name: string_builder(rows),
             service_namespace: string_builder(rows),
             service_instance_id: string_builder(rows),
-            resource_attributes: string_builder(rows),
             scope_name: string_builder(rows),
             scope_version: string_builder(rows),
-            scope_attributes: string_builder(rows),
-            metric_attributes: string_builder(rows),
             flags: UInt32Builder::with_capacity(rows),
-            exemplars_json: string_builder(rows),
             json_scratch: String::new(),
+            plan,
         }
     }
 
@@ -538,8 +512,7 @@ impl GaugeBuilders {
         if self.rows == 0 && !keep_empty {
             return Ok(None);
         }
-        self.shape
-            .plan
+        self.plan
             .finish(
                 gauge_schema_arc(),
                 vec![
@@ -553,13 +526,13 @@ impl GaugeBuilders {
                     array(self.service_name.finish()),
                     array(self.service_namespace.finish()),
                     array(self.service_instance_id.finish()),
-                    array(self.resource_attributes.finish()),
+                    self.resource_attributes.finish(),
                     array(self.scope_name.finish()),
                     array(self.scope_version.finish()),
-                    array(self.scope_attributes.finish()),
-                    array(self.metric_attributes.finish()),
+                    self.scope_attributes.finish(),
+                    self.metric_attributes.finish(),
                     array(self.flags.finish()),
-                    array(self.exemplars_json.finish()),
+                    self.exemplars_json.finish(),
                 ],
                 self.rows,
             )
@@ -568,7 +541,8 @@ impl GaugeBuilders {
 }
 
 struct SumBuilders {
-    shape: ShapePlan,
+    plan: Plan,
+    points: PointFilter,
     rows: usize,
     time_unix_nano: TimestampNanosecondBuilder,
     start_time_unix_nano: TimestampNanosecondBuilder,
@@ -580,22 +554,28 @@ struct SumBuilders {
     service_name: StringBuilder,
     service_namespace: StringBuilder,
     service_instance_id: StringBuilder,
-    resource_attributes: StringBuilder,
+    resource_attributes: JsonColumn,
     scope_name: StringBuilder,
     scope_version: StringBuilder,
-    scope_attributes: StringBuilder,
-    metric_attributes: StringBuilder,
+    scope_attributes: JsonColumn,
+    metric_attributes: JsonColumn,
     flags: UInt32Builder,
-    exemplars_json: StringBuilder,
+    exemplars_json: JsonColumn,
     aggregation_temporality: Int32Builder,
     is_monotonic: BooleanBuilder,
     json_scratch: String,
 }
 
 impl SumBuilders {
-    fn with_capacity(rows: usize, shape: ShapePlan) -> Self {
+    fn with_capacity(rows: usize, plan: Plan) -> Self {
+        let schema = sum_schema_arc();
+        let json = |name| JsonColumn::new(&plan, &schema, name, rows, rows.saturating_mul(32));
         Self {
-            shape,
+            points: PointFilter::new(&plan, &schema),
+            resource_attributes: json("resource_attributes"),
+            scope_attributes: json("scope_attributes"),
+            metric_attributes: json("metric_attributes"),
+            exemplars_json: json("exemplars_json"),
             rows: 0,
             time_unix_nano: TimestampNanosecondBuilder::with_capacity(rows),
             start_time_unix_nano: TimestampNanosecondBuilder::with_capacity(rows),
@@ -607,16 +587,13 @@ impl SumBuilders {
             service_name: string_builder(rows),
             service_namespace: string_builder(rows),
             service_instance_id: string_builder(rows),
-            resource_attributes: string_builder(rows),
             scope_name: string_builder(rows),
             scope_version: string_builder(rows),
-            scope_attributes: string_builder(rows),
-            metric_attributes: string_builder(rows),
             flags: UInt32Builder::with_capacity(rows),
-            exemplars_json: string_builder(rows),
             aggregation_temporality: Int32Builder::with_capacity(rows),
             is_monotonic: BooleanBuilder::with_capacity(rows),
             json_scratch: String::new(),
+            plan,
         }
     }
 
@@ -642,8 +619,7 @@ impl SumBuilders {
         if self.rows == 0 && !keep_empty {
             return Ok(None);
         }
-        self.shape
-            .plan
+        self.plan
             .finish(
                 sum_schema_arc(),
                 vec![
@@ -657,13 +633,13 @@ impl SumBuilders {
                     array(self.service_name.finish()),
                     array(self.service_namespace.finish()),
                     array(self.service_instance_id.finish()),
-                    array(self.resource_attributes.finish()),
+                    self.resource_attributes.finish(),
                     array(self.scope_name.finish()),
                     array(self.scope_version.finish()),
-                    array(self.scope_attributes.finish()),
-                    array(self.metric_attributes.finish()),
+                    self.scope_attributes.finish(),
+                    self.metric_attributes.finish(),
                     array(self.flags.finish()),
-                    array(self.exemplars_json.finish()),
+                    self.exemplars_json.finish(),
                     array(self.aggregation_temporality.finish()),
                     array(self.is_monotonic.finish()),
                 ],
@@ -684,19 +660,15 @@ trait NumberMetricBuilders {
     fn service_name(&mut self) -> &mut StringBuilder;
     fn service_namespace(&mut self) -> &mut StringBuilder;
     fn service_instance_id(&mut self) -> &mut StringBuilder;
-    fn resource_attributes(&mut self) -> &mut StringBuilder;
+    fn resource_attributes(&mut self) -> &mut JsonColumn;
     fn scope_name(&mut self) -> &mut StringBuilder;
     fn scope_version(&mut self) -> &mut StringBuilder;
-    fn scope_attributes(&mut self) -> &mut StringBuilder;
+    fn scope_attributes(&mut self) -> &mut JsonColumn;
     fn flags(&mut self) -> &mut UInt32Builder;
-    fn json_builders(&mut self) -> (&mut StringBuilder, &mut StringBuilder, &mut String);
-    fn shape(&self) -> &ShapePlan;
+    fn json_builders(&mut self) -> (&mut JsonColumn, &mut JsonColumn, &mut String);
 }
 
 impl NumberMetricBuilders for GaugeBuilders {
-    fn shape(&self) -> &ShapePlan {
-        &self.shape
-    }
     fn time_unix_nano(&mut self) -> &mut TimestampNanosecondBuilder {
         &mut self.time_unix_nano
     }
@@ -727,7 +699,7 @@ impl NumberMetricBuilders for GaugeBuilders {
     fn service_instance_id(&mut self) -> &mut StringBuilder {
         &mut self.service_instance_id
     }
-    fn resource_attributes(&mut self) -> &mut StringBuilder {
+    fn resource_attributes(&mut self) -> &mut JsonColumn {
         &mut self.resource_attributes
     }
     fn scope_name(&mut self) -> &mut StringBuilder {
@@ -736,13 +708,13 @@ impl NumberMetricBuilders for GaugeBuilders {
     fn scope_version(&mut self) -> &mut StringBuilder {
         &mut self.scope_version
     }
-    fn scope_attributes(&mut self) -> &mut StringBuilder {
+    fn scope_attributes(&mut self) -> &mut JsonColumn {
         &mut self.scope_attributes
     }
     fn flags(&mut self) -> &mut UInt32Builder {
         &mut self.flags
     }
-    fn json_builders(&mut self) -> (&mut StringBuilder, &mut StringBuilder, &mut String) {
+    fn json_builders(&mut self) -> (&mut JsonColumn, &mut JsonColumn, &mut String) {
         (
             &mut self.metric_attributes,
             &mut self.exemplars_json,
@@ -752,9 +724,6 @@ impl NumberMetricBuilders for GaugeBuilders {
 }
 
 impl NumberMetricBuilders for SumBuilders {
-    fn shape(&self) -> &ShapePlan {
-        &self.shape
-    }
     fn time_unix_nano(&mut self) -> &mut TimestampNanosecondBuilder {
         &mut self.time_unix_nano
     }
@@ -785,7 +754,7 @@ impl NumberMetricBuilders for SumBuilders {
     fn service_instance_id(&mut self) -> &mut StringBuilder {
         &mut self.service_instance_id
     }
-    fn resource_attributes(&mut self) -> &mut StringBuilder {
+    fn resource_attributes(&mut self) -> &mut JsonColumn {
         &mut self.resource_attributes
     }
     fn scope_name(&mut self) -> &mut StringBuilder {
@@ -794,13 +763,13 @@ impl NumberMetricBuilders for SumBuilders {
     fn scope_version(&mut self) -> &mut StringBuilder {
         &mut self.scope_version
     }
-    fn scope_attributes(&mut self) -> &mut StringBuilder {
+    fn scope_attributes(&mut self) -> &mut JsonColumn {
         &mut self.scope_attributes
     }
     fn flags(&mut self) -> &mut UInt32Builder {
         &mut self.flags
     }
-    fn json_builders(&mut self) -> (&mut StringBuilder, &mut StringBuilder, &mut String) {
+    fn json_builders(&mut self) -> (&mut JsonColumn, &mut JsonColumn, &mut String) {
         (
             &mut self.metric_attributes,
             &mut self.exemplars_json,
@@ -839,18 +808,11 @@ fn append_metric_common<B: NumberMetricBuilders, P: NumberDataPointView>(
         }
     }
     builders.flags().append_value(point.flags().into_inner());
-    let (wants_attributes, wants_exemplars) = {
-        let shape = builders.shape();
-        (shape.metric_attributes, shape.exemplars)
-    };
     let (metric_attributes, exemplars_json, json_scratch) = builders.json_builders();
-    if wants_attributes {
-        view_json::append_attributes(metric_attributes, point.attributes(), json_scratch)?;
-    }
-    if wants_exemplars {
-        view_json::append_exemplars(exemplars_json, point.exemplars(), json_scratch)?;
-    }
-    Ok(())
+    metric_attributes
+        .append(|column| view_json::append_attributes(column, point.attributes(), json_scratch))?;
+    exemplars_json
+        .append(|column| view_json::append_exemplars(column, point.exemplars(), json_scratch))
 }
 
 fn append_number_metric_context<B: NumberMetricBuilders>(
@@ -874,22 +836,19 @@ fn append_number_metric_context<B: NumberMetricBuilders>(
         resource.service_instance_id.as_deref(),
         rows,
     );
-    append_opt_n(
-        builders.resource_attributes(),
-        resource.attributes_json.as_deref(),
-        rows,
-    );
+    builders
+        .resource_attributes()
+        .append_opt_n(resource.attributes_json.as_deref(), rows);
     append_opt_n(builders.scope_name(), scope.name.as_deref(), rows);
     append_opt_n(builders.scope_version(), scope.version.as_deref(), rows);
-    append_opt_n(
-        builders.scope_attributes(),
-        scope.attributes_json.as_deref(),
-        rows,
-    );
+    builders
+        .scope_attributes()
+        .append_opt_n(scope.attributes_json.as_deref(), rows);
 }
 
 struct HistogramBuilders {
-    shape: ShapePlan,
+    plan: Plan,
+    points: PointFilter,
     rows: usize,
     time_unix_nano: TimestampNanosecondBuilder,
     start_time_unix_nano: TimestampNanosecondBuilder,
@@ -905,21 +864,27 @@ struct HistogramBuilders {
     service_name: StringBuilder,
     service_namespace: StringBuilder,
     service_instance_id: StringBuilder,
-    resource_attributes: StringBuilder,
+    resource_attributes: JsonColumn,
     scope_name: StringBuilder,
     scope_version: StringBuilder,
-    scope_attributes: StringBuilder,
-    metric_attributes: StringBuilder,
+    scope_attributes: JsonColumn,
+    metric_attributes: JsonColumn,
     flags: UInt32Builder,
-    exemplars_json: StringBuilder,
+    exemplars_json: JsonColumn,
     aggregation_temporality: Int32Builder,
     json_scratch: String,
 }
 
 impl HistogramBuilders {
-    fn with_capacity(rows: usize, shape: ShapePlan) -> Self {
+    fn with_capacity(rows: usize, plan: Plan) -> Self {
+        let schema = histogram_schema_arc();
+        let json = |name| JsonColumn::new(&plan, &schema, name, rows, rows.saturating_mul(32));
         Self {
-            shape,
+            points: PointFilter::new(&plan, &schema),
+            resource_attributes: json("resource_attributes"),
+            scope_attributes: json("scope_attributes"),
+            metric_attributes: json("metric_attributes"),
+            exemplars_json: json("exemplars_json"),
             rows: 0,
             time_unix_nano: TimestampNanosecondBuilder::with_capacity(rows),
             start_time_unix_nano: TimestampNanosecondBuilder::with_capacity(rows),
@@ -935,15 +900,12 @@ impl HistogramBuilders {
             service_name: string_builder(rows),
             service_namespace: string_builder(rows),
             service_instance_id: string_builder(rows),
-            resource_attributes: string_builder(rows),
             scope_name: string_builder(rows),
             scope_version: string_builder(rows),
-            scope_attributes: string_builder(rows),
-            metric_attributes: string_builder(rows),
             flags: UInt32Builder::with_capacity(rows),
-            exemplars_json: string_builder(rows),
             aggregation_temporality: Int32Builder::with_capacity(rows),
             json_scratch: String::new(),
+            plan,
         }
     }
 
@@ -974,21 +936,13 @@ impl HistogramBuilders {
         let explicit_bounds: Vec<_> = point.explicit_bounds().collect();
         append_u64_list(&mut self.bucket_counts, &bucket_counts);
         append_f64_list(&mut self.explicit_bounds, &explicit_bounds);
-        if self.shape.metric_attributes {
-            view_json::append_attributes(
-                &mut self.metric_attributes,
-                point.attributes(),
-                &mut self.json_scratch,
-            )?;
-        }
+        self.metric_attributes.append(|column| {
+            view_json::append_attributes(column, point.attributes(), &mut self.json_scratch)
+        })?;
         self.flags.append_value(point.flags().into_inner());
-        if self.shape.exemplars {
-            view_json::append_exemplars(
-                &mut self.exemplars_json,
-                point.exemplars(),
-                &mut self.json_scratch,
-            )?;
-        }
+        self.exemplars_json.append(|column| {
+            view_json::append_exemplars(column, point.exemplars(), &mut self.json_scratch)
+        })?;
         self.aggregation_temporality
             .append_value(aggregation_temporality);
         self.rows += 1;
@@ -1015,8 +969,7 @@ impl HistogramBuilders {
         if self.rows == 0 && !keep_empty {
             return Ok(None);
         }
-        self.shape
-            .plan
+        self.plan
             .finish(
                 histogram_schema_arc(),
                 vec![
@@ -1034,13 +987,13 @@ impl HistogramBuilders {
                     array(self.service_name.finish()),
                     array(self.service_namespace.finish()),
                     array(self.service_instance_id.finish()),
-                    array(self.resource_attributes.finish()),
+                    self.resource_attributes.finish(),
                     array(self.scope_name.finish()),
                     array(self.scope_version.finish()),
-                    array(self.scope_attributes.finish()),
-                    array(self.metric_attributes.finish()),
+                    self.scope_attributes.finish(),
+                    self.metric_attributes.finish(),
                     array(self.flags.finish()),
-                    array(self.exemplars_json.finish()),
+                    self.exemplars_json.finish(),
                     array(self.aggregation_temporality.finish()),
                 ],
                 self.rows,
@@ -1050,7 +1003,8 @@ impl HistogramBuilders {
 }
 
 struct ExpHistogramBuilders {
-    shape: ShapePlan,
+    plan: Plan,
+    points: PointFilter,
     rows: usize,
     time_unix_nano: TimestampNanosecondBuilder,
     start_time_unix_nano: TimestampNanosecondBuilder,
@@ -1071,21 +1025,27 @@ struct ExpHistogramBuilders {
     service_name: StringBuilder,
     service_namespace: StringBuilder,
     service_instance_id: StringBuilder,
-    resource_attributes: StringBuilder,
+    resource_attributes: JsonColumn,
     scope_name: StringBuilder,
     scope_version: StringBuilder,
-    scope_attributes: StringBuilder,
-    metric_attributes: StringBuilder,
+    scope_attributes: JsonColumn,
+    metric_attributes: JsonColumn,
     flags: UInt32Builder,
-    exemplars_json: StringBuilder,
+    exemplars_json: JsonColumn,
     aggregation_temporality: Int32Builder,
     json_scratch: String,
 }
 
 impl ExpHistogramBuilders {
-    fn with_capacity(rows: usize, shape: ShapePlan) -> Self {
+    fn with_capacity(rows: usize, plan: Plan) -> Self {
+        let schema = exp_histogram_schema_arc();
+        let json = |name| JsonColumn::new(&plan, &schema, name, rows, rows.saturating_mul(32));
         Self {
-            shape,
+            points: PointFilter::new(&plan, &schema),
+            resource_attributes: json("resource_attributes"),
+            scope_attributes: json("scope_attributes"),
+            metric_attributes: json("metric_attributes"),
+            exemplars_json: json("exemplars_json"),
             rows: 0,
             time_unix_nano: TimestampNanosecondBuilder::with_capacity(rows),
             start_time_unix_nano: TimestampNanosecondBuilder::with_capacity(rows),
@@ -1106,15 +1066,12 @@ impl ExpHistogramBuilders {
             service_name: string_builder(rows),
             service_namespace: string_builder(rows),
             service_instance_id: string_builder(rows),
-            resource_attributes: string_builder(rows),
             scope_name: string_builder(rows),
             scope_version: string_builder(rows),
-            scope_attributes: string_builder(rows),
-            metric_attributes: string_builder(rows),
             flags: UInt32Builder::with_capacity(rows),
-            exemplars_json: string_builder(rows),
             aggregation_temporality: Int32Builder::with_capacity(rows),
             json_scratch: String::new(),
+            plan,
         }
     }
 
@@ -1160,21 +1117,13 @@ impl ExpHistogramBuilders {
             self.negative_offset.append_null();
             self.negative_bucket_counts.append_null();
         }
-        if self.shape.metric_attributes {
-            view_json::append_attributes(
-                &mut self.metric_attributes,
-                point.attributes(),
-                &mut self.json_scratch,
-            )?;
-        }
+        self.metric_attributes.append(|column| {
+            view_json::append_attributes(column, point.attributes(), &mut self.json_scratch)
+        })?;
         self.flags.append_value(point.flags().into_inner());
-        if self.shape.exemplars {
-            view_json::append_exemplars(
-                &mut self.exemplars_json,
-                point.exemplars(),
-                &mut self.json_scratch,
-            )?;
-        }
+        self.exemplars_json.append(|column| {
+            view_json::append_exemplars(column, point.exemplars(), &mut self.json_scratch)
+        })?;
         self.aggregation_temporality
             .append_value(aggregation_temporality);
         self.rows += 1;
@@ -1201,8 +1150,7 @@ impl ExpHistogramBuilders {
         if self.rows == 0 && !keep_empty {
             return Ok(None);
         }
-        self.shape
-            .plan
+        self.plan
             .finish(
                 exp_histogram_schema_arc(),
                 vec![
@@ -1225,13 +1173,13 @@ impl ExpHistogramBuilders {
                     array(self.service_name.finish()),
                     array(self.service_namespace.finish()),
                     array(self.service_instance_id.finish()),
-                    array(self.resource_attributes.finish()),
+                    self.resource_attributes.finish(),
                     array(self.scope_name.finish()),
                     array(self.scope_version.finish()),
-                    array(self.scope_attributes.finish()),
-                    array(self.metric_attributes.finish()),
+                    self.scope_attributes.finish(),
+                    self.metric_attributes.finish(),
                     array(self.flags.finish()),
-                    array(self.exemplars_json.finish()),
+                    self.exemplars_json.finish(),
                     array(self.aggregation_temporality.finish()),
                 ],
                 self.rows,
@@ -1245,10 +1193,10 @@ fn append_metric_resource_scope_n(
     service_name: &mut StringBuilder,
     service_namespace: &mut StringBuilder,
     service_instance_id: &mut StringBuilder,
-    resource_attributes: &mut StringBuilder,
+    resource_attributes: &mut JsonColumn,
     scope_name: &mut StringBuilder,
     scope_version: &mut StringBuilder,
-    scope_attributes: &mut StringBuilder,
+    scope_attributes: &mut JsonColumn,
     rows: usize,
     resource: &ResourceContext,
     scope: &ScopeContext,
@@ -1264,14 +1212,10 @@ fn append_metric_resource_scope_n(
         resource.service_instance_id.as_deref(),
         rows,
     );
-    append_opt_n(
-        resource_attributes,
-        resource.attributes_json.as_deref(),
-        rows,
-    );
+    resource_attributes.append_opt_n(resource.attributes_json.as_deref(), rows);
     append_opt_n(scope_name, scope.name.as_deref(), rows);
     append_opt_n(scope_version, scope.version.as_deref(), rows);
-    append_opt_n(scope_attributes, scope.attributes_json.as_deref(), rows);
+    scope_attributes.append_opt_n(scope.attributes_json.as_deref(), rows);
 }
 
 #[inline]
