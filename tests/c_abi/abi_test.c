@@ -324,43 +324,54 @@ static void test_options(const char* root) {
     free(bar.data);
 }
 
-static OtlpIngestStatus never_called(void* user_data, OtlpSignalType signal, uint64_t stream_id, int64_t batch_id,
-                                     uint64_t input_bytes, struct ArrowArray* array, struct ArrowSchema* schema) {
-    (void)user_data, (void)signal, (void)stream_id, (void)batch_id, (void)input_bytes, (void)array, (void)schema;
+static OtlpIngestStatus never_called(void* user_data, uint64_t input_bytes, const OtlpIngestBatch* batches,
+                                     size_t batch_count, char* detail, size_t detail_len) {
+    (void)user_data, (void)input_bytes, (void)batches, (void)batch_count, (void)detail, (void)detail_len;
     return OTLP_INGEST_INTERNAL;
 }
 
-static void test_grpc_lifecycle(void) {
-    char err[256];
-    const char* bad = "256.0.0.1:1";
-    memset(err, 0, sizeof err);
-    CHECK(otlp_grpc_server_start(bad, strlen(bad), NULL, NULL, NULL, 0, 0, err, sizeof err) == NULL);
-    CHECK(strcmp(err, "on_batch callback is null") == 0);
+static int ready(void* user_data, char* reason, size_t reason_len) {
+    (void)user_data, (void)reason, (void)reason_len;
+    return 1;
+}
 
-    memset(err, 0, sizeof err);
-    CHECK(otlp_grpc_server_start(bad, strlen(bad), never_called, NULL, NULL, OTLP_GRPC_SERVICE_OTLP_UNARY, 0, err,
-                                 sizeof err) == NULL);
+static void test_ingest_lifecycle(void) {
+    char err[256] = {0};
+    const char* bad = "256.0.0.1:1";
+    OtlpIngestServerConfig config = {0};
+    CHECK(otlp_ingest_server_start(bad, strlen(bad), NULL, err, sizeof err) == NULL);
+    CHECK(strcmp(err, "config is null") == 0);
+    CHECK(otlp_ingest_server_start(bad, strlen(bad), &config, err, sizeof err) == NULL);
+    CHECK(strcmp(err, "on_message callback is null") == 0);
+
+    config.on_message = never_called;
+    config.services = OTLP_INGEST_SERVE_OTLP_GRPC;
+    CHECK(otlp_ingest_server_start(bad, strlen(bad), &config, err, sizeof err) == NULL);
     CHECK(strncmp(err, "failed to bind", strlen("failed to bind")) == 0);
 
-    memset(err, 0, sizeof err);
-    CHECK(otlp_grpc_server_start_with_profile(bad, strlen(bad), never_called, NULL, NULL, 0, 1 << 20,
-                                              OTLP_ARROW_PROFILE_DUCKDB, err, 4) == NULL);
+    config.services = 0;
+    config.profile = OTLP_ARROW_PROFILE_DUCKDB;
+    config.max_message_bytes = 1 << 20;
+    CHECK(otlp_ingest_server_start(bad, strlen(bad), &config, err, 4) == NULL);
     CHECK(strcmp(err, "fai") == 0);
 
     const char* any = "127.0.0.1:0";
-    OtlpGrpcServer* server = otlp_grpc_server_start_with_profile(
-        any, strlen(any), never_called, NULL, NULL, OTLP_GRPC_SERVICE_OTAP_ARROW, 1 << 20, OTLP_ARROW_PROFILE_DUCKDB,
-        err, sizeof err);
+    config.services = OTLP_INGEST_SERVE_OTAP_GRPC | OTLP_INGEST_SERVE_OTLP_HTTP;
+    config.on_ready = ready;
+    config.auth_token = "secret";
+    config.auth_token_len = 6;
+    OtlpIngestServer* server = otlp_ingest_server_start(any, strlen(any), &config, err, sizeof err);
     CHECK(server != NULL);
-    otlp_grpc_server_stop(server, 100);
-    otlp_grpc_server_stop(server, 100);
-    otlp_grpc_server_free(server);
-    otlp_grpc_server_stop(NULL, 0);
-    otlp_grpc_server_free(NULL);
+    otlp_ingest_server_stop(server, 100);
+    otlp_ingest_server_stop(server, 100);
+    otlp_ingest_server_free(server);
+    otlp_ingest_server_stop(NULL, 0);
+    otlp_ingest_server_free(NULL);
 
-    server = otlp_grpc_server_start(any, strlen(any), never_called, NULL, NULL, 0, 0, err, sizeof err);
+    config = (OtlpIngestServerConfig){.on_message = never_called};
+    server = otlp_ingest_server_start(any, strlen(any), &config, err, sizeof err);
     CHECK(server != NULL);
-    otlp_grpc_server_free(server);
+    otlp_ingest_server_free(server);
 }
 
 int main(int argc, char** argv) {
@@ -374,7 +385,7 @@ int main(int argc, char** argv) {
     test_metrics_all(argv[1]);
     test_otap(argv[1]);
     test_options(argv[1]);
-    test_grpc_lifecycle();
+    test_ingest_lifecycle();
     if (failures) {
         fprintf(stderr, "%d C ABI check(s) failed\n", failures);
         return 1;

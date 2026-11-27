@@ -1,22 +1,27 @@
 #![cfg(feature = "server")]
 
 use std::ffi::{c_char, c_int, c_void};
+use std::io::{Read, Write};
+use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use arrow_array::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
 use opentelemetry_proto::tonic::collector::logs::v1::logs_service_client::LogsServiceClient;
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
+use opentelemetry_proto::tonic::collector::metrics::v1::{
+    metrics_service_client::MetricsServiceClient, ExportMetricsServiceRequest,
+};
 use opentelemetry_proto::tonic::collector::trace::v1::trace_service_client::TraceServiceClient;
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
 use otlp2records::ffi::{OtlpArrowProfile, OtlpSignalType};
-use otlp2records::server_ffi::{
-    otlp_grpc_server_free, otlp_grpc_server_start_with_profile, otlp_grpc_server_stop,
-    OtlpGrpcServer, OtlpIngestStatus, OTLP_GRPC_SERVICE_OTAP_ARROW, OTLP_GRPC_SERVICE_OTLP_UNARY,
-};
 use otlp2records::otap::{BatchArrowRecords, BatchStatus, StatusCode};
+use otlp2records::server_ffi::{
+    otlp_ingest_server_free, otlp_ingest_server_start, otlp_ingest_server_stop, OtlpIngestBatch,
+    OtlpIngestServer, OtlpIngestServerConfig, OtlpIngestStatus, OTLP_INGEST_SERVE_OTAP_GRPC,
+    OTLP_INGEST_SERVE_OTLP_GRPC, OTLP_INGEST_SERVE_OTLP_HTTP,
+};
 use prost::Message;
 use tonic::codec::CompressionEncoding;
 use tonic::Code;
@@ -28,24 +33,28 @@ const ARROW_LOGS: &str = "/opentelemetry.proto.experimental.arrow.v1.ArrowLogsSe
 
 #[derive(Default)]
 struct Host {
-    batches: Mutex<Vec<Delivered>>,
-    auth_calls: AtomicUsize,
+    messages: Mutex<Vec<Delivered>>,
+    readiness_calls: AtomicUsize,
     entered: AtomicUsize,
     returned: AtomicUsize,
     callback_sleep_ms: AtomicU64,
     reply: Option<OtlpIngestStatus>,
-    token: Option<String>,
-    stop_from_callback: AtomicPtr<OtlpGrpcServer>,
-    free_from_callback: AtomicPtr<OtlpGrpcServer>,
+    detail: &'static [u8],
+    readiness: Option<(bool, &'static [u8])>,
+    stop_from_callback: AtomicPtr<OtlpIngestServer>,
+    free_from_callback: AtomicPtr<OtlpIngestServer>,
 }
 
 #[derive(Debug, Clone)]
 struct Delivered {
-    signal: OtlpSignalType,
-    stream_id: u64,
-    batch_id: i64,
     input_bytes: u64,
-    rows: i64,
+    batches: Vec<DeliveredBatch>,
+}
+
+#[derive(Debug, Clone)]
+struct DeliveredBatch {
+    signal: OtlpSignalType,
+    rows: usize,
     formats: Vec<(String, String)>,
 }
 
@@ -55,24 +64,23 @@ impl Host {
     }
 
     fn delivered(&self) -> Vec<Delivered> {
-        self.batches.lock().unwrap().clone()
+        self.messages.lock().unwrap().clone()
     }
 }
 
-extern "C" fn on_batch(
+extern "C" fn on_message(
     user_data: *mut c_void,
-    signal: OtlpSignalType,
-    stream_id: u64,
-    batch_id: i64,
     input_bytes: u64,
-    array: *mut FFI_ArrowArray,
-    schema: *mut FFI_ArrowSchema,
+    batches: *const OtlpIngestBatch,
+    batch_count: usize,
+    detail: *mut c_char,
+    detail_len: usize,
 ) -> OtlpIngestStatus {
-    let (host, array, schema) = unsafe { (&*(user_data as *const Host), &*array, &*schema) };
+    let host = unsafe { &*user_data.cast::<Host>() };
     host.entered.fetch_add(1, Ordering::SeqCst);
     unsafe {
-        otlp_grpc_server_stop(host.stop_from_callback.load(Ordering::SeqCst), 1_000);
-        otlp_grpc_server_free(
+        otlp_ingest_server_stop(host.stop_from_callback.load(Ordering::SeqCst), 1_000);
+        otlp_ingest_server_free(
             host.free_from_callback
                 .swap(std::ptr::null_mut(), Ordering::SeqCst),
         );
@@ -80,58 +88,74 @@ extern "C" fn on_batch(
     std::thread::sleep(Duration::from_millis(
         host.callback_sleep_ms.load(Ordering::SeqCst),
     ));
-    host.batches.lock().unwrap().push(Delivered {
-        signal,
-        stream_id,
-        batch_id,
+    let batches = if batch_count == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(batches, batch_count) }
+    };
+    host.messages.lock().unwrap().push(Delivered {
         input_bytes,
-        rows: array.len() as i64,
-        formats: schema
-            .children()
-            .map(|c| (c.name().unwrap_or_default().into(), c.format().into()))
+        batches: batches
+            .iter()
+            .map(|batch| {
+                let (array, schema) = unsafe { (&*batch.array, &*batch.schema) };
+                DeliveredBatch {
+                    signal: batch.signal_type,
+                    rows: array.len(),
+                    formats: schema
+                        .children()
+                        .map(|c| (c.name().unwrap_or_default().into(), c.format().into()))
+                        .collect(),
+                }
+            })
             .collect(),
     });
+    write_callback_text(detail, detail_len, host.detail);
     host.returned.fetch_add(1, Ordering::SeqCst);
     host.reply.unwrap_or(OtlpIngestStatus::Ok)
 }
 
-extern "C" fn on_auth(user_data: *mut c_void, token: *const c_char, len: usize) -> c_int {
-    let (host, token) = unsafe {
-        (
-            &*(user_data as *const Host),
-            std::slice::from_raw_parts(token as *const u8, len),
-        )
-    };
-    host.auth_calls.fetch_add(1, Ordering::SeqCst);
-    c_int::from(Some(token) == host.token.as_deref().map(str::as_bytes))
+fn write_callback_text(output: *mut c_char, output_len: usize, text: &[u8]) {
+    let output = unsafe { std::slice::from_raw_parts_mut(output.cast::<u8>(), output_len) };
+    assert!(output.iter().all(|&b| b == 0));
+    let len = text.len().min(output_len);
+    output[..len].copy_from_slice(&text[..len]);
+}
+
+extern "C" fn on_ready(user_data: *mut c_void, reason: *mut c_char, reason_len: usize) -> c_int {
+    let host = unsafe { &*user_data.cast::<Host>() };
+    host.readiness_calls.fetch_add(1, Ordering::SeqCst);
+    let (ready, text) = host.readiness.unwrap();
+    write_callback_text(reason, reason_len, text);
+    c_int::from(ready)
 }
 
 struct Server {
-    handle: *mut OtlpGrpcServer,
+    handle: *mut OtlpIngestServer,
     addr: String,
     host: Box<Host>,
 }
 
-struct Options {
+struct Options<'a> {
     services: u32,
     max_decoding: u64,
     profile: OtlpArrowProfile,
-    auth: bool,
+    token: Option<&'a [u8]>,
 }
 
-impl Default for Options {
+impl Default for Options<'_> {
     fn default() -> Self {
         Self {
             services: 0,
             max_decoding: 0,
             profile: OtlpArrowProfile::Canonical,
-            auth: false,
+            token: None,
         }
     }
 }
 
 impl Server {
-    fn start(options: Options, host: Host) -> Server {
+    fn start(options: Options<'_>, host: Host) -> Server {
         let host = Box::new(host);
         let port = std::net::TcpListener::bind("127.0.0.1:0")
             .unwrap()
@@ -140,20 +164,7 @@ impl Server {
             .port();
         let addr = format!("127.0.0.1:{port}");
         let mut err = [0 as c_char; 256];
-        let handle = unsafe {
-            otlp_grpc_server_start_with_profile(
-                addr.as_ptr() as *const c_char,
-                addr.len(),
-                Some(on_batch),
-                options.auth.then_some(on_auth as _),
-                &*host as *const Host as *mut c_void,
-                options.services,
-                options.max_decoding,
-                options.profile,
-                err.as_mut_ptr(),
-                err.len(),
-            )
-        };
+        let handle = start(&addr, &configuration(&host, options), &mut err);
         assert!(!handle.is_null(), "start failed: {:?}", unsafe {
             std::ffi::CStr::from_ptr(err.as_ptr())
         });
@@ -165,16 +176,43 @@ impl Server {
     }
 
     fn stop(&self, deadline_ms: u64) {
-        unsafe { otlp_grpc_server_stop(self.handle, deadline_ms) };
+        unsafe { otlp_ingest_server_stop(self.handle, deadline_ms) };
     }
 }
 
 impl Drop for Server {
     fn drop(&mut self) {
         unsafe {
-            otlp_grpc_server_stop(self.handle, 1_000);
-            otlp_grpc_server_free(self.handle);
+            otlp_ingest_server_stop(self.handle, 1_000);
+            otlp_ingest_server_free(self.handle);
         }
+    }
+}
+
+fn configuration(host: &Host, options: Options<'_>) -> OtlpIngestServerConfig {
+    OtlpIngestServerConfig {
+        user_data: (host as *const Host).cast_mut().cast(),
+        on_message: Some(on_message),
+        on_ready: host.readiness.map(|_| on_ready as _),
+        auth_token: options
+            .token
+            .map_or(std::ptr::null(), |token| token.as_ptr().cast()),
+        auth_token_len: options.token.map_or(0, <[u8]>::len),
+        services: options.services,
+        profile: options.profile,
+        max_message_bytes: options.max_decoding,
+    }
+}
+
+fn start(addr: &str, config: &OtlpIngestServerConfig, err: &mut [c_char]) -> *mut OtlpIngestServer {
+    unsafe {
+        otlp_ingest_server_start(
+            addr.as_ptr().cast(),
+            addr.len(),
+            config,
+            err.as_mut_ptr(),
+            err.len(),
+        )
     }
 }
 
@@ -211,7 +249,7 @@ fn span_request() -> ExportTraceServiceRequest {
 
 async fn export_logs(
     url: String,
-    token: Option<&str>,
+    headers: &[(&'static str, &str)],
     compression: Option<CompressionEncoding>,
 ) -> Result<(), tonic::Status> {
     let mut client = LogsServiceClient::connect(url)
@@ -221,10 +259,8 @@ async fn export_logs(
         client = client.send_compressed(encoding);
     }
     let mut request = tonic::Request::new(logs_request());
-    if let Some(token) = token {
-        request
-            .metadata_mut()
-            .insert("authorization", token.parse().unwrap());
+    for &(key, value) in headers {
+        request.metadata_mut().insert(key, value.parse().unwrap());
     }
     client.export(request).await.map(|_| ())
 }
@@ -237,7 +273,17 @@ fn envelope(batch_id: i64, bytes: &[u8]) -> BatchArrowRecords {
 
 async fn arrow_logs(
     url: String,
-    token: Option<&str>,
+    headers: &[(&'static str, &str)],
+    compression: Option<CompressionEncoding>,
+    messages: Vec<BatchArrowRecords>,
+) -> Result<Vec<BatchStatus>, tonic::Status> {
+    arrow_stream(url, ARROW_LOGS, headers, compression, messages).await
+}
+
+async fn arrow_stream(
+    url: String,
+    path: &'static str,
+    headers: &[(&'static str, &str)],
     compression: Option<CompressionEncoding>,
     messages: Vec<BatchArrowRecords>,
 ) -> Result<Vec<BatchStatus>, tonic::Status> {
@@ -254,16 +300,14 @@ async fn arrow_logs(
         .await
         .map_err(|e| tonic::Status::unavailable(e.to_string()))?;
     let mut request = tonic::Request::new(tokio_stream::iter(messages));
-    if let Some(token) = token {
-        request
-            .metadata_mut()
-            .insert("authorization", token.parse().unwrap());
+    for &(key, value) in headers {
+        request.metadata_mut().insert(key, value.parse().unwrap());
     }
     let codec = tonic_prost::ProstCodec::<BatchArrowRecords, BatchStatus>::default();
     let mut acks = grpc
         .streaming(
             request,
-            tonic::codegen::http::uri::PathAndQuery::from_static(ARROW_LOGS),
+            tonic::codegen::http::uri::PathAndQuery::from_static(path),
             codec,
         )
         .await?
@@ -290,7 +334,7 @@ fn stop_does_not_return_while_a_host_callback_is_still_running() {
     let server = Server::start(Options::default(), host);
     let rt = runtime();
     let url = server.url();
-    let export = rt.spawn(async move { export_logs(url, None, None).await });
+    let export = rt.spawn(async move { export_logs(url, &[], None).await });
 
     wait_until("the callback to start", || {
         server.host.entered.load(Ordering::SeqCst) == 1
@@ -299,7 +343,7 @@ fn stop_does_not_return_while_a_host_callback_is_still_running() {
 
     assert!(
         !server.host.in_callback(),
-        "otlp_grpc_server_stop returned while the host callback was still running; \
+        "otlp_ingest_server_stop returned while the host callback was still running; \
          the host frees user_data right after stop returns"
     );
     assert_eq!(server.host.returned.load(Ordering::SeqCst), 1);
@@ -316,10 +360,10 @@ fn no_host_callback_starts_after_stop_returns() {
             let url = url.clone();
             rt.spawn(async move {
                 loop {
-                    let unary = export_logs(url.clone(), None, None);
+                    let unary = export_logs(url.clone(), &[], None);
                     let stream = arrow_logs(
                         url.clone(),
-                        None,
+                        &[],
                         None,
                         vec![envelope(1, OTAP_LOGS_INITIAL), envelope(2, OTAP_LOGS_REUSE)],
                     );
@@ -355,7 +399,7 @@ fn stop_called_from_inside_a_callback_returns_instead_of_deadlocking() {
     let rt = runtime();
     let (tx, rx) = std::sync::mpsc::channel();
     let url = server.url();
-    rt.spawn(async move { tx.send(export_logs(url, None, None).await) });
+    rt.spawn(async move { tx.send(export_logs(url, &[], None).await) });
     rx.recv_timeout(Duration::from_secs(10))
         .expect("an export whose callback calls stop never completed")
         .expect("export");
@@ -383,60 +427,72 @@ fn free_called_from_inside_a_callback_stops_the_server() {
     }));
     let rt = runtime();
     let url = server.url();
-    let _ = rt.block_on(export_logs(url.clone(), None, None));
+    let _ = rt.block_on(export_logs(url.clone(), &[], None));
     wait_until("the freed server stops accepting", || {
-        rt.block_on(export_logs(url.clone(), None, None)).is_err()
+        rt.block_on(export_logs(url.clone(), &[], None)).is_err()
     });
     assert!(!RUNTIME_DROPPED_IN_CALLBACK.load(Ordering::SeqCst));
 }
 
 static RUNTIME_DROPPED_IN_CALLBACK: AtomicBool = AtomicBool::new(false);
 
+const REJECTED_HEADERS: &[&[(&str, &str)]] = &[
+    &[],
+    &[("authorization", "Bearer wrong")],
+    &[("authorization", "")],
+    &[("x-api-key", "wrong")],
+];
+
+const ACCEPTED_HEADERS: &[&[(&str, &str)]] = &[
+    &[("authorization", "Bearer s3cret")],
+    &[("authorization", "BEARER s3cret")],
+    &[("x-api-key", "s3cret")],
+    &[("authorization", "invalid"), ("x-api-key", "s3cret")],
+];
+
 #[test]
-fn requests_without_the_token_never_reach_the_batch_callback() {
-    let host = Host {
-        token: Some("Bearer s3cret".into()),
-        ..Host::default()
-    };
+fn grpc_authentication_uses_bearer_or_api_key() {
     let server = Server::start(
         Options {
-            auth: true,
+            token: Some(b"s3cret"),
             ..Options::default()
         },
-        host,
+        Host::default(),
     );
     let rt = runtime();
-    for token in [None, Some("Bearer wrong"), Some("")] {
+    for headers in REJECTED_HEADERS {
         let unary = rt
-            .block_on(export_logs(server.url(), token, None))
+            .block_on(export_logs(server.url(), headers, None))
             .unwrap_err();
-        assert_eq!(unary.code(), Code::Unauthenticated, "{token:?}");
+        assert_eq!(unary.code(), Code::Unauthenticated, "{headers:?}");
+        assert_eq!(unary.message(), "invalid token");
         let stream = rt
             .block_on(arrow_logs(
                 server.url(),
-                token,
+                headers,
                 None,
                 vec![envelope(1, OTAP_LOGS_INITIAL)],
             ))
             .unwrap_err();
-        assert_eq!(stream.code(), Code::Unauthenticated, "{token:?}");
+        assert_eq!(stream.code(), Code::Unauthenticated, "{headers:?}");
     }
-    assert!(server.host.auth_calls.load(Ordering::SeqCst) >= 6);
     assert!(server.host.delivered().is_empty());
 
-    rt.block_on(export_logs(server.url(), Some("Bearer s3cret"), None))
-        .unwrap();
-    let acks = rt
-        .block_on(arrow_logs(
-            server.url(),
-            Some("Bearer s3cret"),
-            None,
-            vec![envelope(7, OTAP_LOGS_INITIAL)],
-        ))
-        .unwrap();
-    assert_eq!(acks.len(), 1);
-    assert_eq!(acks[0].status_code, StatusCode::Ok as i32);
-    assert_eq!(server.host.delivered().len(), 2);
+    for headers in ACCEPTED_HEADERS {
+        rt.block_on(export_logs(server.url(), headers, None))
+            .unwrap();
+        let acks = rt
+            .block_on(arrow_logs(
+                server.url(),
+                headers,
+                None,
+                vec![envelope(7, OTAP_LOGS_INITIAL)],
+            ))
+            .unwrap();
+        assert_eq!(acks.len(), 1);
+        assert_eq!(acks[0].status_code, StatusCode::Ok as i32);
+    }
+    assert_eq!(server.host.delivered().len(), 2 * ACCEPTED_HEADERS.len());
 }
 
 #[test]
@@ -451,13 +507,13 @@ fn messages_over_the_decoding_cap_are_rejected_before_the_callback() {
     let rt = runtime();
     assert!(LOGS_PB.len() > 1024 && OTAP_LOGS_INITIAL.len() > 1024);
     let unary = rt
-        .block_on(export_logs(server.url(), None, None))
+        .block_on(export_logs(server.url(), &[], None))
         .unwrap_err();
     assert_eq!(unary.code(), Code::OutOfRange);
     let stream = rt
         .block_on(arrow_logs(
             server.url(),
-            None,
+            &[],
             None,
             vec![envelope(1, OTAP_LOGS_INITIAL)],
         ))
@@ -472,14 +528,14 @@ fn zstd_compressed_requests_are_accepted_on_both_families() {
     let rt = runtime();
     rt.block_on(export_logs(
         server.url(),
-        None,
+        &[],
         Some(CompressionEncoding::Zstd),
     ))
     .unwrap();
     let acks = rt
         .block_on(arrow_logs(
             server.url(),
-            None,
+            &[],
             Some(CompressionEncoding::Zstd),
             vec![envelope(3, OTAP_LOGS_INITIAL)],
         ))
@@ -493,32 +549,32 @@ fn service_flags_register_disjoint_service_families() {
     let rt = runtime();
     let otlp_only = Server::start(
         Options {
-            services: OTLP_GRPC_SERVICE_OTLP_UNARY,
+            services: OTLP_INGEST_SERVE_OTLP_GRPC,
             ..Options::default()
         },
         Host::default(),
     );
-    rt.block_on(export_logs(otlp_only.url(), None, None))
+    rt.block_on(export_logs(otlp_only.url(), &[], None))
         .unwrap();
     let arrow = rt
-        .block_on(arrow_logs(otlp_only.url(), None, None, vec![]))
+        .block_on(arrow_logs(otlp_only.url(), &[], None, vec![]))
         .unwrap_err();
     assert_eq!(arrow.code(), Code::Unimplemented);
 
     let otap_only = Server::start(
         Options {
-            services: OTLP_GRPC_SERVICE_OTAP_ARROW,
+            services: OTLP_INGEST_SERVE_OTAP_GRPC,
             ..Options::default()
         },
         Host::default(),
     );
     let unary = rt
-        .block_on(export_logs(otap_only.url(), None, None))
+        .block_on(export_logs(otap_only.url(), &[], None))
         .unwrap_err();
     assert_eq!(unary.code(), Code::Unimplemented);
     rt.block_on(arrow_logs(
         otap_only.url(),
-        None,
+        &[],
         None,
         vec![envelope(1, OTAP_LOGS_INITIAL)],
     ))
@@ -532,7 +588,7 @@ fn otap_stream_acks_each_message_reuses_state_and_closes_on_a_decode_error() {
     let acks = rt
         .block_on(arrow_logs(
             server.url(),
-            None,
+            &[],
             None,
             vec![
                 envelope(10, OTAP_LOGS_INITIAL),
@@ -556,11 +612,18 @@ fn otap_stream_acks_each_message_reuses_state_and_closes_on_a_decode_error() {
     );
     let delivered = server.host.delivered();
     assert_eq!(delivered.len(), 2);
-    assert!(delivered.iter().all(|d| d.signal == OtlpSignalType::Logs));
-    assert!(delivered.iter().all(|d| d.rows > 0 && d.input_bytes > 0));
-    assert_eq!(delivered[0].stream_id, delivered[1].stream_id);
-    assert_ne!(delivered[0].stream_id, 0);
-    assert_eq!((delivered[0].batch_id, delivered[1].batch_id), (10, 11));
+    for (message, (id, fixture)) in delivered
+        .iter()
+        .zip([(10, OTAP_LOGS_INITIAL), (11, OTAP_LOGS_REUSE)])
+    {
+        assert_eq!(
+            message.input_bytes,
+            envelope(id, fixture).encoded_len() as u64
+        );
+        assert_eq!(message.batches.len(), 1);
+        assert_eq!(message.batches[0].signal, OtlpSignalType::Logs);
+        assert!(message.batches[0].rows > 0);
+    }
 }
 
 #[test]
@@ -572,13 +635,22 @@ fn host_backpressure_nacks_without_closing_the_stream() {
     let server = Server::start(Options::default(), host);
     let rt = runtime();
     let unary = rt
-        .block_on(export_logs(server.url(), None, None))
+        .block_on(export_logs(server.url(), &[], None))
         .unwrap_err();
     assert_eq!(unary.code(), Code::ResourceExhausted);
+    assert_eq!(unary.message(), "ingest buffer full");
+    assert_http(
+        &server,
+        "POST /v1/logs",
+        &[("Content-Type", "application/json")],
+        LOG_JSON,
+        503,
+        r#"{"error":"request_failed","message":"ingest buffer full"}"#,
+    );
     let acks = rt
         .block_on(arrow_logs(
             server.url(),
-            None,
+            &[],
             None,
             vec![envelope(1, OTAP_LOGS_INITIAL), envelope(2, OTAP_LOGS_REUSE)],
         ))
@@ -607,7 +679,7 @@ fn export_one_span(profile: OtlpArrowProfile) -> Vec<(String, String)> {
     });
     let mut delivered = server.host.delivered();
     assert_eq!(delivered.len(), 1);
-    delivered.pop().unwrap().formats
+    delivered.pop().unwrap().batches.pop().unwrap().formats
 }
 
 fn format_of<'a>(formats: &'a [(String, String)], column: &str) -> &'a str {
@@ -624,4 +696,767 @@ fn delivered_batches_use_the_server_profile() {
     assert_eq!(format_of(&duckdb, "duration_time_unix_nano"), "l");
     assert_eq!(format_of(&duckdb, "flags"), "i");
     assert_eq!(format_of(&duckdb, "start_time_unix_nano"), "tsn:");
+}
+
+const LOG_JSON: &[u8] =
+    br#"{"resourceLogs":[{"scopeLogs":[{"logRecords":[{"body":{"stringValue":"test"}}]}]}]}"#;
+const LOGS_BUFFERED: &str = r#"{"status":"buffered","rows":1,"batches":1}"#;
+const UNAUTHORIZED: &str = r#"{"error":"unauthorized","message":"missing or invalid Authorization bearer token or x-api-key"}"#;
+const METRICS_PB: &[u8] = include_bytes!("fixtures/otap/metrics-initial.otlp");
+const OTAP_METRICS: &[u8] = include_bytes!("fixtures/otap/metrics-initial.bar");
+const ARROW_METRICS: &str =
+    "/opentelemetry.proto.experimental.arrow.v1.ArrowMetricsService/ArrowMetrics";
+const METRIC_SIGNALS: [OtlpSignalType; 4] = [
+    OtlpSignalType::MetricsGauge,
+    OtlpSignalType::MetricsSum,
+    OtlpSignalType::MetricsHistogram,
+    OtlpSignalType::MetricsExpHistogram,
+];
+
+fn http_exchange(
+    addr: &str,
+    request_line: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+) -> std::io::Result<Vec<u8>> {
+    let mut request =
+        format!("{request_line} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n").into_bytes();
+    if !headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("transfer-encoding"))
+    {
+        write!(request, "Content-Length: {}\r\n", body.len()).unwrap();
+    }
+    for (name, value) in headers {
+        write!(request, "{name}: {value}\r\n").unwrap();
+    }
+    request.extend_from_slice(b"\r\n");
+    request.extend_from_slice(body);
+    exchange(addr, &request)
+}
+
+fn exchange(addr: &str, request: &[u8]) -> std::io::Result<Vec<u8>> {
+    let mut conn = TcpStream::connect(addr)?;
+    conn.set_read_timeout(Some(Duration::from_secs(5)))?;
+    conn.set_write_timeout(Some(Duration::from_secs(5)))?;
+    conn.write_all(request)?;
+    let mut response = Vec::new();
+    conn.read_to_end(&mut response)?;
+    Ok(response)
+}
+
+fn http(addr: &str, request_line: &str, headers: &[(&str, &str)], body: &[u8]) -> (u16, String) {
+    let response =
+        String::from_utf8(http_exchange(addr, request_line, headers, body).unwrap()).unwrap();
+    let (headers, body) = response.split_once("\r\n\r\n").unwrap();
+    assert!(
+        headers
+            .lines()
+            .any(|line| line.eq_ignore_ascii_case("content-type: application/json")),
+        "{headers}"
+    );
+    (
+        headers.split_whitespace().nth(1).unwrap().parse().unwrap(),
+        body.into(),
+    )
+}
+
+fn assert_http(
+    server: &Server,
+    request_line: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+    status: u16,
+    response: &str,
+) {
+    let (actual_status, actual_body) = http(&server.addr, request_line, headers, body);
+    assert_eq!((actual_status, actual_body.as_str()), (status, response));
+}
+
+fn assert_shapes(message: &Delivered, input_bytes: usize, signals: &[OtlpSignalType]) {
+    assert_eq!(message.input_bytes, input_bytes as u64);
+    assert_eq!(
+        message
+            .batches
+            .iter()
+            .map(|batch| batch.signal)
+            .collect::<Vec<_>>(),
+        signals
+    );
+    assert!(message.batches.iter().all(|batch| batch.rows == 1));
+}
+
+#[test]
+fn http_logs_support_protobuf_json_and_json_lines() {
+    let server = Server::start(Options::default(), Host::default());
+    let mut logs = logs_request();
+    logs.resource_logs.truncate(1);
+    logs.resource_logs[0].scope_logs.truncate(1);
+    logs.resource_logs[0].scope_logs[0].log_records.truncate(1);
+    let logs_pb = logs.encode_to_vec();
+    let jsonl = [LOG_JSON, b"\n", LOG_JSON, b"\n"].concat();
+    for content_type in [
+        "application/x-protobuf",
+        "application/protobuf",
+        "application/otlp",
+    ] {
+        assert_http(
+            &server,
+            "POST /v1/logs",
+            &[("Content-Type", content_type)],
+            &logs_pb,
+            202,
+            LOGS_BUFFERED,
+        );
+    }
+    for content_type in ["APPLICATION/JSON ; charset=utf-8", "application/otlp+json"] {
+        assert_http(
+            &server,
+            "POST /v1/logs",
+            &[("Content-Type", content_type)],
+            LOG_JSON,
+            202,
+            LOGS_BUFFERED,
+        );
+    }
+    for content_type in ["application/x-ndjson", "application/jsonl"] {
+        assert_http(
+            &server,
+            "POST /v1/logs",
+            &[("Content-Type", content_type)],
+            &jsonl,
+            202,
+            r#"{"status":"buffered","rows":2,"batches":1}"#,
+        );
+    }
+    let delivered = server.host.delivered();
+    assert_eq!(delivered.len(), 7);
+    for message in &delivered[..3] {
+        assert_shapes(message, logs_pb.len(), &[OtlpSignalType::Logs]);
+    }
+    for message in &delivered[3..5] {
+        assert_shapes(message, LOG_JSON.len(), &[OtlpSignalType::Logs]);
+    }
+    for message in &delivered[5..] {
+        assert_eq!(message.input_bytes, jsonl.len() as u64);
+        assert_eq!(message.batches.len(), 1);
+        assert_eq!(message.batches[0].signal, OtlpSignalType::Logs);
+        assert_eq!(message.batches[0].rows, 2);
+    }
+}
+
+#[test]
+fn http_delivers_traces_and_all_metric_shapes() {
+    let server = Server::start(Options::default(), Host::default());
+    let trace = span_request().encode_to_vec();
+    let protobuf = &[("Content-Type", "application/x-protobuf")];
+    assert_http(
+        &server,
+        "POST /v1/traces",
+        protobuf,
+        &trace,
+        202,
+        LOGS_BUFFERED,
+    );
+    assert_http(
+        &server,
+        "POST /v1/metrics",
+        protobuf,
+        METRICS_PB,
+        202,
+        r#"{"status":"buffered","rows":4,"batches":4,"skipped":{"summaries":1,"nan_values":0,"infinity_values":0,"missing_values":0}}"#,
+    );
+    assert_http(
+        &server,
+        "POST /v1/metrics",
+        protobuf,
+        b"",
+        202,
+        r#"{"status":"buffered","rows":0,"batches":0,"skipped":{"summaries":0,"nan_values":0,"infinity_values":0,"missing_values":0}}"#,
+    );
+    assert_http(
+        &server,
+        "POST /v1/logs",
+        protobuf,
+        b"",
+        202,
+        r#"{"status":"buffered","rows":0,"batches":0}"#,
+    );
+    let delivered = server.host.delivered();
+    assert_eq!(delivered.len(), 4);
+    assert_shapes(&delivered[0], trace.len(), &[OtlpSignalType::Traces]);
+    assert_shapes(&delivered[1], METRICS_PB.len(), &METRIC_SIGNALS);
+    assert_shapes(&delivered[2], 0, &[]);
+    assert_eq!(delivered[3].batches.len(), 1);
+    assert_eq!(delivered[3].batches[0].rows, 0);
+}
+
+fn gzip(body: &[u8]) -> Vec<u8> {
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(body).unwrap();
+    encoder.finish().unwrap()
+}
+
+fn deflate(body: &[u8]) -> Vec<u8> {
+    let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(body).unwrap();
+    encoder.finish().unwrap()
+}
+
+#[test]
+fn http_checks_encodings_and_reports_decoded_bytes() {
+    let server = Server::start(Options::default(), Host::default());
+    let (left, right) = LOG_JSON.split_at(LOG_JSON.len() / 2);
+    for (encoding, body) in [
+        ("GZiP", gzip(LOG_JSON)),
+        ("gzip", [gzip(left), gzip(right)].concat()),
+        ("deflate", deflate(LOG_JSON)),
+        ("IdEnTiTy", LOG_JSON.to_vec()),
+        ("", LOG_JSON.to_vec()),
+    ] {
+        assert_http(
+            &server,
+            "POST /v1/logs",
+            &[
+                ("Content-Encoding", encoding),
+                ("Content-Type", "application/json"),
+            ],
+            &body,
+            202,
+            LOGS_BUFFERED,
+        );
+    }
+    assert_http(
+        &server,
+        "POST /v1/logs",
+        &[("Content-Encoding", "Br")],
+        b"",
+        415,
+        r#"{"error":"request_failed","message":"unsupported content-encoding Br"}"#,
+    );
+    let mut truncated = deflate(LOG_JSON);
+    truncated.pop();
+    for (encoding, body) in [("gzip", b"not gzip".as_slice()), ("deflate", &truncated)] {
+        let (status, response) = http(
+            &server.addr,
+            "POST /v1/logs",
+            &[
+                ("Content-Encoding", encoding),
+                ("Content-Type", "application/json"),
+            ],
+            body,
+        );
+        assert_eq!(status, 400);
+        assert!(
+            response.starts_with(r#"{"error":"bad_request","message":"failed to decompress body:"#),
+            "{response}"
+        );
+    }
+    let delivered = server.host.delivered();
+    assert_eq!(delivered.len(), 5);
+    for message in delivered {
+        assert_shapes(&message, LOG_JSON.len(), &[OtlpSignalType::Logs]);
+    }
+}
+
+#[test]
+fn http_authentication_precedes_content_checks_and_body_read() {
+    let server = Server::start(
+        Options {
+            token: Some(b"s3cret"),
+            ..Options::default()
+        },
+        Host::default(),
+    );
+    for headers in REJECTED_HEADERS {
+        assert_http(
+            &server,
+            "POST /v1/logs",
+            headers,
+            LOG_JSON,
+            401,
+            UNAUTHORIZED,
+        );
+    }
+    let head = format!(
+        "POST /v1/logs HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nExpect: 100-continue\r\nContent-Length: 100\r\n\r\n",
+        server.addr
+    );
+    let response = String::from_utf8(exchange(&server.addr, head.as_bytes()).unwrap()).unwrap();
+    let (headers, body) = response.split_once("\r\n\r\n").unwrap();
+    assert!(headers.starts_with("HTTP/1.1 401"), "{headers}");
+    assert_eq!(body, UNAUTHORIZED);
+    assert!(server.host.delivered().is_empty());
+
+    for headers in ACCEPTED_HEADERS {
+        let mut headers = headers.to_vec();
+        headers.push(("Content-Type", "application/json"));
+        assert_http(
+            &server,
+            "POST /v1/logs",
+            &headers,
+            LOG_JSON,
+            202,
+            LOGS_BUFFERED,
+        );
+    }
+    assert_eq!(server.host.delivered().len(), ACCEPTED_HEADERS.len());
+}
+
+#[test]
+fn grpc_authentication_precedes_message_decoding() {
+    let server = Server::start(
+        Options {
+            token: Some(b"s3cret"),
+            max_decoding: 1,
+            ..Options::default()
+        },
+        Host::default(),
+    );
+    let rt = runtime();
+    let status = rt
+        .block_on(export_logs(server.url(), &[], None))
+        .unwrap_err();
+    assert_eq!(status.code(), Code::Unauthenticated);
+    let status = rt
+        .block_on(export_logs(server.url(), ACCEPTED_HEADERS[0], None))
+        .unwrap_err();
+    assert_eq!(status.code(), Code::OutOfRange);
+    assert!(server.host.delivered().is_empty());
+}
+
+#[test]
+fn start_validates_and_copies_the_auth_token() {
+    let host = Box::<Host>::default();
+    let mut err = [0; 256];
+    for (token, expected) in [
+        (b"".as_slice(), "auth_token is empty"),
+        (b"\xff".as_slice(), "auth_token is not valid UTF-8"),
+    ] {
+        let config = configuration(
+            &host,
+            Options {
+                token: Some(token),
+                ..Options::default()
+            },
+        );
+        assert!(start("127.0.0.1:0", &config, &mut err).is_null());
+        assert_eq!(
+            unsafe { std::ffi::CStr::from_ptr(err.as_ptr()) }
+                .to_str()
+                .unwrap(),
+            expected
+        );
+    }
+    let mut token = b"s3cret".to_vec();
+    let server = Server::start(
+        Options {
+            token: Some(&token),
+            ..Options::default()
+        },
+        Host::default(),
+    );
+    token.fill(b'x');
+    assert_http(
+        &server,
+        "POST /v1/logs",
+        &[
+            ("x-api-key", "s3cret"),
+            ("Content-Type", "application/json"),
+        ],
+        LOG_JSON,
+        202,
+        LOGS_BUFFERED,
+    );
+}
+
+#[test]
+fn http_limits_wire_and_decompressed_bodies() {
+    let server = Server::start(
+        Options {
+            max_decoding: 128,
+            ..Options::default()
+        },
+        Host::default(),
+    );
+    let body = vec![b' '; 4096];
+    assert_http(
+        &server,
+        "POST /v1/logs",
+        &[("Content-Type", "application/json")],
+        &body,
+        413,
+        r#"{"error":"request_failed","message":"payload has 4096 bytes; max is 128"}"#,
+    );
+    let chunked = [b"1000\r\n", body.as_slice(), b"\r\n0\r\n\r\n"].concat();
+    assert_http(
+        &server,
+        "POST /v1/logs",
+        &[
+            ("Transfer-Encoding", "chunked"),
+            ("Content-Type", "application/json"),
+        ],
+        &chunked,
+        413,
+        r#"{"error":"request_failed","message":"payload exceeds 128 bytes"}"#,
+    );
+    let corrupt_chunked = [b"8\r\nnot gzip\r\n".as_slice(), &chunked].concat();
+    assert_http(
+        &server,
+        "POST /v1/logs",
+        &[
+            ("Transfer-Encoding", "chunked"),
+            ("Content-Encoding", "gzip"),
+            ("Content-Type", "application/json"),
+        ],
+        &corrupt_chunked,
+        413,
+        r#"{"error":"request_failed","message":"payload exceeds 128 bytes"}"#,
+    );
+    for (encoding, compressed) in [("gzip", gzip(&body)), ("deflate", deflate(&body))] {
+        assert!(compressed.len() < 128);
+        assert_http(
+            &server,
+            "POST /v1/logs",
+            &[
+                ("Content-Encoding", encoding),
+                ("Content-Type", "application/json"),
+            ],
+            &compressed,
+            413,
+            r#"{"error":"request_failed","message":"payload exceeds 128 bytes"}"#,
+        );
+    }
+    assert!(server.host.delivered().is_empty());
+
+    let mut boundary = LOG_JSON.to_vec();
+    boundary.resize(128, b' ');
+    assert_http(
+        &server,
+        "POST /v1/logs",
+        &[
+            ("Content-Encoding", "gzip"),
+            ("Content-Type", "application/json"),
+        ],
+        &gzip(&boundary),
+        202,
+        LOGS_BUFFERED,
+    );
+    assert_shapes(&server.host.delivered()[0], 128, &[OtlpSignalType::Logs]);
+}
+
+#[test]
+fn http_rejects_unsupported_and_unparseable_payloads() {
+    let server = Server::start(Options::default(), Host::default());
+    assert_http(
+        &server,
+        "POST /v1/logs",
+        &[],
+        LOG_JSON,
+        415,
+        r#"{"error":"request_failed","message":"unsupported content-type <missing>"}"#,
+    );
+    assert_http(
+        &server,
+        "POST /v1/logs",
+        &[("Content-Type", " Text/Plain ; charset=UTF-8")],
+        LOG_JSON,
+        415,
+        r#"{"error":"request_failed","message":"unsupported content-type text/plain"}"#,
+    );
+    let (status, response) = http(
+        &server.addr,
+        "POST /v1/logs",
+        &[("Content-Type", "application/json")],
+        b"no JSON",
+    );
+    assert_eq!(status, 400);
+    assert!(
+        response.starts_with(r#"{"error":"bad_request","message":"failed to transform logs:"#),
+        "{response}"
+    );
+    assert!(server.host.delivered().is_empty());
+}
+
+#[test]
+fn http_and_grpc_report_host_status_and_detail() {
+    for (reply, grpc_code, http_status, response) in [
+        (
+            OtlpIngestStatus::ResourceExhausted,
+            Code::ResourceExhausted,
+            503,
+            r#"{"error":"request_failed","message":"try \"later\""}"#,
+        ),
+        (
+            OtlpIngestStatus::Invalid,
+            Code::InvalidArgument,
+            400,
+            r#"{"error":"bad_request","message":"try \"later\""}"#,
+        ),
+        (
+            OtlpIngestStatus::Internal,
+            Code::Internal,
+            500,
+            r#"{"error":"internal_error","message":"try \"later\""}"#,
+        ),
+    ] {
+        let server = Server::start(
+            Options::default(),
+            Host {
+                reply: Some(reply),
+                detail: b"try \"later\"\0ignored",
+                ..Host::default()
+            },
+        );
+        assert_http(
+            &server,
+            "POST /v1/logs",
+            &[("Content-Type", "application/json")],
+            LOG_JSON,
+            http_status,
+            response,
+        );
+        let rt = runtime();
+        let grpc = rt
+            .block_on(export_logs(server.url(), &[], None))
+            .unwrap_err();
+        assert_eq!(grpc.code(), grpc_code);
+        assert_eq!(grpc.message(), "try \"later\"");
+        let acks = rt
+            .block_on(arrow_logs(
+                server.url(),
+                &[],
+                None,
+                vec![envelope(7, OTAP_LOGS_INITIAL)],
+            ))
+            .unwrap();
+        assert_eq!(acks.len(), 1);
+        assert_eq!(acks[0].status_code, grpc_code as i32);
+        assert_eq!(acks[0].status_message, "try \"later\"");
+    }
+}
+
+#[test]
+fn callback_detail_is_bounded_and_lossy() {
+    static DETAIL: [u8; 256] = [0xff; 256];
+    let server = Server::start(
+        Options::default(),
+        Host {
+            reply: Some(OtlpIngestStatus::Invalid),
+            detail: &DETAIL,
+            ..Host::default()
+        },
+    );
+    let (status, body) = http(
+        &server.addr,
+        "POST /v1/logs",
+        &[("Content-Type", "application/json")],
+        LOG_JSON,
+    );
+    assert_eq!(status, 400);
+    assert_eq!(
+        body,
+        format!(
+            r#"{{"error":"bad_request","message":"{}"}}"#,
+            "�".repeat(256)
+        )
+    );
+}
+
+#[test]
+fn http_health_and_readiness() {
+    for (readiness, status, response) in [
+        (None, 200, r#"{"status":"ready"}"#),
+        (
+            Some((true, b"unused".as_slice())),
+            200,
+            r#"{"status":"ready"}"#,
+        ),
+        (
+            Some((false, b"seal \"stalled\"".as_slice())),
+            503,
+            r#"{"status":"degraded","reason":"seal \"stalled\""}"#,
+        ),
+        (
+            Some((false, b"".as_slice())),
+            503,
+            r#"{"status":"degraded","reason":"not ready"}"#,
+        ),
+    ] {
+        let server = Server::start(
+            Options {
+                token: Some(b"secret"),
+                ..Options::default()
+            },
+            Host {
+                readiness,
+                ..Host::default()
+            },
+        );
+        assert_http(&server, "GET /healthz", &[], b"", 200, r#"{"status":"ok"}"#);
+        assert_eq!(server.host.readiness_calls.load(Ordering::SeqCst), 0);
+        assert_http(&server, "GET /readyz", &[], b"", status, response);
+        assert_eq!(
+            server.host.readiness_calls.load(Ordering::SeqCst),
+            usize::from(readiness.is_some())
+        );
+        assert!(server.host.delivered().is_empty());
+    }
+}
+
+#[test]
+fn http_and_grpc_share_one_port_when_enabled() {
+    let rt = runtime();
+    let http_only = Server::start(
+        Options {
+            services: OTLP_INGEST_SERVE_OTLP_HTTP,
+            ..Options::default()
+        },
+        Host::default(),
+    );
+    let status = rt
+        .block_on(export_logs(http_only.url(), &[], None))
+        .unwrap_err();
+    assert_eq!(status.code(), Code::Unimplemented);
+    assert!(http_only.host.delivered().is_empty());
+    assert_http(
+        &http_only,
+        "POST /v1/logs",
+        &[("Content-Type", "application/json")],
+        LOG_JSON,
+        202,
+        LOGS_BUFFERED,
+    );
+
+    let grpc_only = Server::start(
+        Options {
+            services: OTLP_INGEST_SERVE_OTLP_GRPC,
+            ..Options::default()
+        },
+        Host::default(),
+    );
+    let response = http_exchange(&grpc_only.addr, "GET /healthz", &[], b"");
+    match response {
+        Ok(response) => assert!(response.is_empty(), "{response:?}"),
+        Err(error) => assert!(
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe
+            ),
+            "{error}"
+        ),
+    }
+
+    let shared = Server::start(
+        Options {
+            token: Some(b"s3cret"),
+            ..Options::default()
+        },
+        Host::default(),
+    );
+    assert_http(
+        &shared,
+        "POST /v1/logs",
+        &[
+            ("Content-Type", "application/json"),
+            ("x-api-key", "s3cret"),
+        ],
+        LOG_JSON,
+        202,
+        LOGS_BUFFERED,
+    );
+    rt.block_on(export_logs(shared.url(), ACCEPTED_HEADERS[2], None))
+        .unwrap();
+    assert_eq!(shared.host.delivered().len(), 2);
+    for path in [
+        "/does-not-exist",
+        "/opentelemetry.proto.collector.logs.v1.LogsService/Unknown",
+    ] {
+        assert_eq!(http(&shared.addr, &format!("GET {path}"), &[], b"").0, 404);
+        let status = rt
+            .block_on(arrow_stream(shared.url(), path, &[], None, vec![]))
+            .unwrap_err();
+        assert_eq!(status.code(), Code::Unimplemented);
+    }
+}
+
+#[test]
+fn grpc_unary_and_otap_deliver_one_message_with_all_metric_shapes() {
+    let server = Server::start(Options::default(), Host::default());
+    let request = ExportMetricsServiceRequest::decode(METRICS_PB).unwrap();
+    let input_bytes = request.encoded_len();
+    let otap = envelope(13, OTAP_METRICS);
+    let otap_bytes = otap.encoded_len();
+    runtime().block_on(async {
+        let mut client = MetricsServiceClient::connect(server.url()).await.unwrap();
+        client.export(request).await.unwrap();
+        client
+            .export(ExportMetricsServiceRequest::default())
+            .await
+            .unwrap();
+        let acks = arrow_stream(server.url(), ARROW_METRICS, &[], None, vec![otap])
+            .await
+            .unwrap();
+        assert_eq!(acks.len(), 1);
+        assert_eq!(
+            (acks[0].batch_id, acks[0].status_code),
+            (13, StatusCode::Ok as i32)
+        );
+    });
+    let delivered = server.host.delivered();
+    assert_eq!(delivered.len(), 3);
+    assert_shapes(&delivered[0], input_bytes, &METRIC_SIGNALS);
+    assert_shapes(&delivered[1], 0, &[]);
+    assert_shapes(&delivered[2], otap_bytes, &METRIC_SIGNALS);
+}
+
+#[test]
+fn http_profile_refusal_delivers_no_metric_shapes() {
+    use opentelemetry_proto::tonic::metrics::v1::metric;
+    let server = Server::start(
+        Options {
+            profile: OtlpArrowProfile::DuckDb,
+            ..Options::default()
+        },
+        Host::default(),
+    );
+    let mut request = ExportMetricsServiceRequest::decode(METRICS_PB).unwrap();
+    let metrics = &mut request.resource_metrics[0].scope_metrics[0].metrics;
+    let Some(metric::Data::Histogram(histogram)) = &mut metrics[2].data else {
+        panic!("fixture histogram");
+    };
+    histogram.data_points[0].count = u64::MAX;
+    assert_http(
+        &server,
+        "POST /v1/metrics",
+        &[("Content-Type", "application/x-protobuf")],
+        &request.encode_to_vec(),
+        400,
+        r#"{"error":"bad_request","message":"invalid payload"}"#,
+    );
+    assert!(server.host.delivered().is_empty());
+}
+
+#[test]
+fn http_stop_waits_for_in_flight_callback_and_rejects_late_traffic() {
+    let host = Host::default();
+    host.callback_sleep_ms.store(400, Ordering::SeqCst);
+    let server = Server::start(Options::default(), host);
+    let addr = &server.addr;
+    let headers = &[("Content-Type", "application/json")];
+    std::thread::scope(|scope| {
+        let first = scope.spawn(|| http_exchange(addr, "POST /v1/logs", headers, LOG_JSON));
+        wait_until("the HTTP callback to start", || server.host.in_callback());
+        let late = scope.spawn(|| {
+            wait_until("the listener to stop accepting", || {
+                TcpStream::connect(addr).is_err()
+            });
+            assert!(http_exchange(addr, "POST /v1/logs", headers, LOG_JSON).is_err());
+        });
+        server.stop(10);
+        assert!(!server.host.in_callback());
+        let _ = first.join().unwrap();
+        late.join().unwrap();
+    });
+    assert_eq!(server.host.delivered().len(), 1);
 }

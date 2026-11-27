@@ -43,11 +43,20 @@ impl ExportedBatch {
         std::ptr::write(schema, self.schema);
     }
 
+    #[cfg(all(feature = "server", not(target_arch = "wasm32")))]
     pub(crate) fn lend<R>(
-        mut self,
-        f: impl FnOnce(*mut FFI_ArrowArray, *mut FFI_ArrowSchema) -> R,
+        batches: &mut [(crate::ffi::OtlpSignalType, Self)],
+        f: impl FnOnce(&[crate::server_ffi::OtlpIngestBatch]) -> R,
     ) -> R {
-        f(&mut self.array, &mut self.schema)
+        let borrowed: Vec<_> = batches
+            .iter_mut()
+            .map(|(signal_type, batch)| crate::server_ffi::OtlpIngestBatch {
+                signal_type: *signal_type,
+                array: &mut batch.array,
+                schema: &mut batch.schema,
+            })
+            .collect();
+        f(&borrowed)
     }
 
     fn into_c(self) -> OtlpArrowBatch {
