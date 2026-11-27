@@ -427,11 +427,23 @@ let batch = ArrowProfile::DuckDb.apply(transform_traces(bytes, InputFormat::Prot
 let schema = ArrowProfile::DuckDb.schema(&otlp2records::traces_schema());
 ```
 
-Over the C ABI, each entry point has a `*_with_profile` variant taking an
-`OtlpArrowProfile` (`otlp_get_schema_with_profile`,
-`otlp_transform_with_profile`, `otlp_transform_metrics_all_with_profile`,
-`otlp_otap_decoder_new_with_profile`, `otlp_grpc_server_start_with_profile`);
-see `include/otlp2records.h`. The profile-less functions are unchanged.
+The C transform and decoder APIs accept an `OtlpArrowProfile` through their
+`*_with_profile` variants. The ingest server selects the profile in
+`OtlpIngestServerConfig`. See [the C header](include/otlp2records.h).
+
+## Embedded ingest server
+
+The native `server` feature exposes `otlp_ingest_server_start` through the C
+ABI. One port can serve OTLP/gRPC exports, OTAP/Arrow streams and OTLP/HTTP.
+The host gets one callback per message with all its Arrow batches. An optional
+token can be supplied as an Authorization bearer token or `x-api-key`.
+
+OTLP/HTTP accepts protobuf, JSON, and newline-delimited JSON at
+`POST /v1/logs`, `/v1/traces` and `/v1/metrics`, with optional gzip or deflate
+compression. A 202 response reports buffered rows and batches, plus skipped
+counts for metrics. `GET /healthz` checks liveness and `GET /readyz` reports
+host readiness. See [the C header](include/otlp2records.h) for the server config
+and response contract.
 
 ## Performance
 

@@ -26,8 +26,8 @@ mod validation;
 mod wire;
 
 // Vendored tonic server stub for the canonical OTAP ArrowLogsService. Only built
-// for the native gRPC ingest server (it pulls in tonic's server/transport).
-#[cfg(all(feature = "grpc", not(target_arch = "wasm32")))]
+// for the native ingest server (it pulls in tonic's server/transport).
+#[cfg(all(feature = "server", not(target_arch = "wasm32")))]
 pub mod grpc_service;
 
 pub use decoder::OtapDecoder;

@@ -1,5 +1,5 @@
-//! The host frees `user_data` as soon as `otlp_grpc_server_stop` returns, so no
-//! batch or auth callback may be running, or start, after that. Tokio cannot
+//! The host frees `user_data` as soon as `otlp_ingest_server_stop` returns, so no
+//! message or readiness callback may be running, or start, after that. Tokio cannot
 //! enforce this: a callback is synchronous host code that a runtime shutdown or
 //! a drain deadline cannot interrupt.
 

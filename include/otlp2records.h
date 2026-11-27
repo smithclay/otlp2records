@@ -117,7 +117,7 @@ typedef enum OtlpStatus {
  *
  * Everything else (including Timestamp(ns) "tsn:") is unchanged, and nulls
  * stay null. A UInt32/UInt64 value above the signed maximum is an error, not
- * a wrap: the transform/decode returns OTLP_ERROR_PARSE_FAILED and the gRPC
+ * a wrap: the transform/decode returns OTLP_ERROR_PARSE_FAILED and the ingest
  * server answers INVALID_ARGUMENT without invoking the batch callback.
  */
 typedef enum OtlpArrowProfile {
@@ -472,185 +472,126 @@ OtlpStatus otlp_otap_decode_with_options(
 );
 
 /* ============================================================================
- * Native gRPC Ingest Server
+ * Native Ingest Server (Cargo feature "server")
  *
- * Embeds a tonic (Rust) gRPC server on its own runtime threads and pushes each
- * decoded Arrow batch back through a host callback. This is the live-ingest
- * counterpart to otlp_transform()/the OTAP decoder: rather than the host
- * feeding bytes in and pulling Arrow out, the host starts a server and Arrow
- * batches arrive as telemetry is received over the wire.
- *
- * Serves all six signals over two service families on one listener: standard
- * OTLP/gRPC unary Export ({Logs,Trace,Metrics}Service) and canonical OTAP/Arrow
- * bidirectional streaming (Arrow{Logs,Traces,Metrics}Service). The callback ABI
- * carries stream_id/batch_id so the unary and streaming paths share one
- * signature; unary requests use 0 for both.
- *
- * Native only: this API is absent from wasm builds (no runtime/sockets).
+ * One listener and runtime for OTLP/gRPC, OTAP/gRPC and OTLP/HTTP.
  * ============================================================================ */
 
-/**
- * @brief Outcome the host's batch callback reports to the server.
- *
- * Mapped to a gRPC status (and, for streaming, an OTAP BatchStatus).
- */
 typedef enum OtlpIngestStatus {
-    /** Buffered successfully -> gRPC OK */
-    OTLP_INGEST_OK = 0,
-    /** Ingest buffer full (backpressure) -> gRPC RESOURCE_EXHAUSTED */
-    OTLP_INGEST_RESOURCE_EXHAUSTED = 1,
-    /** Malformed/unconvertible payload -> gRPC INVALID_ARGUMENT */
-    OTLP_INGEST_INVALID = 2,
-    /** Host-side internal error -> gRPC INTERNAL */
-    OTLP_INGEST_INTERNAL = 3,
-    /** Rejected by auth -> gRPC UNAUTHENTICATED */
-    OTLP_INGEST_UNAUTHENTICATED = 4,
+    OTLP_INGEST_OK = 0,                 /**< Buffered */
+    OTLP_INGEST_RESOURCE_EXHAUSTED = 1, /**< Backpressure */
+    OTLP_INGEST_INVALID = 2,            /**< Payload the host cannot accept */
+    OTLP_INGEST_INTERNAL = 3,           /**< Host-side failure */
 } OtlpIngestStatus;
 
-/** Opaque running gRPC server. */
-typedef struct OtlpGrpcServer OtlpGrpcServer;
+/** OR these service bits together. Zero serves all three on one port. */
+#define OTLP_INGEST_SERVE_OTLP_GRPC 1u /**< {Logs,Trace,Metrics}Service unary Export */
+#define OTLP_INGEST_SERVE_OTAP_GRPC 2u /**< Arrow{Logs,Traces,Metrics}Service streams */
+#define OTLP_INGEST_SERVE_OTLP_HTTP 4u /**< POST /v1/{logs,traces,metrics}, GET /healthz, /readyz */
+
+/** One decoded Arrow batch, borrowed for the message callback. */
+typedef struct OtlpIngestBatch {
+    OtlpSignalType signal_type;
+    struct ArrowArray* array;
+    struct ArrowSchema* schema;
+} OtlpIngestBatch;
 
 /**
- * @brief service_flags bits for otlp_grpc_server_start: which gRPC service
- *        families the listener registers. OR them together; 0 registers both.
+ * Called once per decoded OTLP Export, OTAP BatchArrowRecords, or HTTP POST.
+ * Logs and traces each pass one batch. Metrics pass every present shape in
+ * gauge, sum, histogram, exponential histogram order. If no shapes are
+ * present, batch_count is zero and batches is NULL.
  *
- * Lets the host keep otlp: (OTLP/gRPC unary Export) and otap: (OTAP/Arrow
- * streaming) as separate listeners with disjoint service sets.
+ * input_bytes is the encoded gRPC message size or decompressed HTTP body size.
+ * The server releases the Arrow arrays and schemas after the callback returns.
+ * Copy any data needed later. The host must never release these structures or
+ * release copies of them. Callbacks can run concurrently on server worker
+ * threads. Catch host exceptions before returning through the C ABI.
+ *
+ * On a refusal, the host may write NUL-terminated UTF-8 into the zero-filled
+ * detail buffer. The server uses it as the gRPC status message, OTAP
+ * status_message, or HTTP error message. Empty detail uses a default message.
  */
-#define OTLP_GRPC_SERVICE_OTLP_UNARY 1u /**< {Logs,Trace,Metrics}Service unary Export */
-#define OTLP_GRPC_SERVICE_OTAP_ARROW 2u /**< Arrow{Logs,Traces,Metrics}Service streaming */
-
-/**
- * @brief Per-batch callback: one decoded Arrow batch destined for a signal.
- *
- * Invoked on a server worker thread. stream_id/batch_id are 0 for unary
- * requests; for streaming they identify the source stream and message.
- * input_bytes is the wire size of the source payload, charged against the
- * host's admission/backpressure budget. It is reported on the first batch
- * delivered from a message and is 0 on the rest, so a metrics message that fans
- * out into several shapes is charged once. The array/schema are borrowed for the
- * duration of the call only and are released by the server after it returns --
- * the callee MUST copy out only the data they reference and MUST NOT call their
- * release callbacks. Do NOT copy the ArrowArray/ArrowSchema structs themselves
- * (e.g. via memcpy) and release the copy later: the server releases the
- * originals on return, so a release on a struct copy is a double-free.
- * The callee must not throw across this boundary; translate any error into an
- * OtlpIngestStatus.
- *
- * @return OTLP_INGEST_OK on success, or an error mapped to a gRPC status.
- *         A non-OK status for one metric shape fails the request without
- *         delivering the later shapes; the earlier ones stay delivered.
- */
-typedef OtlpIngestStatus (*OtlpBatchCallback)(
+typedef OtlpIngestStatus (*OtlpIngestCallback)(
     void* user_data,
-    OtlpSignalType signal_type,
-    uint64_t stream_id,
-    int64_t batch_id,
     uint64_t input_bytes,
-    struct ArrowArray* array,
-    struct ArrowSchema* schema
+    const OtlpIngestBatch* batches,
+    size_t batch_count,
+    char* detail,
+    size_t detail_len
+);
+
+/** Non-zero means ready. Zero may include a NUL-terminated UTF-8 reason. */
+typedef int (*OtlpReadyCallback)(void* user_data, char* reason, size_t reason_len);
+
+typedef struct OtlpIngestServerConfig {
+    void* user_data;
+    OtlpIngestCallback on_message;  /**< Required */
+    OtlpReadyCallback on_ready;     /**< NULL means always ready until shutdown */
+    const char* auth_token;         /**< NULL disables authentication */
+    size_t auth_token_len;
+    uint32_t services;              /**< OTLP_INGEST_SERVE_* bits, zero enables all */
+    OtlpArrowProfile profile;
+    uint64_t max_message_bytes;     /**< Zero uses 4 MiB */
+} OtlpIngestServerConfig;
+
+typedef struct OtlpIngestServer OtlpIngestServer;
+
+/**
+ * Start the server on a UTF-8 "host:port" address. The socket is bound before
+ * the call returns. On failure, returns NULL and writes a truncated,
+ * NUL-terminated message when err_buf and its size are provided.
+ *
+ * If provided, the token must be non-empty UTF-8 and is copied at start.
+ * Ingest requests accept either Authorization: Bearer <token> (the scheme is
+ * case-insensitive) or x-api-key: <token>. Authentication precedes body decoding
+ * and failures return gRPC UNAUTHENTICATED or HTTP 401.
+ *
+ * The profile applies to every batch. If it cannot represent a batch, gRPC
+ * returns INVALID_ARGUMENT or HTTP returns 400 without invoking on_message.
+ * The message limit applies per gRPC message and to both the received and
+ * decompressed HTTP body. The callbacks and user_data must remain valid until
+ * otlp_ingest_server_stop() returns.
+ *
+ * OTLP/HTTP POST accepts protobuf, JSON, and newline-delimited JSON, with
+ * identity, gzip, or zlib-wrapped deflate encoding. Responses use JSON.
+ * Success returns 202 and {"status":"buffered","rows":<r>,"batches":<b>},
+ * where batches counts batches with rows. Metrics add a "skipped" object with
+ * summaries, nan_values, infinity_values and missing_values.
+ *
+ * Errors have "error" and "message" fields. Unsupported media returns 415,
+ * oversized bodies 413, and malformed payloads 400. Host statuses map to
+ * gRPC RESOURCE_EXHAUSTED, INVALID_ARGUMENT or INTERNAL and to HTTP 503,
+ * 400 or 500 respectively. Missing HTTP routes return 404.
+ *
+ * Health checks are unauthenticated. GET /healthz returns 200 and
+ * {"status":"ok"}. GET /readyz returns 200 and {"status":"ready"}, or
+ * 503 and {"status":"degraded","reason":"<reason>"}. The default degraded
+ * reason is "not ready", or "server is stopping" during shutdown.
+ */
+OtlpIngestServer* otlp_ingest_server_start(
+    const char* bind_addr, size_t bind_addr_len,
+    const OtlpIngestServerConfig* config,
+    char* err_buf, size_t err_buf_len
 );
 
 /**
- * @brief Optional auth callback: validate the raw `authorization` metadata.
+ * Stop accepting connections and drain in-flight requests for up to
+ * drain_deadline_ms. Then close callback admission and wait for any running
+ * callbacks, even beyond that deadline. After this returns, user_data may be
+ * freed. Shutdown refusals are gRPC UNAVAILABLE or HTTP 503.
  *
- * @param user_data Opaque host pointer passed to otlp_grpc_server_start()
- * @param metadata_token The `authorization` metadata value (may be empty)
- * @param len Length of metadata_token in bytes
- * @return Non-zero to accept the request, 0 to reject (UNAUTHENTICATED)
- *
- * @note Pass NULL for this callback to accept every request.
+ * A NULL server is a no-op. Repeated stops are safe. When called inside
+ * a callback, stop returns immediately and the server keeps running.
  */
-typedef int (*OtlpAuthCallback)(
-    void* user_data,
-    const char* metadata_token,
-    size_t len
-);
+void otlp_ingest_server_stop(OtlpIngestServer* server, uint64_t drain_deadline_ms);
 
 /**
- * @brief Start a gRPC ingest server bound to "host:port".
- *
- * @param bind_addr Bind address bytes, "host:port" (e.g. "127.0.0.1:4317")
- * @param bind_addr_len Length of bind_addr in bytes
- * @param on_batch Per-batch callback (must be non-NULL)
- * @param on_auth Auth callback, or NULL to disable auth
- * @param user_data Opaque pointer passed verbatim to the callbacks
- * @param service_flags OR of OTLP_GRPC_SERVICE_* bits selecting which gRPC
- *        service families to register; 0 registers both. Use this to keep otlp:
- *        (OTLP/gRPC unary) and otap: (OTAP/Arrow streaming) listeners disjoint.
- * @param max_decoding_message_bytes Cap on a single received gRPC message (one
- *        OTLP Export request or one OTAP BatchArrowRecords), applied to every
- *        service. Pass 0 for tonic's 4 MiB default; raise it when producers send
- *        batches larger than 4 MiB.
- * @param err_buf Optional buffer for an error message on failure (may be NULL)
- * @param err_buf_len Size of err_buf in bytes
- * @return A non-NULL server handle on success; NULL on failure (with err_buf
- *         filled, truncated and null-terminated, when provided).
- *
- * @note The listener is bound synchronously, so address-in-use is reported here.
- * @note user_data and the callbacks must remain valid until
- *       otlp_grpc_server_stop() returns.
+ * Free a server handle, stopping it first if it is still running. When called
+ * inside a callback, free returns immediately and shutdown completes after
+ * the callback returns. A NULL server is a no-op.
  */
-OtlpGrpcServer* otlp_grpc_server_start(
-    const char* bind_addr,
-    size_t bind_addr_len,
-    OtlpBatchCallback on_batch,
-    OtlpAuthCallback on_auth,
-    void* user_data,
-    uint32_t service_flags,
-    uint64_t max_decoding_message_bytes,
-    char* err_buf,
-    size_t err_buf_len
-);
-
-/**
- * @brief otlp_grpc_server_start() with an output profile.
- *
- * Every batch handed to on_batch (OTLP/gRPC unary and OTAP/Arrow streaming,
- * every signal and metric shape) is re-typed for profile first. Identical to
- * otlp_grpc_server_start() for OTLP_ARROW_PROFILE_CANONICAL. A batch the
- * profile cannot represent is answered INVALID_ARGUMENT without invoking
- * on_batch.
- */
-OtlpGrpcServer* otlp_grpc_server_start_with_profile(
-    const char* bind_addr,
-    size_t bind_addr_len,
-    OtlpBatchCallback on_batch,
-    OtlpAuthCallback on_auth,
-    void* user_data,
-    uint32_t service_flags,
-    uint64_t max_decoding_message_bytes,
-    OtlpArrowProfile profile,
-    char* err_buf,
-    size_t err_buf_len
-);
-
-/**
- * @brief Stop the server. Idempotent.
- *
- * Stops accepting connections and drains in-flight requests for up to
- * drain_deadline_ms. Then no new callback is started, and this waits for
- * callbacks already running to return, however long that takes: once it
- * returns, no batch or auth callback is running or will run, so user_data may
- * be freed. Requests refused during shutdown are answered UNAVAILABLE.
- *
- * @param server Handle from otlp_grpc_server_start(), or NULL (a no-op)
- * @param drain_deadline_ms Max time to wait for in-flight requests to drain
- *
- * @note Called from inside a batch/auth callback it returns immediately
- *       without stopping the server.
- */
-void otlp_grpc_server_stop(OtlpGrpcServer* server, uint64_t drain_deadline_ms);
-
-/**
- * @brief Free a server handle, stopping it first if it is still running.
- *
- * Called from inside a batch/auth callback it returns at once, and the server
- * stops after that callback returns.
- *
- * @param server Handle from otlp_grpc_server_start(), or NULL (a no-op)
- */
-void otlp_grpc_server_free(OtlpGrpcServer* server);
+void otlp_ingest_server_free(OtlpIngestServer* server);
 
 /**
  * @brief Get a static message for a status code.

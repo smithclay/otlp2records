@@ -100,7 +100,7 @@ fn every_c_abi_entry_point_routes_through_ffi_boundary() {
 fn the_lint_sees_a_missing_boundary() {
     let unguarded = r#"
         #[no_mangle]
-        pub unsafe extern "C" fn otlp_grpc_server_stop(server: *mut Server, deadline: u64) {
+        pub unsafe extern "C" fn otlp_ingest_server_stop(server: *mut Server, deadline: u64) {
             if server.is_null() { return; }
             (*server).stop(deadline);
         }
@@ -111,7 +111,7 @@ fn the_lint_sees_a_missing_boundary() {
     "#;
     let found = exported_functions(unguarded);
     assert_eq!(found.len(), 2);
-    assert_eq!(found[0].name, "otlp_grpc_server_stop");
+    assert_eq!(found[0].name, "otlp_ingest_server_stop");
     assert!(!found[0].body.contains("ffi_boundary("));
     assert!(found[1].body.contains("ffi_boundary("));
 }
