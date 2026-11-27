@@ -6,7 +6,7 @@ use axum::extract::{Request, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{on, post, MethodFilter};
+use axum::routing::{get, post};
 use axum::Router;
 use flate2::write::{MultiGzDecoder, ZlibDecoder};
 use serde::Serialize;
@@ -20,8 +20,8 @@ use crate::{transform_logs, transform_metrics, transform_traces, InputFormat, Tr
 
 pub(super) fn routes(grpc: Router, host: Arc<Host>) -> Routes {
     let http = Router::new()
-        .route("/healthz", on(MethodFilter::GET, health))
-        .route("/readyz", on(MethodFilter::GET, ready))
+        .route("/healthz", get(health))
+        .route("/readyz", get(ready))
         .route(
             "/v1/logs",
             post(|State(host), request| post_message(host, TransformSignal::Logs, request)),
@@ -127,7 +127,6 @@ fn refusal_response(refusal: Refusal) -> Response {
 
 async fn post_message(host: Arc<Host>, signal: TransformSignal, request: Request) -> Response {
     let (parts, body) = request.into_parts();
-    let stopping = host.cancel.is_cancelled();
     let header_bytes = |key| {
         parts
             .headers
@@ -144,7 +143,7 @@ async fn post_message(host: Arc<Host>, signal: TransformSignal, request: Request
             "missing or invalid Authorization bearer token or x-api-key",
         );
     }
-    if stopping {
+    if host.cancel.is_cancelled() {
         return refusal_response(Refusal::STOPPING);
     }
 
@@ -306,7 +305,6 @@ async fn read_body(body: Body, encoding: Encoding, limit: usize) -> Result<Vec<u
 async fn read_wire<W: Write>(body: Body, mut output: W, limit: usize) -> Result<W, Response> {
     let mut wire = body.into_data_stream();
     let mut read = 0;
-    let mut corrupt = None;
     while let Some(chunk) = wire.next().await {
         let bytes = chunk.map_err(|err| {
             error(
@@ -319,21 +317,11 @@ async fn read_wire<W: Write>(body: Body, mut output: W, limit: usize) -> Result<
             return Err(payload_exceeds(limit));
         }
         read += bytes.len();
-        if corrupt.is_none() {
-            if let Err(err) = output.write_all(&bytes) {
-                if err.kind() == io::ErrorKind::FileTooLarge {
-                    return Err(payload_exceeds(limit));
-                }
-                // Keep counting the wire bytes to detect a size violation on a
-                // chunked request even when its compressed stream is corrupt.
-                corrupt = Some(err);
-            }
-        }
+        output
+            .write_all(&bytes)
+            .map_err(|err| decompression_error(err, limit))?;
     }
-    match corrupt {
-        Some(err) => Err(decompression_error(err, limit)),
-        None => Ok(output),
-    }
+    Ok(output)
 }
 
 fn payload_exceeds(limit: usize) -> Response {
@@ -356,7 +344,7 @@ fn decompression_error(err: io::Error, limit: usize) -> Response {
     }
 }
 
-/// A streaming sink whose capacity never exceeds the decoded size limit.
+/// The decoded body, refusing writes past the size limit.
 struct Payload {
     bytes: Vec<u8>,
     limit: usize,
@@ -366,12 +354,6 @@ impl Write for Payload {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         if bytes.len() > self.limit - self.bytes.len() {
             return Err(io::ErrorKind::FileTooLarge.into());
-        }
-        let needed = self.bytes.len() + bytes.len();
-        let capacity = self.bytes.capacity();
-        if needed > capacity {
-            let target = needed.max(capacity.saturating_mul(2)).min(self.limit);
-            self.bytes.reserve_exact(target - self.bytes.len());
         }
         self.bytes.extend_from_slice(bytes);
         Ok(bytes.len())

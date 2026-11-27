@@ -1100,19 +1100,6 @@ fn http_limits_wire_and_decompressed_bodies() {
         413,
         r#"{"error":"request_failed","message":"payload exceeds 128 bytes"}"#,
     );
-    let corrupt_chunked = [b"8\r\nnot gzip\r\n".as_slice(), &chunked].concat();
-    assert_http(
-        &server,
-        "POST /v1/logs",
-        &[
-            ("Transfer-Encoding", "chunked"),
-            ("Content-Encoding", "gzip"),
-            ("Content-Type", "application/json"),
-        ],
-        &corrupt_chunked,
-        413,
-        r#"{"error":"request_failed","message":"payload exceeds 128 bytes"}"#,
-    );
     for (encoding, compressed) in [("gzip", gzip(&body)), ("deflate", deflate(&body))] {
         assert!(compressed.len() < 128);
         assert_http(
@@ -1294,6 +1281,7 @@ fn http_health_and_readiness() {
             },
         );
         assert_http(&server, "GET /healthz", &[], b"", 200, r#"{"status":"ok"}"#);
+        assert_http(&server, "HEAD /healthz", &[], b"", 200, "");
         assert_eq!(server.host.readiness_calls.load(Ordering::SeqCst), 0);
         assert_http(&server, "GET /readyz", &[], b"", status, response);
         assert_eq!(
