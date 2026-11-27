@@ -43,17 +43,17 @@ pub mod ffi;
 #[path = "bindings/export.rs"]
 mod ffi_export;
 
-#[cfg(all(feature = "grpc", not(target_arch = "wasm32")))]
-#[path = "bindings/grpc_ffi.rs"]
-pub mod grpc_ffi;
+#[cfg(all(feature = "server", not(target_arch = "wasm32")))]
+#[path = "bindings/server_ffi.rs"]
+pub mod server_ffi;
 
-#[cfg(all(feature = "grpc", not(target_arch = "wasm32")))]
-#[path = "bindings/grpc_gate.rs"]
-mod grpc_gate;
+#[cfg(all(feature = "server", not(target_arch = "wasm32")))]
+#[path = "bindings/server_gate.rs"]
+mod server_gate;
 
-#[cfg(all(test, feature = "grpc", not(target_arch = "wasm32")))]
-#[path = "bindings/grpc_lifecycle_model.rs"]
-mod grpc_lifecycle_model;
+#[cfg(all(test, feature = "server", not(target_arch = "wasm32")))]
+#[path = "bindings/server_lifecycle_model.rs"]
+mod server_lifecycle_model;
 
 #[cfg(all(feature = "wasm", target_arch = "wasm32"))]
 #[path = "bindings/wasm.rs"]

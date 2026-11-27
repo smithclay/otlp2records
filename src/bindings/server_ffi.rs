@@ -22,7 +22,7 @@ use tonic::Code;
 
 use crate::ffi::{OtlpArrowProfile, OtlpSignalType};
 use crate::ffi_export::{ffi_boundary, ExportError, ExportedBatch, ExportedMetrics};
-use crate::grpc_gate::{in_host_call, CallbackGate};
+use crate::server_gate::{in_host_call, CallbackGate};
 use crate::otap::grpc_service::{
     ArrowLogsService, ArrowLogsServiceServer, ArrowMetricsService, ArrowMetricsServiceServer,
     ArrowTracesService, ArrowTracesServiceServer,
@@ -635,7 +635,7 @@ fn start_server(
                 .map(|n| n.get().clamp(1, 4))
                 .unwrap_or(2),
         )
-        .thread_name("otlp-grpc")
+        .thread_name("otlp-ingest")
         .enable_all()
         .build()
         .map_err(|e| format!("failed to start runtime: {e}"))?;

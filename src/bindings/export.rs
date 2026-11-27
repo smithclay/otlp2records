@@ -157,7 +157,7 @@ impl ExportedMetrics {
         );
     }
 
-    #[cfg(all(feature = "grpc", not(target_arch = "wasm32")))]
+    #[cfg(all(feature = "server", not(target_arch = "wasm32")))]
     pub(crate) fn into_shapes(
         self,
     ) -> impl Iterator<Item = (crate::ffi::OtlpSignalType, ExportedBatch)> {

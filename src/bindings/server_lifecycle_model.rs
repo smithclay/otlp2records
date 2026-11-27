@@ -1,6 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 
-use crate::grpc_gate::GateState;
+use crate::server_gate::GateState;
 
 const WORKERS: usize = 2;
 const MESSAGES: u8 = 2;

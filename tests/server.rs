@@ -1,4 +1,4 @@
-#![cfg(feature = "grpc")]
+#![cfg(feature = "server")]
 
 use std::ffi::{c_char, c_int, c_void};
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
@@ -12,7 +12,7 @@ use opentelemetry_proto::tonic::collector::trace::v1::trace_service_client::Trac
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
 use otlp2records::ffi::{OtlpArrowProfile, OtlpSignalType};
-use otlp2records::grpc_ffi::{
+use otlp2records::server_ffi::{
     otlp_grpc_server_free, otlp_grpc_server_start_with_profile, otlp_grpc_server_stop,
     OtlpGrpcServer, OtlpIngestStatus, OTLP_GRPC_SERVICE_OTAP_ARROW, OTLP_GRPC_SERVICE_OTLP_UNARY,
 };

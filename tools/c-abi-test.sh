@@ -2,7 +2,7 @@
 set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$root"
-features="grpc,otap-zstd"
+features="server,otap-zstd"
 native_libs="$(cargo rustc --color never --lib --features "$features" --crate-type staticlib -- --print native-static-libs 2>&1 \
     | sed -n 's/.*native-static-libs: //p' | tail -1)"
 out="${TMPDIR:-/tmp}/otlp2records-c-abi"

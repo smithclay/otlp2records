@@ -22,7 +22,7 @@ tonic-prost = "0.14"
 # independently of the rest of that workspace (and MSRV 1.87), so it is safe to
 # depend on from this crate and from wasm32.
 otel-arrow-dfe-pdata-views = "0.54"
-# gRPC ingest server (native-only, behind the `grpc` feature). tokio and tonic's
+# gRPC ingest server (native-only, behind the `server` feature). tokio and tonic's
 # transport/server are pulled in only when that feature is enabled, so the base
 # build stays synchronous and wasm32-safe.
 tokio = { version = "1", optional = true, default-features = false, features = [
@@ -103,7 +103,7 @@ otap-zstd = ["arrow-ipc/zstd"]
 # (gen-tonic, on top of the message types already enabled). Never enabled for
 # wasm32 (no tokio runtime or sockets there); selected by the extension's CMake
 # only for native targets.
-grpc = [
+server = [
     "ffi",
     "dep:tokio",
     "dep:tokio-stream",
